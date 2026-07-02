@@ -3,15 +3,21 @@ import path from 'path';
 import { parseNdjson, normalizeEntry } from './parser.js';
 import { insertEvents } from './db.js';
 
-export function scanLogFiles(logDir, pattern) {
+export function scanLogFiles(logDir, pattern, since) {
   if (!fs.existsSync(logDir)) return [];
 
   const files = fs.readdirSync(logDir).filter(f => {
     if (pattern.includes('*')) {
       const regex = new RegExp('^' + pattern.replace(/\./g, '\\.').replace(/\*/g, '.*') + '$');
-      return regex.test(f);
+      if (!regex.test(f)) return false;
+    } else if (f !== pattern) {
+      return false;
     }
-    return f === pattern;
+    if (since) {
+      const m = f.match(/(\d{4}-\d{2}-\d{2})/);
+      if (!m || m[1] < since) return false;
+    }
+    return true;
   });
 
   return files.map(f => path.join(logDir, f)).sort();
@@ -31,12 +37,12 @@ export function ingestFile(db, filePath) {
   return { file: filePath, inserted, errors: [] };
 }
 
-export function ingestAll(db, config) {
+export function ingestAll(db, config, since) {
   const results = [];
 
   for (const [agentId, agentConfig] of Object.entries(config.agents)) {
     const logDir = path.resolve(config.dbPath, '..', agentConfig.logDir);
-    const files = scanLogFiles(logDir, agentConfig.pattern);
+    const files = scanLogFiles(logDir, agentConfig.pattern, since);
 
     for (const file of files) {
       const result = ingestFile(db, file);

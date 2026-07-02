@@ -21,7 +21,9 @@ if (!fs.existsSync(path.dirname(dbPath))) {
 }
 
 const db = openDb(dbPath);
-const PORT = parseInt(process.argv[process.argv.indexOf('--port') + 1], 10) || 9320;
+const portIdx = process.argv.indexOf('--port');
+const portArg = portIdx >= 0 ? process.argv[portIdx + 1] : null;
+const PORT = (portArg && /^\d+$/.test(portArg)) ? parseInt(portArg, 10) : 9320;
 
 function json(res, data, status = 200) {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });

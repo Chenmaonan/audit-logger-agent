@@ -131,28 +131,35 @@ export function queryEvents(db, filters = {}) {
   return db.prepare(sql).all(params);
 }
 
-export function dailySummary(db, date) {
+export function dailySummary(db, date, agentId) {
+  const where = ['date(ts) = @date'];
+  const params = { date };
+  if (agentId) { where.push('agent_id = @agentId'); params.agentId = agentId; }
   return db.prepare(`
     SELECT agent_id, tool_name, status, COUNT(*) as count
     FROM audit_events
-    WHERE date(ts) = @date
+    WHERE ${where.join(' AND ')}
     GROUP BY agent_id, tool_name, status
     ORDER BY agent_id, tool_name, status
-  `).all({ date });
+  `).all(params);
 }
 
-export function errorReport(db, from, to) {
+export function errorReport(db, from, to, agentId) {
+  const where = ['status = \'error\'', 'ts >= @from', 'ts <= @to'];
+  const params = { from, to };
+  if (agentId) { where.push('agent_id = @agentId'); params.agentId = agentId; }
   return db.prepare(`
     SELECT ts, agent_id, tool_name, error_code, error_message, result_summary, trace_id
     FROM audit_events
-    WHERE status = 'error'
-      AND ts >= @from
-      AND ts <= @to
+    WHERE ${where.join(' AND ')}
     ORDER BY ts DESC
-  `).all({ from, to });
+  `).all(params);
 }
 
-export function toolUsageStats(db, from, to) {
+export function toolUsageStats(db, from, to, agentId) {
+  const where = ['event IN (\'tool.end\', \'tool.error\')', 'ts >= @from', 'ts <= @to'];
+  const params = { from, to };
+  if (agentId) { where.push('agent_id = @agentId'); params.agentId = agentId; }
   return db.prepare(`
     SELECT
       agent_id,
@@ -163,18 +170,8 @@ export function toolUsageStats(db, from, to) {
       ROUND(AVG(duration_ms), 0) as avg_duration_ms,
       MAX(duration_ms) as max_duration_ms
     FROM audit_events
-    WHERE event IN ('tool.end', 'tool.error')
-      AND ts >= @from
-      AND ts <= @to
+    WHERE ${where.join(' AND ')}
     GROUP BY agent_id, tool_name
     ORDER BY total DESC
-  `).all({ from, to });
-}
-
-export function traceSpans(db, traceId) {
-  return db.prepare(`
-    SELECT * FROM audit_events
-    WHERE trace_id = @traceId
-    ORDER BY ts ASC
-  `).all({ traceId });
+  `).all(params);
 }

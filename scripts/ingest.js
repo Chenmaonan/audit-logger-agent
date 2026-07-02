@@ -18,8 +18,8 @@ const db = openDb(dbPath);
 
 const sinceArg = process.argv.includes('--since') ? process.argv[process.argv.indexOf('--since') + 1] : null;
 
-console.log(`Ingesting audit logs into ${dbPath}...`);
-const results = ingestAll(db, config);
+console.log(`Ingesting audit logs into ${dbPath}...${sinceArg ? ` (since ${sinceArg})` : ''}`);
+const results = ingestAll(db, config, sinceArg);
 
 let totalInserted = 0;
 let totalErrors = 0;

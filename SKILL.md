@@ -9,11 +9,13 @@ Agents must emit NDJSON (`.jsonl`) files conforming to the `agent-audit-log` spe
 ## Available Actions
 
 ### ingest
-Scan configured log directories, parse NDJSON files, deduplicate by `span_id`, and index into the local SQLite database.
+Scan configured log directories, parse NDJSON files, deduplicate by `row_hash` (SHA-256 of the raw JSON line), and index into the local SQLite database. This keeps start/end/error events that share a `span_id` distinct while still preventing the same log line from being inserted twice on re-ingest.
 
 ```
 node scripts/ingest.js [--since YYYY-MM-DD]
 ```
+
+`--since` restricts the scan to log files whose date (parsed from the filename, e.g. `audit-2026-07-02.jsonl`) is on or after the given date. Use it to bound incremental scans.
 
 ### query
 Query the audit database with flexible filters.
@@ -40,7 +42,7 @@ node scripts/report.js [options]
   --date YYYY-MM-DD          Date for daily report
   --from <ISO>               Start for range reports
   --to <ISO>                 End for range reports
-  --agent-id <id>            Filter by agent
+  --agent-id <id>            Filter all report types by agent
 ```
 
 ### server
@@ -54,6 +56,7 @@ Endpoints:
 - `GET /query?agent_id=...&tool_name=...&from=...&to=...&limit=100`
 - `GET /report/daily?date=YYYY-MM-DD`
 - `GET /report/errors?from=...&to=...`
+- `GET /report/tools?from=...&to=...`
 - `GET /health`
 
 ## Configuration

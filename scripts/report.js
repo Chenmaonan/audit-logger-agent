@@ -43,8 +43,8 @@ const opts = parseArgs();
 switch (opts.type) {
   case 'daily': {
     const date = opts.date || new Date().toISOString().slice(0, 10);
-    console.log(`Daily Summary — ${date}\n`);
-    const rows = dailySummary(db, date);
+    console.log(`Daily Summary — ${date}${opts.agent_id ? ` (agent: ${opts.agent_id})` : ''}\n`);
+    const rows = dailySummary(db, date, opts.agent_id);
 
     if (rows.length === 0) {
       console.log('No events for this date.');
@@ -61,8 +61,8 @@ switch (opts.type) {
   case 'errors': {
     const from = opts.from || '1970-01-01';
     const to = opts.to || '2099-12-31';
-    console.log(`Error Report — ${from} to ${to}\n`);
-    const rows = errorReport(db, from, to);
+    console.log(`Error Report — ${from} to ${to}${opts.agent_id ? ` (agent: ${opts.agent_id})` : ''}\n`);
+    const rows = errorReport(db, from, to, opts.agent_id);
 
     if (rows.length === 0) {
       console.log('No errors in this range.');
@@ -81,8 +81,8 @@ switch (opts.type) {
   case 'tools': {
     const from = opts.from || '1970-01-01';
     const to = opts.to || '2099-12-31';
-    console.log(`Tool Usage Stats — ${from} to ${to}\n`);
-    const rows = toolUsageStats(db, from, to);
+    console.log(`Tool Usage Stats — ${from} to ${to}${opts.agent_id ? ` (agent: ${opts.agent_id})` : ''}\n`);
+    const rows = toolUsageStats(db, from, to, opts.agent_id);
 
     if (rows.length === 0) {
       console.log('No tool usage in this range.');
