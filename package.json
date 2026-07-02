@@ -1,0 +1,16 @@
+{
+  "name": "audit-logger-agent",
+  "version": "1.0.0",
+  "description": "Cross-agent audit log ingestion, query, and reporting tool",
+  "type": "module",
+  "main": "scripts/ingest.js",
+  "scripts": {
+    "ingest": "node scripts/ingest.js",
+    "query": "node scripts/query.js",
+    "report": "node scripts/report.js",
+    "server": "node scripts/server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0"
+  }
+}

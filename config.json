@@ -1,0 +1,13 @@
+{
+  "dbPath": "data/audit.db",
+  "agents": {
+    "rental-price-agent": {
+      "logDir": "../../rental-price-agent-main/tasks/logs",
+      "pattern": "audit-*.jsonl"
+    },
+    "mt-agent": {
+      "logDir": "../../MT-agent-master/output/logs",
+      "pattern": "audit-*.jsonl"
+    }
+  }
+}

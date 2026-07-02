@@ -1,0 +1,49 @@
+import fs from 'fs';
+import path from 'path';
+import { parseNdjson, normalizeEntry } from './parser.js';
+import { insertEvents } from './db.js';
+
+export function scanLogFiles(logDir, pattern) {
+  if (!fs.existsSync(logDir)) return [];
+
+  const files = fs.readdirSync(logDir).filter(f => {
+    if (pattern.includes('*')) {
+      const regex = new RegExp('^' + pattern.replace(/\*/g, '.*').replace(/\./g, '\\.') + '$');
+      return regex.test(f);
+    }
+    return f === pattern;
+  });
+
+  return files.map(f => path.join(logDir, f)).sort();
+}
+
+export function ingestFile(db, filePath) {
+  const content = fs.readFileSync(filePath, 'utf-8');
+  const { entries, errors } = parseNdjson(content);
+
+  if (errors.length > 0) {
+    return { file: filePath, inserted: 0, errors };
+  }
+
+  const rows = entries.map(normalizeEntry);
+  const inserted = insertEvents(db, rows);
+
+  return { file: filePath, inserted, errors: [] };
+}
+
+export function ingestAll(db, config) {
+  const results = [];
+
+  for (const [agentId, agentConfig] of Object.entries(config.agents)) {
+    const logDir = path.resolve(config.dbPath, '..', agentConfig.logDir);
+    const files = scanLogFiles(logDir, agentConfig.pattern);
+
+    for (const file of files) {
+      const result = ingestFile(db, file);
+      result.agent_id = agentId;
+      results.push(result);
+    }
+  }
+
+  return results;
+}
