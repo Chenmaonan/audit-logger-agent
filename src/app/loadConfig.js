@@ -7,5 +7,9 @@ export function loadAppConfig(rootDir) {
   if (!fs.existsSync(configPath)) {
     throw new Error(`config.json not found at ${configPath}`);
   }
-  return JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+  return {
+    ...config,
+    planner: config.planner ?? {},
+  };
 }

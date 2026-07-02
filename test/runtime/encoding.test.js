@@ -11,12 +11,11 @@ function readSource(relativePath) {
   return fs.readFileSync(path.join(__dirname, '..', '..', relativePath), 'utf-8');
 }
 
-test('planner source keeps key Chinese strings intact', () => {
-  const plannerSource = readSource('src/agent/planner.js');
+test('plannerPrompt source keeps key strings intact', () => {
+  const plannerPromptSource = readSource('src/agent/plannerPrompt.js');
 
-  assert.ok(plannerSource.includes('需要确认处理范围'));
-  assert.ok(plannerSource.includes('异常任务分析已完成'));
-  assert.ok(!plannerSource.includes('�'));
+  assert.ok(plannerPromptSource.includes('audit-log agent'));
+  assert.ok(!plannerPromptSource.includes('�'));
 });
 
 test('payload source keeps key Chinese strings intact', () => {

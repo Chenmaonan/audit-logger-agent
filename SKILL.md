@@ -52,6 +52,19 @@ Start an HTTP API server for live querying.
 node scripts/server.js [--port 9320]
 ```
 
+### OpenAI-backed planner
+
+The v1.3 planner uses OpenAI. Start the server with:
+
+```powershell
+$env:OPENAI_API_KEY = "<redacted>"
+$env:OPENAI_BASE_URL = "https://api.openai.com/v1"
+$env:OPENAI_MODEL = "<your-openai-model>"
+node scripts/server.js --port 9320
+```
+
+The LLM planner uses structured output to produce either a local tool execution plan or a `decision_request`. Tool execution remains local and auditable.
+
 Endpoints:
 - `GET /query?agent_id=...&tool_name=...&from=...&to=...&limit=100`
 - `GET /report/daily?date=YYYY-MM-DD`

@@ -17,6 +17,8 @@ import { createRuntimeAuditLogger } from '../src/observability/runtimeAudit.js';
 import { createHttpApp } from '../src/adapters/http/app.js';
 import { recoverInflightRuns } from '../src/agent/recovery.js';
 import { loadAppConfig } from '../src/app/loadConfig.js';
+import { loadOpenAIConfig } from '../src/llm/openaiConfig.js';
+import { createOpenAIResponsesClient } from '../src/llm/openaiResponsesClient.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -32,6 +34,19 @@ const registry = createToolRegistry();
 registry.register(buildAuditQueryTool({ db }));
 registry.register(buildReportTool({ db }));
 
+const openAIConfig = loadOpenAIConfig({ env: process.env, appConfig: config });
+const llmClient = createOpenAIResponsesClient({
+  apiKey: openAIConfig.apiKey,
+  baseURL: openAIConfig.baseURL,
+  timeoutMs: openAIConfig.timeoutMs,
+});
+
+const planner = createPlanner({
+  llmClient,
+  model: openAIConfig.model,
+  registry,
+});
+
 const auditLogger = createRuntimeAuditLogger(db);
 
 const eventPublisher = createEventPublisher({
@@ -43,7 +58,7 @@ const runtime = createRuntime({
   runStore,
   outboxStore,
   waitStore,
-  planner: createPlanner(),
+  planner,
   registry,
   eventPublisher,
   auditLogger,

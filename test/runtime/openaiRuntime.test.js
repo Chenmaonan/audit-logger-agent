@@ -1,0 +1,79 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { openDb } from '../../scripts/lib/db.js';
+import { ensureRuntimeSchema } from '../../src/db/runtimeSchema.js';
+import { createRunStore } from '../../src/agent/runStore.js';
+import { createOutboxStore } from '../../src/agent/outboxStore.js';
+import { createWaitStore } from '../../src/agent/waitStore.js';
+import { createEventPublisher } from '../../src/agent/eventPublisher.js';
+import { createRuntime } from '../../src/agent/runtime.js';
+import { createToolRegistry } from '../../src/tools/registry.js';
+import { createPlanner } from '../../src/agent/planner.js';
+import { loadOpenAIConfig } from '../../src/llm/openaiConfig.js';
+import { createOpenAIResponsesClient } from '../../src/llm/openaiResponsesClient.js';
+
+async function waitForTerminal(runStore, runId, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const run = runStore.getRun(runId);
+    if (run && ['completed', 'failed', 'waiting_user'].includes(run.status)) return run;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return runStore.getRun(runId);
+}
+
+test('runtime executes an OpenAI-planned audit task through the real Responses API', async () => {
+  assert.ok(process.env.OPENAI_API_KEY, 'OPENAI_API_KEY is required for this integration test');
+  assert.ok(process.env.OPENAI_MODEL, 'OPENAI_MODEL is required for this integration test');
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'openai-runtime-'));
+  const db = openDb(path.join(tmpDir, 'runtime.db'));
+  ensureRuntimeSchema(db);
+
+  const runStore = createRunStore(db);
+  const outboxStore = createOutboxStore(db);
+  const waitStore = createWaitStore(db);
+  const eventPublisher = createEventPublisher({ outboxStore, callbackClient: { async send() {} } });
+
+  const registry = createToolRegistry();
+  registry.register({ name: 'audit.queryEvents', description: 'Query audit events', inputSchema: { type: 'object' }, async execute() { return [{ tool_name: 'demo.tool', result_summary: 'demo failed' }]; } });
+  registry.register({ name: 'report.errorSummary', description: 'Summarize errors', inputSchema: { type: 'object' }, async execute() { return [{ tool_name: 'demo.tool', result_summary: 'demo failed' }]; } });
+
+  const config = loadOpenAIConfig({ env: process.env, appConfig: {} });
+
+  const runtime = createRuntime({
+    runStore,
+    outboxStore,
+    waitStore,
+    planner: createPlanner({
+      model: config.model,
+      registry,
+      llmClient: createOpenAIResponsesClient(config),
+    }),
+    registry,
+    eventPublisher,
+    auditLogger: { async log() {} },
+  });
+
+  const created = await runtime.startRun({
+    channel: 'feishu',
+    conversationId: 'oc_test',
+    messageId: 'om_openai',
+    userOpenId: 'ou_test',
+    requestText: 'Please analyze all audit failures',
+    deliveryMode: 'callback',
+    callbackUrl: 'http://127.0.0.1:9999/agent-events',
+    metadata: {},
+  });
+
+  const completed = await waitForTerminal(runStore, created.run_id);
+  assert.equal(completed.status, 'completed');
+  assert.ok(runStore.listSteps(created.run_id).length >= 1);
+  assert.ok(outboxStore.listAll(20).find((event) => event.type === 'final_result'));
+
+  db.close();
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});

@@ -57,6 +57,14 @@ export function createToolRegistry({ defaultTimeoutMs = DEFAULT_TIMEOUT_MS } = {
       return Array.from(tools.keys());
     },
 
+    describeTools() {
+      return Array.from(tools.values()).map((tool) => ({
+        name: tool.name,
+        description: tool.description ?? `Tool ${tool.name}`,
+        inputSchema: tool.inputSchema ?? { type: 'object', additionalProperties: true },
+      }));
+    },
+
     async execute(name, input, context = {}) {
       const tool = tools.get(name);
       if (!tool) {
