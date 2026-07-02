@@ -25,9 +25,16 @@ async function waitForTerminal(runStore, runId, timeoutMs = 30000) {
   return runStore.getRun(runId);
 }
 
-test('runtime executes an OpenAI-planned audit task through the real Responses API', async () => {
-  assert.ok(process.env.OPENAI_API_KEY, 'OPENAI_API_KEY is required for this integration test');
-  assert.ok(process.env.OPENAI_MODEL, 'OPENAI_MODEL is required for this integration test');
+test('runtime executes an OpenAI-planned audit task through the real Responses API', async (t) => {
+  let config;
+  try {
+    config = loadOpenAIConfig({ env: process.env, appConfig: {} });
+  } catch {
+    t.skip('AUDIT_AGENT_LLM_API_KEY / AUDIT_AGENT_LLM_MODEL not set in .config or environment');
+    return;
+  }
+  assert.ok(config.apiKey, 'AUDIT_AGENT_LLM_API_KEY is required for this integration test');
+  assert.ok(config.model, 'AUDIT_AGENT_LLM_MODEL is required for this integration test');
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'openai-runtime-'));
   const db = openDb(path.join(tmpDir, 'runtime.db'));
@@ -41,8 +48,6 @@ test('runtime executes an OpenAI-planned audit task through the real Responses A
   const registry = createToolRegistry();
   registry.register({ name: 'audit.queryEvents', description: 'Query audit events', inputSchema: { type: 'object' }, async execute() { return [{ tool_name: 'demo.tool', result_summary: 'demo failed' }]; } });
   registry.register({ name: 'report.errorSummary', description: 'Summarize errors', inputSchema: { type: 'object' }, async execute() { return [{ tool_name: 'demo.tool', result_summary: 'demo failed' }]; } });
-
-  const config = loadOpenAIConfig({ env: process.env, appConfig: {} });
 
   const runtime = createRuntime({
     runStore,

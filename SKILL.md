@@ -54,12 +54,20 @@ node scripts/server.js [--port 9320]
 
 ### OpenAI-backed planner
 
-The v1.3 planner uses OpenAI. Start the server with:
+The v1.3 planner uses OpenAI. Copy `.config.example` to `.config` and fill in your values (git-ignored):
+
+```json
+{
+  "AUDIT_AGENT_LLM_API_KEY": "<your-api-key>",
+  "AUDIT_AGENT_LLM_BASE_URL": "https://api.openai.com/v1",
+  "AUDIT_AGENT_LLM_MODEL": "<your-model>",
+  "AUDIT_AGENT_LLM_TIMEOUT_MS": "30000"
+}
+```
+
+Then start the server:
 
 ```powershell
-$env:OPENAI_API_KEY = "<redacted>"
-$env:OPENAI_BASE_URL = "https://api.openai.com/v1"
-$env:OPENAI_MODEL = "<your-openai-model>"
 node scripts/server.js --port 9320
 ```
 

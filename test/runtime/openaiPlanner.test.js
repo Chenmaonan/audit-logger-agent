@@ -12,11 +12,20 @@ function registryWithTools() {
   return registry;
 }
 
-test('OpenAI planner converts natural language into a validated local tool plan', async () => {
-  assert.ok(process.env.OPENAI_API_KEY, 'OPENAI_API_KEY is required for this integration test');
-  assert.ok(process.env.OPENAI_MODEL, 'OPENAI_MODEL is required for this integration test');
+function loadIntegrationConfig(t) {
+  try {
+    const config = loadOpenAIConfig({ env: process.env, appConfig: {} });
+    if (!config.apiKey || !config.model) return null;
+    return config;
+  } catch {
+    return null;
+  }
+}
 
-  const config = loadOpenAIConfig({ env: process.env, appConfig: {} });
+test('OpenAI planner converts natural language into a validated local tool plan', async (t) => {
+  const config = loadIntegrationConfig(t);
+  if (!config) { t.skip('AUDIT_AGENT_LLM_API_KEY / AUDIT_AGENT_LLM_MODEL not set in .config or environment'); return; }
+
   const planner = createOpenAIPlanner({
     llmClient: createOpenAIResponsesClient(config),
     model: config.model,
@@ -36,11 +45,10 @@ test('OpenAI planner converts natural language into a validated local tool plan'
   }
 });
 
-test('OpenAI planner synthesizes a structured final result', async () => {
-  assert.ok(process.env.OPENAI_API_KEY, 'OPENAI_API_KEY is required for this integration test');
-  assert.ok(process.env.OPENAI_MODEL, 'OPENAI_MODEL is required for this integration test');
+test('OpenAI planner synthesizes a structured final result', async (t) => {
+  const config = loadIntegrationConfig(t);
+  if (!config) { t.skip('AUDIT_AGENT_LLM_API_KEY / AUDIT_AGENT_LLM_MODEL not set in .config or environment'); return; }
 
-  const config = loadOpenAIConfig({ env: process.env, appConfig: {} });
   const planner = createOpenAIPlanner({
     llmClient: createOpenAIResponsesClient(config),
     model: config.model,

@@ -1,17 +1,25 @@
 # OpenAI LLM Agent Usage
 
-## Environment
+## Configuration
 
-Set these variables before starting the server:
+LLM credentials are read from a project-level `.config` file (JSON) at the repo root. Copy the example file and fill in your values:
 
 ```powershell
-$env:OPENAI_API_KEY = "<redacted>"
-$env:OPENAI_BASE_URL = "https://api.openai.com/v1"
-$env:OPENAI_MODEL = "<your-openai-model>"
-$env:OPENAI_TIMEOUT_MS = "30000"
+Copy-Item .config.example .config
 ```
 
-Do not commit real API keys. `OPENAI_BASE_URL` exists for proxies and compatible gateways; leave it unset for the official OpenAI API.
+`.config` shape:
+
+```json
+{
+  "AUDIT_AGENT_LLM_API_KEY": "<your-api-key>",
+  "AUDIT_AGENT_LLM_BASE_URL": "https://api.openai.com/v1",
+  "AUDIT_AGENT_LLM_MODEL": "<your-model>",
+  "AUDIT_AGENT_LLM_TIMEOUT_MS": "30000"
+}
+```
+
+`.config` is git-ignored and must never contain real keys in commits. You may instead set process environment variables with the same names — environment values override `.config`. `AUDIT_AGENT_LLM_BASE_URL` exists for proxies and compatible gateways; leave it at the default for the official OpenAI API.
 
 ## Start Server
 

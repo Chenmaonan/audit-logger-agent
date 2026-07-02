@@ -5,8 +5,17 @@ import { createOpenAIResponsesClient } from '../../src/llm/openaiResponsesClient
 import { createPlanner } from '../../src/agent/planner.js';
 import { createToolRegistry } from '../../src/tools/registry.js';
 
+function hasIntegrationConfig() {
+  try {
+    const config = loadOpenAIConfig({ env: process.env, appConfig: {} });
+    return Boolean(config.apiKey && config.model);
+  } catch {
+    return false;
+  }
+}
+
 test('planner factory creates the OpenAI planner path', {
-  skip: !process.env.OPENAI_API_KEY || !process.env.OPENAI_MODEL,
+  skip: !hasIntegrationConfig(),
 }, async () => {
   const config = loadOpenAIConfig({ env: process.env, appConfig: {} });
   const registry = createToolRegistry();
