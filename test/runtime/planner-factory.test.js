@@ -27,9 +27,19 @@ test('planner factory creates the OpenAI planner path', {
     llmClient: createOpenAIResponsesClient(config),
   });
 
-  const result = await planner.createInitialPlan({
-    requestText: 'Create a plan to query audit errors. Use only available tools.',
-    metadata: {},
-  });
+  // Non-deterministic LLM output via a compatible gateway can occasionally
+  // fail schema validation; retry once since this is a smoke test for wiring.
+  let result;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      result = await planner.createInitialPlan({
+        requestText: 'Create a plan to query audit errors. Use only available tools.',
+        metadata: {},
+      });
+      break;
+    } catch (error) {
+      if (attempt === 1) throw error;
+    }
+  }
   assert.ok(['plan', 'decision_request'].includes(result.type));
 });
