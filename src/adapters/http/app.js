@@ -23,6 +23,33 @@ function parseUrl(req) {
   return new URL(req.url, 'http://127.0.0.1');
 }
 
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+function validateCreateRunBody(body) {
+  const errors = [];
+  if (!isNonEmptyString(body.channel)) errors.push({ field: 'channel', message: 'channel is required' });
+  if (!isNonEmptyString(body.conversation_id)) errors.push({ field: 'conversation_id', message: 'conversation_id is required' });
+  if (!body.user || !isNonEmptyString(body.user.open_id)) errors.push({ field: 'user.open_id', message: 'user.open_id is required' });
+  if (!body.request || !isNonEmptyString(body.request.text)) errors.push({ field: 'request.text', message: 'request.text is required' });
+  if (!body.delivery || !isNonEmptyString(body.delivery.mode)) errors.push({ field: 'delivery.mode', message: 'delivery.mode is required' });
+  if (body.delivery && body.delivery.mode === 'callback' && !isNonEmptyString(body.delivery.callback_url)) {
+    errors.push({ field: 'delivery.callback_url', message: 'delivery.callback_url is required when delivery.mode is callback' });
+  }
+  return errors;
+}
+
+// Maps runtime-thrown errors (carrying a stable `code`) to HTTP status + body.
+function mapRuntimeError(error) {
+  const code = error?.code;
+  if (code === 'run_not_found') return { status: 404, body: { error_code: code, error: error.message } };
+  if (code === 'resume_conflict') return { status: 409, body: { error_code: code, error: error.message } };
+  if (code === 'invalid_decision_response') return { status: 400, body: { error_code: code, error: error.message } };
+  if (code === 'invalid_request') return { status: 400, body: { error_code: code, error: error.message } };
+  return { status: 500, body: { error_code: 'internal_error', error: 'Internal server error' } };
+}
+
 export function createHttpApp({ db, config, runStore, runtime }) {
   return http.createServer(async (req, res) => {
     const url = parseUrl(req);
@@ -41,7 +68,8 @@ export function createHttpApp({ db, config, runStore, runtime }) {
       if (req.method === 'GET' && url.pathname === '/query') {
         const filters = Object.fromEntries(url.searchParams.entries());
         if (filters.limit) filters.limit = Number(filters.limit);
-        json(res, 200, { count: queryEvents(db, filters).length, results: queryEvents(db, filters) });
+        const results = queryEvents(db, filters);
+        json(res, 200, { count: results.length, results });
         return;
       }
 
@@ -69,6 +97,13 @@ export function createHttpApp({ db, config, runStore, runtime }) {
 
       if (req.method === 'POST' && url.pathname === '/v1/runs') {
         const body = await readJson(req);
+        const validationErrors = validateCreateRunBody(body);
+        if (validationErrors.length > 0) {
+          json(res, 400, { error_code: 'invalid_request', error: 'Invalid request body', details: validationErrors });
+          return;
+        }
+        // P2-01: startRun now creates the run synchronously and kicks off
+        // execution in the background, so this returns immediately (async ACK).
         const created = await runtime.startRun({
           channel: body.channel,
           conversationId: body.conversation_id,
@@ -78,6 +113,7 @@ export function createHttpApp({ db, config, runStore, runtime }) {
           deliveryMode: body.delivery?.mode,
           callbackUrl: body.delivery?.callback_url,
           metadata: body.metadata,
+          idempotencyKey: body.idempotency_key ?? req.headers['idempotency-key'],
         });
         json(res, 202, { run_id: created.run_id, status: created.status });
         return;
@@ -86,8 +122,21 @@ export function createHttpApp({ db, config, runStore, runtime }) {
       if (req.method === 'POST' && url.pathname.startsWith('/v1/runs/') && url.pathname.endsWith('/resume')) {
         const runId = url.pathname.split('/')[3];
         const body = await readJson(req);
-        const run = await runtime.resumeRun(runId, body);
-        json(res, 202, { run_id: run.run_id, status: run.status });
+        if (!body || !body.decision_id) {
+          json(res, 400, { error_code: 'invalid_request', error: 'decision_id is required' });
+          return;
+        }
+        if (!body.response || typeof body.response !== 'object') {
+          json(res, 400, { error_code: 'invalid_request', error: 'response is required' });
+          return;
+        }
+        try {
+          const run = await runtime.resumeRun(runId, body);
+          json(res, 202, { run_id: run.run_id, status: run.status });
+        } catch (error) {
+          const mapped = mapRuntimeError(error);
+          json(res, mapped.status, mapped.body);
+        }
         return;
       }
 
@@ -95,16 +144,17 @@ export function createHttpApp({ db, config, runStore, runtime }) {
         const runId = url.pathname.split('/').pop();
         const run = await runtime.getRun(runId);
         if (!run) {
-          json(res, 404, { error: 'Run not found' });
+          json(res, 404, { error_code: 'run_not_found', error: 'Run not found' });
           return;
         }
         json(res, 200, run);
         return;
       }
 
-      json(res, 404, { error: 'Not found' });
+      json(res, 404, { error_code: 'not_found', error: 'Not found' });
     } catch (error) {
-      json(res, 500, { error: error.message });
+      const mapped = mapRuntimeError(error);
+      json(res, mapped.status, mapped.body);
     }
   });
 }

@@ -15,6 +15,7 @@ import { createCallbackClient } from '../src/adapters/bot/callbackClient.js';
 import { createEventPublisher } from '../src/agent/eventPublisher.js';
 import { createRuntimeAuditLogger } from '../src/observability/runtimeAudit.js';
 import { createHttpApp } from '../src/adapters/http/app.js';
+import { recoverInflightRuns } from '../src/agent/recovery.js';
 import { loadAppConfig } from '../src/app/loadConfig.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -31,6 +32,8 @@ const registry = createToolRegistry();
 registry.register(buildAuditQueryTool({ db }));
 registry.register(buildReportTool({ db }));
 
+const auditLogger = createRuntimeAuditLogger(db);
+
 const eventPublisher = createEventPublisher({
   outboxStore,
   callbackClient: createCallbackClient({ fetchImpl: fetch }),
@@ -43,8 +46,19 @@ const runtime = createRuntime({
   planner: createPlanner(),
   registry,
   eventPublisher,
-  auditLogger: createRuntimeAuditLogger(db),
+  auditLogger,
+  executor: (task) => setImmediate(task),
 });
+
+// P3-04: recover runs orphaned by a process restart before serving traffic.
+try {
+  const recovered = recoverInflightRuns({ runStore, eventPublisher, auditLogger });
+  if (recovered.length > 0) {
+    console.log(`Recovered ${recovered.length} orphaned run(s) marked as failed.`);
+  }
+} catch (error) {
+  console.error(`Run recovery failed: ${error.message}`);
+}
 
 const app = createHttpApp({ db, config: { ...config, dbPath }, runStore, runtime });
 const portIndex = process.argv.indexOf('--port');

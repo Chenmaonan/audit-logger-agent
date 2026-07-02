@@ -68,7 +68,8 @@ test('tool registry executes registered audit tool', async () => {
   registry.register(buildAuditQueryTool({ db }));
   registry.register(buildReportTool({ db }));
 
-  const rows = await registry.execute('audit.queryEvents', { status: 'error' }, {});
+  const result = await registry.execute('audit.queryEvents', { status: 'error' }, {});
+  const rows = result.ok ? result.data : [];
   assert.equal(rows.length, 1);
 
   db.close();

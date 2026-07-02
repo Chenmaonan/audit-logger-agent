@@ -53,7 +53,7 @@ export function createPlanner({ now = () => new Date().toISOString() } = {}) {
     },
 
     async resumeFromDecision(waitingContext, response) {
-      const selected = response.selected_option;
+      const selected = response?.selected_option;
       const nowIso = now();
       const range = dayRange(nowIso);
 
@@ -69,15 +69,22 @@ export function createPlanner({ now = () => new Date().toISOString() } = {}) {
         };
       }
 
-      return {
-        type: 'plan',
-        plan: {
-          steps: [
-            { stepName: 'load-errors', toolName: 'audit.queryEvents', input: { status: 'error', limit: 100 } },
-            { stepName: 'summarize-errors', toolName: 'report.errorSummary', input: { from: '1970-01-01', to: '2099-12-31', agentId: undefined } },
-          ],
-        },
-      };
+      if (selected === 'all_errors') {
+        return {
+          type: 'plan',
+          plan: {
+            steps: [
+              { stepName: 'load-errors', toolName: 'audit.queryEvents', input: { status: 'error', limit: 100 } },
+              { stepName: 'summarize-errors', toolName: 'report.errorSummary', input: { from: '1970-01-01', to: '2099-12-31', agentId: undefined } },
+            ],
+          },
+        };
+      }
+
+      const err = new Error(`Invalid selected_option: ${String(selected)}`);
+      err.code = 'invalid_decision_response';
+      err.retryable = false;
+      throw err;
     },
 
     async synthesizeFinalResult(context) {

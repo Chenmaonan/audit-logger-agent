@@ -1,5 +1,5 @@
 const REQUIRED_FIELDS = ['ts', 'agent_id', 'trace_id', 'span_id', 'event', 'tool_name', 'status', 'result_summary'];
-const VALID_EVENTS = ['tool.start', 'tool.end', 'tool.error', 'agent.start', 'agent.end', 'agent.error'];
+const VALID_EVENTS = ['tool.start', 'tool.end', 'tool.error', 'agent.start', 'agent.end', 'agent.error', 'run.start', 'run.resume', 'run.waiting_user', 'run.final_result', 'run.failed'];
 const VALID_STATUSES = ['ok', 'error', 'timeout', 'cancelled'];
 
 export function validateLogEntry(entry, lineNumber) {

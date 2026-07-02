@@ -23,6 +23,13 @@ export function createWaitStore(db) {
     WHERE decision_id = @decision_id
   `);
 
+  const listPendingByRunStmt = db.prepare(`
+    SELECT * FROM agent_waiting_states
+    WHERE run_id = ? AND status = 'pending'
+    ORDER BY created_at DESC
+    LIMIT 1
+  `);
+
   return {
     createWaitingState(input) {
       const decisionId = input.decisionId ?? `dec_${crypto.randomUUID()}`;
@@ -51,6 +58,16 @@ export function createWaitStore(db) {
 
     resolveWaitingState(decisionId) {
       resolveStmt.run({ decision_id: decisionId, resolved_at: nowIso() });
+    },
+
+    findPendingForRun(runId) {
+      const row = listPendingByRunStmt.get(runId);
+      if (!row) return null;
+      return {
+        ...row,
+        schema_json: JSON.parse(row.schema_json),
+        context_json: JSON.parse(row.context_json),
+      };
     },
   };
 }

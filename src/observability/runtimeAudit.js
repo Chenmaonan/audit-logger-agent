@@ -5,11 +5,15 @@ import { insertEvents } from '../../scripts/lib/db.js';
 export function createRuntimeAuditLogger(db, { agentId = 'feishu-independent-agent' } = {}) {
   return {
     async log({ runId, traceId = null, event, status, summary, toolName = 'agent.runtime' }) {
+      const ts = new Date().toISOString();
+      const resolvedTraceId = traceId ?? `trace_${runId}`;
+      const spanId = crypto.randomUUID();
+
       insertEvents(db, [{
-        ts: new Date().toISOString(),
+        ts,
         agent_id: agentId,
-        trace_id: traceId ?? `trace_${runId}`,
-        span_id: crypto.randomUUID(),
+        trace_id: resolvedTraceId,
+        span_id: spanId,
         parent_span_id: null,
         event,
         tool_name: toolName,
@@ -23,9 +27,10 @@ export function createRuntimeAuditLogger(db, { agentId = 'feishu-independent-age
         error_message: null,
         tags: JSON.stringify(['agent-runtime']),
         raw_json: JSON.stringify({
-          ts: new Date().toISOString(),
+          ts,
           agent_id: agentId,
-          trace_id: traceId ?? `trace_${runId}`,
+          trace_id: resolvedTraceId,
+          span_id: spanId,
           event,
           tool_name: toolName,
           status,
