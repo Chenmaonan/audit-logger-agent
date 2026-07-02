@@ -5,10 +5,11 @@ import path from 'path';
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS audit_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  row_hash TEXT UNIQUE NOT NULL,
   ts TEXT NOT NULL,
   agent_id TEXT NOT NULL,
   trace_id TEXT NOT NULL,
-  span_id TEXT UNIQUE NOT NULL,
+  span_id TEXT NOT NULL,
   parent_span_id TEXT,
   event TEXT NOT NULL,
   tool_name TEXT NOT NULL,
@@ -28,9 +29,16 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_agent ON audit_events(agent_id);
 CREATE INDEX IF NOT EXISTS idx_audit_tool ON audit_events(tool_name);
 CREATE INDEX IF NOT EXISTS idx_audit_trace ON audit_events(trace_id);
+CREATE INDEX IF NOT EXISTS idx_audit_span ON audit_events(span_id);
 CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_events(status);
 CREATE INDEX IF NOT EXISTS idx_audit_product ON audit_events(product_id);
 `;
+
+import crypto from 'crypto';
+
+function hashRow(rawJson) {
+  return crypto.createHash('sha256').update(rawJson).digest('hex').slice(0, 16);
+}
 
 export function openDb(dbPath) {
   const dir = path.dirname(dbPath);
@@ -45,11 +53,11 @@ export function openDb(dbPath) {
 export function insertEvents(db, events) {
   const stmt = db.prepare(`
     INSERT OR IGNORE INTO audit_events
-      (ts, agent_id, trace_id, span_id, parent_span_id, event, tool_name, status,
+      (row_hash, ts, agent_id, trace_id, span_id, parent_span_id, event, tool_name, status,
        result_summary, duration_ms, channel, user_id, product_id,
        error_code, error_message, tags, raw_json)
     VALUES
-      (@ts, @agent_id, @trace_id, @span_id, @parent_span_id, @event, @tool_name, @status,
+      (@row_hash, @ts, @agent_id, @trace_id, @span_id, @parent_span_id, @event, @tool_name, @status,
        @result_summary, @duration_ms, @channel, @user_id, @product_id,
        @error_code, @error_message, @tags, @raw_json)
   `);
@@ -57,7 +65,8 @@ export function insertEvents(db, events) {
   const insertMany = db.transaction((rows) => {
     let count = 0;
     for (const row of rows) {
-      const info = stmt.run(row);
+      const rowHash = hashRow(row.raw_json);
+      const info = stmt.run({ ...row, row_hash: rowHash });
       if (info.changes > 0) count++;
     }
     return count;

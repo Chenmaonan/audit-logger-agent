@@ -8,7 +8,7 @@ export function scanLogFiles(logDir, pattern) {
 
   const files = fs.readdirSync(logDir).filter(f => {
     if (pattern.includes('*')) {
-      const regex = new RegExp('^' + pattern.replace(/\*/g, '.*').replace(/\./g, '\\.') + '$');
+      const regex = new RegExp('^' + pattern.replace(/\./g, '\\.').replace(/\*/g, '.*') + '$');
       return regex.test(f);
     }
     return f === pattern;
