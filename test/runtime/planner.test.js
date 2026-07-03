@@ -9,21 +9,93 @@ import { buildAuditQueryTool } from '../../src/tools/auditQueryTool.js';
 import { buildReportTool } from '../../src/tools/reportTool.js';
 import { createPlanner } from '../../src/agent/planner.js';
 
+function createRegistry() {
+  const registry = createToolRegistry();
+  registry.register({
+    name: 'audit.queryEvents',
+    description: 'Query audit events',
+    inputSchema: { type: 'object' },
+    async execute() {
+      return [];
+    },
+  });
+  registry.register({
+    name: 'report.errorSummary',
+    description: 'Summarize audit errors',
+    inputSchema: { type: 'object' },
+    async execute() {
+      return [];
+    },
+  });
+  return registry;
+}
+
+function createStubPlanner() {
+  const registry = createRegistry();
+  const planner = createPlanner({
+    llmClient: {
+      async createStructuredResponse({ input }) {
+        const payload = JSON.parse(input[1].content);
+        if (payload.requestText === 'Handle anomalous tasks') {
+          return {
+            type: 'decision_request',
+            plan: null,
+            decision: {
+              title: 'Need scope confirmation',
+              summary: 'Choose whether to review today only or all history.',
+              options: [
+                { id: 'today_only', label: 'Today only', description: 'Prioritize today' },
+                { id: 'all_errors', label: 'All history', description: 'Review all errors' },
+              ],
+              formSchema: [],
+              submitLabel: 'Continue',
+            },
+          };
+        }
+
+        return {
+          type: 'plan',
+          plan: {
+            steps: [
+              {
+                stepName: 'load-errors',
+                toolName: 'audit.queryEvents',
+                input: { status: 'error', limit: 100 },
+              },
+              {
+                stepName: 'summarize-errors',
+                toolName: 'report.errorSummary',
+                input: { from: '2026-07-02T00:00:00.000+08:00', to: '2026-07-02T23:59:59.999+08:00' },
+              },
+            ],
+          },
+          decision: null,
+        };
+      },
+    },
+    model: 'test-model',
+    registry,
+    now: () => '2026-07-02T09:00:00.000+08:00',
+  });
+  return { planner, registry };
+}
+
 test('planner asks for decision when request scope is ambiguous', async () => {
-  const planner = createPlanner({ now: () => '2026-07-02T09:00:00.000+08:00' });
+  const { planner } = createStubPlanner();
   const result = await planner.createInitialPlan({
-    requestText: '帮我处理异常任务',
+    requestText: 'Handle anomalous tasks',
     metadata: {},
   });
 
   assert.equal(result.type, 'decision_request');
   assert.equal(result.decision.options.length, 2);
+  assert.deepEqual(result.decision.options.map((option) => option.id), ['today_only', 'all_errors']);
 });
 
-test('planner returns executable plan for today error analysis request', async () => {
-  const planner = createPlanner({ now: () => '2026-07-02T09:00:00.000+08:00' });
+test('planner returns executable plan for a today-only error analysis request', async () => {
+  const { planner } = createStubPlanner();
   const result = await planner.createInitialPlan({
-    requestText: '帮我查询今天的异常任务并给出处理建议',
+    requestText: 'Analyze today audit errors and suggest next actions.',
     metadata: {},
   });
 
@@ -60,7 +132,7 @@ test('tool registry executes registered audit tool', async () => {
       event: 'tool.error',
       tool_name: 'demo.tool',
       status: 'error',
-      result_summary: 'demo failed'
+      result_summary: 'demo failed',
     }),
   }]);
 

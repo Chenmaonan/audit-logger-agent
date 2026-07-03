@@ -9,7 +9,8 @@
     "query": "node scripts/query.js",
     "report": "node scripts/report.js",
     "server": "node scripts/server.js",
-    "test:agent": "node --test test/runtime/foundation.test.js test/http/runs-api.test.js test/runtime/outbox.test.js test/runtime/plannerSchema.test.js test/runtime/toolMetadata.test.js test/runtime/openaiPlanner.test.js test/runtime/planner-factory.test.js test/runtime/openaiRuntime.test.js test/runtime/runtime.test.js test/runtime/audit.test.js test/runtime/encoding.test.js test/runtime/fixes.test.js test/llm/openaiConfig.test.js test/llm/openaiResponsesClient.test.js && node test/self-test.js"
+    "test": "node scripts/run-tests.js",
+    "test:agent": "npm test"
   },
   "dependencies": {
     "better-sqlite3": "^11.7.0",

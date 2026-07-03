@@ -1,6 +1,8 @@
 import { plannerDecisionJsonSchema, validatePlannerDecision } from './plannerSchema.js';
 import { renderFinalResultInput, renderPlannerInput } from './plannerPrompt.js';
 
+const MAX_VALIDATION_ATTEMPTS = 2;
+
 const FINAL_RESULT_SCHEMA = {
   type: 'json_schema',
   name: 'audit_agent_final_result',
@@ -35,6 +37,40 @@ function plannerError(message, code = 'planner_error') {
   return error;
 }
 
+async function createValidatedDecision({ llmClient, model, input, registry, accept }) {
+  let lastError = null;
+
+  for (let attempt = 0; attempt < MAX_VALIDATION_ATTEMPTS; attempt += 1) {
+    const raw = await llmClient.createStructuredResponse({
+      model,
+      input,
+      schema: plannerDecisionJsonSchema(),
+    });
+
+    const validated = validatePlannerDecision(raw, { registry });
+    if (!validated.ok) {
+      lastError = validated.error;
+      if (lastError.code === 'invalid_planner_decision' && attempt + 1 < MAX_VALIDATION_ATTEMPTS) {
+        continue;
+      }
+      throw lastError;
+    }
+
+    const accepted = accept?.(validated.decision);
+    if (accepted?.ok !== false) {
+      return validated.decision;
+    }
+
+    lastError = accepted.error;
+    if (lastError?.code === 'invalid_planner_decision' && attempt + 1 < MAX_VALIDATION_ATTEMPTS) {
+      continue;
+    }
+    throw lastError;
+  }
+
+  throw lastError ?? plannerError('OpenAI planner did not produce a valid decision', 'invalid_planner_decision');
+}
+
 export function createOpenAIPlanner({ llmClient, model, registry, now = () => new Date().toISOString() }) {
   if (!llmClient) throw new Error('llmClient is required for createOpenAIPlanner');
   if (!model) throw new Error('model is required for createOpenAIPlanner');
@@ -42,40 +78,41 @@ export function createOpenAIPlanner({ llmClient, model, registry, now = () => ne
 
   return {
     async createInitialPlan(input) {
-      const raw = await llmClient.createStructuredResponse({
+      return createValidatedDecision({
+        llmClient,
         model,
+        registry,
         input: renderPlannerInput({
           requestText: input.requestText ?? '',
           metadata: input.metadata ?? {},
           nowIso: now(),
           tools: registry.describeTools(),
         }),
-        schema: plannerDecisionJsonSchema(),
+        accept: () => ({ ok: true }),
       });
-
-      const validated = validatePlannerDecision(raw, { registry });
-      if (!validated.ok) throw validated.error;
-      return validated.decision;
     },
 
     async resumeFromDecision(waitingContext, response) {
-      const raw = await llmClient.createStructuredResponse({
+      return createValidatedDecision({
+        llmClient,
         model,
+        registry,
         input: renderPlannerInput({
           requestText: waitingContext?.requestText ?? '',
           metadata: { ...waitingContext?.metadata, decisionResponse: response },
           nowIso: now(),
           tools: registry.describeTools(),
         }),
-        schema: plannerDecisionJsonSchema(),
+        accept: (decision) => {
+          if (decision.type !== 'plan') {
+            return {
+              ok: false,
+              error: plannerError('resumeFromDecision must return a plan', 'invalid_planner_decision'),
+            };
+          }
+          return { ok: true };
+        },
       });
-
-      const validated = validatePlannerDecision(raw, { registry });
-      if (!validated.ok) throw validated.error;
-      if (validated.decision.type !== 'plan') {
-        throw plannerError('resumeFromDecision must return a plan', 'invalid_planner_decision');
-      }
-      return validated.decision;
     },
 
     async synthesizeFinalResult(context) {
