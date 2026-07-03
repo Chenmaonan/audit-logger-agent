@@ -472,7 +472,10 @@ export function createAuditReviewScheduler({
         const run = reviewStore.getRun(reviewId);
         // Attach persisted finding_ids back onto the review findings so the
         // Feishu summary's top_findings carry a usable finding_id link.
-        const persistedRows = reviewStore.listFindings({ limit: 1000, reviewId });
+        // Query ALL findings (not filtered by reviewId): finding_hash dedup keeps
+        // the earliest review_id on a re-observed finding, so filtering by this
+        // run's review_id would miss rows that were merged into an earlier run.
+        const persistedRows = reviewStore.listFindings({ limit: 1000 });
         // Match by category+agent+tool+trace+product (the hash inputs) to find the DB row.
         const matchRow = (f) => persistedRows.find((row) =>
           row.category === f.category &&

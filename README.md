@@ -151,6 +151,85 @@ v1.4 审查相关接口（鉴权见下文）：
 - `GET /dashboard/audit-reviews/{reviewId}` —— 审查详情页（HTML）
 - `GET /dashboard/audit-findings/{findingId}` —— finding 证据页（HTML）
 
+### 本地快速启动与手动派发任务
+
+server 启动时会初始化 LLM planner，因此启动前必须通过 `.config` 或同名环境变量配置 `AUDIT_AGENT_LLM_API_KEY` 和 `AUDIT_AGENT_LLM_MODEL`。
+
+```powershell
+npm install
+if (-not (Test-Path .config)) { Copy-Item .config.example .config }
+```
+
+在仓库根目录编辑 `.config`，填入真实的 LLM 网关、模型和密钥后启动：
+
+```powershell
+node scripts/server.js --port 9320
+```
+
+确认服务已经就绪：
+
+```powershell
+Invoke-RestMethod -Uri "http://127.0.0.1:9320/health" -Method Get
+```
+
+启动后，通过 `POST /v1/runs` 给 Agent 派发一个任务。`request.text` 是用户要安排的任务内容；`delivery.callback_url` 是 Agent 投递进度、用户决策请求和最终结果的回调地址。
+
+```powershell
+$body = @{
+  channel = "manual"
+  conversation_id = "oc_manual"
+  message_id = "om_manual_001"
+  user = @{ open_id = "ou_manual" }
+  request = @{ text = "分析今天所有审计异常，并汇总风险最高的链路" }
+  delivery = @{
+    mode = "callback"
+    callback_url = "http://127.0.0.1:9999/agent-events"
+  }
+  metadata = @{ tenant_key = "tenant_manual" }
+} | ConvertTo-Json -Depth 8
+
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:9320/v1/runs" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body
+```
+
+接口会先返回异步 ACK：
+
+```json
+{
+  "run_id": "run_...",
+  "status": "created"
+}
+```
+
+随后可以查询运行状态：
+
+```powershell
+Invoke-RestMethod -Uri "http://127.0.0.1:9320/v1/runs/<run_id>" -Method Get
+```
+
+如果 Agent 认为任务范围不明确，它会向 `callback_url` 投递 `decision_request`，其中包含 `run_id`、`decision_id`、`options` 和可选的 `form_schema`。调用方收集用户选择后，用 `/resume` 恢复任务：
+
+```powershell
+$resumeBody = @{
+  decision_id = "<decision_id>"
+  response = @{
+    selected_option = "<option_id>"
+    form_data = @{}
+  }
+} | ConvertTo-Json -Depth 8
+
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:9320/v1/runs/<run_id>/resume" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $resumeBody
+```
+
+`selected_option` 必须来自 `decision_request.options[].id`；如果 `form_schema` 里有必填字段，需要放入 `response.form_data`。
+
 ---
 
 ## LLM Agent 运行时（v1.3）
