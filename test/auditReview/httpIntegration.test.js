@@ -368,9 +368,12 @@ test('audit review HTTP integration smoke test', async () => {
       const html = await res.text();
       assert.ok(html.includes('<html'), 'dashboard html should contain <html');
       assert.ok(
-        html.includes('审计') || html.includes('Severity'),
-        'dashboard should contain 审计 or Severity',
+        html.includes('审计审查总览') || html.includes('审查批次'),
+        'dashboard should contain 审计审查总览 or 审查批次',
       );
+      assert.equal(html.includes('Severity'), false, 'dashboard should not contain English Severity');
+      assert.equal(html.includes('Confidence'), false, 'dashboard should not contain English Confidence');
+      assert.equal(html.includes('Data source'), false, 'dashboard should not contain Data source');
     }
 
     // ------------------------------------------------------------------
@@ -393,6 +396,10 @@ test('audit review HTTP integration smoke test', async () => {
       assert.equal(res.headers.get('content-type'), 'text/html; charset=utf-8');
       const html = await res.text();
       assert.ok(html.includes('<html'), 'finding detail html should contain <html');
+      assert.ok(html.includes('日志 ID'), 'finding detail should contain 日志 ID');
+      assert.ok(html.includes('Agent 名称'), 'finding detail should contain Agent 名称');
+      assert.ok(html.includes('日志摘要'), 'finding detail should contain 日志摘要');
+      assert.equal(html.includes('置信度'), false, 'finding detail should not contain 置信度');
     }
 
     // ------------------------------------------------------------------

@@ -1,12 +1,13 @@
 // src/auditReview/dashboardTemplate.js
-// Renders a complete, self-contained HTML dashboard from a template input object.
+// Renders a complete, self-contained HTML dashboard from a direct-data view model.
+// No browser-side fetch — the template receives fully-populated sections and renders them directly.
 
 const SEVERITY_TONES = {
-  critical: { color: '#9b1c1c', bg: '#fde8e8', label: 'Critical' },
-  high: { color: '#b54708', bg: '#fef0e6', label: 'High' },
-  medium: { color: '#b7791f', bg: '#fff8e1', label: 'Medium' },
-  low: { color: '#667085', bg: '#f0f2f5', label: 'Low' },
-  neutral: { color: '#475467', bg: '#f5f7fa', label: '' },
+  critical: { color: '#9b1c1c', bg: '#fde8e8', label: '严重' },
+  high: { color: '#b54708', bg: '#fef0e6', label: '高风险' },
+  medium: { color: '#b7791f', bg: '#fff8e1', label: '中风险' },
+  low: { color: '#667085', bg: '#f0f2f5', label: '低风险' },
+  neutral: { color: '#475467', bg: '#f5f7fa', label: '信息' },
 };
 
 function escapeHtml(str) {
@@ -17,6 +18,24 @@ function escapeHtml(str) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
+}
+
+function hasValue(value) {
+  return value !== null && value !== undefined && value !== '' && value !== 0;
+}
+
+function visibleMetrics(metrics = []) {
+  return metrics.filter((metric) => hasValue(metric.value));
+}
+
+function visibleSections(sections = []) {
+  return sections.filter((section) => {
+    if (section.type === 'table') return Array.isArray(section.rows) && section.rows.length > 0;
+    if (section.type === 'definition_list') return Array.isArray(section.items) && section.items.some((item) => hasValue(item.value));
+    if (section.type === 'link_list') return Array.isArray(section.links) && section.links.length > 0;
+    if (section.type === 'callout') return hasValue(section.body) || hasValue(section.title);
+    return false;
+  });
 }
 
 function renderSummaryMetric(metric) {
@@ -30,14 +49,15 @@ function renderSummaryMetric(metric) {
 }
 
 function renderSummaryMetrics(metrics) {
-  if (!Array.isArray(metrics) || metrics.length === 0) return '';
-  return `<div class="summary-metrics">${metrics.map(renderSummaryMetric).join('\n')}</div>`;
+  const visible = visibleMetrics(metrics);
+  if (!Array.isArray(visible) || visible.length === 0) return '';
+  return `<div class="summary-metrics">${visible.map(renderSummaryMetric).join('\n')}</div>`;
 }
 
 function renderSeverityLegend() {
   const items = Object.entries(SEVERITY_TONES)
     .filter(([key]) => key !== 'neutral')
-    .map(([key, tone]) => `<span class="legend-item"><span class="legend-dot" style="background:${tone.color}"></span>${tone.label}</span>`)
+    .map(([, tone]) => `<span class="legend-item"><span class="legend-dot" style="background:${tone.color}"></span>${tone.label}</span>`)
     .join('');
   return `<div class="severity-legend">${items}</div>`;
 }
@@ -47,7 +67,7 @@ function renderFilterBar(filters) {
   const selects = filters.map((f) => {
     const id = escapeHtml(f.id ?? '');
     const label = escapeHtml(f.label ?? f.id ?? '');
-    return `<div class="filter-item"><label for="filter-${id}">${label}</label><select id="filter-${id}" name="${id}" disabled><option value="">All</option></select></div>`;
+    return `<div class="filter-item"><label for="filter-${id}">${label}</label><select id="filter-${id}" name="${id}" disabled><option value="">全部</option></select></div>`;
   }).join('\n');
   return `<div class="filter-bar">${selects}</div>`;
 }
@@ -55,73 +75,69 @@ function renderFilterBar(filters) {
 function renderTableSection(section) {
   const id = escapeHtml(section.id ?? '');
   const title = escapeHtml(section.title ?? '');
-  const ds = escapeHtml(section.data_source ?? '');
   const tableId = `table-${id}`;
+  const columns = Array.isArray(section.columns) ? section.columns : [];
+  const rows = Array.isArray(section.rows) ? section.rows : [];
+  if (rows.length === 0) return '';
+
+  const thead = columns.length > 0
+    ? `<tr>${columns.map((c) => `<th>${escapeHtml(c.label ?? c.key ?? '')}</th>`).join('')}</tr>`
+    : '<tr><th></th></tr>';
+  const tbody = rows.map((row) => {
+    if (columns.length > 0) {
+      return `<tr>${columns.map((c) => `<td>${escapeHtml(row?.[c.key] ?? '')}</td>`).join('')}</tr>`;
+    }
+    return `<tr><td>${escapeHtml(row ?? '')}</td></tr>`;
+  }).join('');
+
   return `<section class="data-section">
     <h3>${title}</h3>
-    <div class="data-source-note">Data source: <code>${ds}</code></div>
-    <table id="${tableId}" class="data-table"><thead><tr><th>(loading)</th></tr></thead><tbody></tbody></table>
-    <script>
-    (function(){
-      var table = document.getElementById(${JSON.stringify(tableId)});
-      var ds = ${JSON.stringify(ds)};
-      if(!table || !ds) return;
-      fetch(ds, { headers: { 'accept': 'application/json' } })
-        .then(function(r){ return r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)); })
-        .then(function(data){
-          var rows = (data && data.results) || (Array.isArray(data) ? data : []);
-          if(!rows.length){ var tb = table.querySelector('tbody'); tb.innerHTML = '<tr><td class="empty">无数据</td></tr>'; return; }
-          var keys = Object.keys(rows[0]);
-          var thead = '<tr>' + keys.map(function(k){ return '<th>' + k + '</th>'; }).join('') + '</tr>';
-          var tbody = rows.map(function(row){
-            return '<tr>' + keys.map(function(k){ return '<td>' + (row[k] === null || row[k] === undefined ? '' : String(row[k])) + '</td>'; }).join('') + '</tr>';
-          }).join('');
-          table.querySelector('thead').innerHTML = thead;
-          table.querySelector('tbody').innerHTML = tbody;
-        })
-        .catch(function(err){
-          var tb = table.querySelector('tbody');
-          tb.innerHTML = '<tr><td class="error">加载失败: ' + (err && err.message ? err.message : 'unknown') + '</td></tr>';
-        });
-    })();
-    </script>
+    <table id="${tableId}" class="data-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table>
   </section>`;
 }
 
-function renderMetadataSection(section) {
+function renderDefinitionListSection(section) {
   const id = escapeHtml(section.id ?? '');
   const title = escapeHtml(section.title ?? '');
-  const ds = escapeHtml(section.data_source ?? '');
-  const containerId = `meta-${id}`;
+  const items = Array.isArray(section.items) ? section.items.filter((item) => hasValue(item.value)) : [];
+  if (items.length === 0) return '';
+
+  const rows = items.map((item) => {
+    const label = escapeHtml(item.label ?? '');
+    const value = escapeHtml(item.value ?? '');
+    return `<div class="meta-row"><span class="meta-key">${label}</span><span class="meta-val">${value}</span></div>`;
+  }).join('');
+
   return `<section class="data-section">
     <h3>${title}</h3>
-    <div class="data-source-note">Data source: <code>${ds}</code></div>
-    <div id="${containerId}" class="metadata-block">(loading)</div>
-    <script>
-    (function(){
-      var el = document.getElementById(${JSON.stringify(containerId)});
-      var ds = ${JSON.stringify(ds)};
-      if(!el || !ds) return;
-      fetch(ds, { headers: { 'accept': 'application/json' } })
-        .then(function(r){ return r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)); })
-        .then(function(data){
-          if(!data || typeof data !== 'object'){ el.innerHTML = '<span class="empty">无数据</span>'; return; }
-          var rows = Object.keys(data).map(function(k){ return '<div class="meta-row"><span class="meta-key">' + k + '</span><span class="meta-val">' + (data[k] === null || data[k] === undefined ? '' : String(data[k])) + '</span></div>'; }).join('');
-          el.innerHTML = rows || '<span class="empty">无数据</span>';
-        })
-        .catch(function(err){ el.innerHTML = '<span class="error">加载失败: ' + (err && err.message ? err.message : 'unknown') + '</span>'; });
-    })();
-    </script>
+    <div id="meta-${id}" class="metadata-block">${rows}</div>
   </section>`;
 }
 
-function renderLinkSection(section) {
+function renderLinkListSection(section) {
   const title = escapeHtml(section.title ?? '');
-  const ds = escapeHtml(section.data_source ?? '');
-  if (!ds) return '';
+  const links = Array.isArray(section.links) ? section.links : [];
+  if (links.length === 0) return '';
+
+  const items = links.map((link) => {
+    const href = escapeHtml(link.href ?? '');
+    const text = escapeHtml(link.label ?? link.text ?? '');
+    return `<li><a href="${href}" class="section-link">${text}</a></li>`;
+  }).join('');
+
   return `<section class="data-section">
     <h3>${title}</h3>
-    <a href="${ds}" class="section-link">查看 ${title}</a>
+    <ul class="link-list">${items}</ul>
+  </section>`;
+}
+
+function renderCalloutSection(section) {
+  const title = escapeHtml(section.title ?? '');
+  const body = escapeHtml(section.body ?? '');
+  if (!title && !body) return '';
+  return `<section class="data-section callout">
+    ${title ? `<h3>${title}</h3>` : ''}
+    ${body ? `<div class="callout-body">${body}</div>` : ''}
   </section>`;
 }
 
@@ -129,19 +145,21 @@ function renderSection(section) {
   if (!section) return '';
   switch (section.type) {
     case 'table': return renderTableSection(section);
-    case 'metadata': return renderMetadataSection(section);
-    case 'link': return renderLinkSection(section);
+    case 'definition_list': return renderDefinitionListSection(section);
+    case 'link_list': return renderLinkListSection(section);
+    case 'callout': return renderCalloutSection(section);
     default: return '';
   }
 }
 
 function renderSections(sections) {
-  if (!Array.isArray(sections) || sections.length === 0) return '<div class="empty-state">暂无数据</div>';
-  return sections.map(renderSection).join('\n');
+  const visible = visibleSections(sections);
+  if (!Array.isArray(visible) || visible.length === 0) return '<div class="empty-state">暂无可展示的审查数据</div>';
+  return visible.map(renderSection).join('\n');
 }
 
 function renderEmptyState() {
-  return '<div class="empty-state">暂无数据</div>';
+  return '<div class="empty-state">暂无可展示的审查数据</div>';
 }
 
 function renderErrorState(message) {
@@ -150,7 +168,7 @@ function renderErrorState(message) {
 
 export function renderDashboard(templateInput) {
   const page = templateInput?.page ?? {};
-  const title = escapeHtml(page.title ?? 'Dashboard');
+  const title = escapeHtml(page.title ?? '审计看板');
   const subtitle = escapeHtml(page.subtitle ?? '');
   const updatedAt = escapeHtml(page.updated_at ?? '');
   const metrics = renderSummaryMetrics(templateInput?.summary_metrics);
@@ -246,8 +264,6 @@ body {
   margin-bottom: 16px;
 }
 .data-section h3 { margin: 0 0 8px 0; font-size: 16px; }
-.data-source-note { font-size: 12px; color: var(--text-muted); margin-bottom: 8px; }
-.data-source-note code { background: #f0f2f5; padding: 1px 6px; border-radius: 3px; }
 .data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .data-table th, .data-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; }
 .data-table th { background: #f9fafb; font-weight: 600; }
@@ -255,7 +271,10 @@ body {
 .meta-row { display: flex; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--border); }
 .meta-key { width: 180px; color: var(--text-muted); }
 .meta-val { flex: 1; word-break: break-all; }
+.link-list { list-style: none; padding: 0; margin: 0; }
+.link-list li { padding: 4px 0; }
 .section-link { color: var(--primary); text-decoration: none; }
+.callout-body { font-size: 14px; color: var(--text); }
 .empty-state, .empty, .error-state, .error { color: var(--text-muted); font-size: 13px; padding: 12px; }
 .error-state, .error { color: #9b1c1c; }
 footer { text-align: center; color: var(--text-muted); font-size: 12px; padding: 24px; }
@@ -270,14 +289,14 @@ footer { text-align: center; color: var(--text-muted); font-size: 12px; padding:
 </header>
 <main class="container">
   <div class="time-range-bar">
-    <span>Updated: ${updatedAt}</span>
+    <span>更新时间：${updatedAt}</span>
   </div>
   ${metrics}
   ${legend}
   ${filters}
   ${sections}
 </main>
-<footer>audit-logger-agent dashboard</footer>
+<footer>audit-logger-agent 审计看板</footer>
 </body>
 </html>`;
 }
@@ -286,4 +305,4 @@ export function renderOverviewHtml(templateInput) {
   return renderDashboard(templateInput);
 }
 
-export { renderEmptyState, renderErrorState, SEVERITY_TONES };
+export { renderEmptyState, renderErrorState, SEVERITY_TONES, hasValue, visibleMetrics, visibleSections };
