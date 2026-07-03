@@ -19,6 +19,17 @@ import { recoverInflightRuns } from '../src/agent/recovery.js';
 import { loadAppConfig } from '../src/app/loadConfig.js';
 import { loadOpenAIConfig } from '../src/llm/openaiConfig.js';
 import { createOpenAIResponsesClient } from '../src/llm/openaiResponsesClient.js';
+import { ensureReviewSchema } from '../src/db/reviewSchema.js';
+import { createReviewStore } from '../src/auditReview/reviewStore.js';
+import { createLockStore } from '../src/auditReview/lockStore.js';
+import { createIngestCursorStore } from '../src/auditReview/ingestCursorStore.js';
+import { createAuditIngestService } from '../src/auditReview/ingestService.js';
+import { createCandidateDetector } from '../src/auditReview/candidateDetector.js';
+import { createLlmReviewer } from '../src/auditReview/llmReviewer.js';
+import { createReviewNotifier } from '../src/auditReview/notification.js';
+import { createVisualization } from '../src/auditReview/visualization.js';
+import { createDashboardAuth } from '../src/auditReview/dashboardAuth.js';
+import { createAuditReviewScheduler } from '../src/auditReview/scheduler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -26,6 +37,7 @@ const config = loadAppConfig(rootDir);
 const dbPath = path.resolve(rootDir, config.dbPath);
 const db = openDb(dbPath);
 ensureRuntimeSchema(db);
+ensureReviewSchema(db);
 
 const runStore = createRunStore(db);
 const waitStore = createWaitStore(db);
@@ -48,6 +60,7 @@ const planner = createPlanner({
 });
 
 const auditLogger = createRuntimeAuditLogger(db);
+const reviewAuditLogger = createRuntimeAuditLogger(db, { agentId: 'audit-logger-agent' });
 
 const eventPublisher = createEventPublisher({
   outboxStore,
@@ -75,7 +88,62 @@ try {
   console.error(`Run recovery failed: ${error.message}`);
 }
 
-const app = createHttpApp({ db, config: { ...config, dbPath }, runStore, runtime });
+// v1.4: audit review scheduler — construct all review-system dependencies.
+const reviewStore = createReviewStore(db);
+const lockStore = createLockStore(db);
+const cursorStore = createIngestCursorStore(db);
+const ingestService = createAuditIngestService({ db, config, cursorStore, now: () => new Date() });
+const detector = createCandidateDetector({ db, riskPolicy: config.auditReview?.riskPolicy ?? {} });
+const llmReviewer = createLlmReviewer({
+  llmClient,
+  model: openAIConfig.model,
+  promptVersion: config.auditReview?.llmReview?.promptVersion,
+  reviewerVersion: config.auditReview?.llmReview?.reviewerVersion,
+});
+const reviewNotifier = createReviewNotifier({ outboxStore, config });
+const reviewVisualization = createVisualization({ reviewStore, config });
+const dashboardAuth = createDashboardAuth({ config, env: process.env });
+const scheduler = createAuditReviewScheduler({
+  db,
+  config,
+  reviewStore,
+  lockStore,
+  ingestService,
+  cursorStore,
+  detector,
+  llmReviewer,
+  notifier: reviewNotifier,
+  visualization: reviewVisualization,
+  auditLogger: reviewAuditLogger,
+  now: () => new Date(),
+});
+
+// v1.4: validate dashboard auth boot config (throws if non-loopback without token).
+dashboardAuth.validateBoot({ bindHost: config.auditReview?.http?.bindHost ?? '127.0.0.1' });
+
+// v1.4: recover stale review runs on startup.
+try {
+  scheduler.recoverStaleRuns();
+} catch (error) {
+  console.error(`Review recovery failed: ${error.message}`);
+}
+
+// v1.4: start the periodic scheduler if enabled.
+if (config.auditReview?.enabled !== false) {
+  scheduler.start();
+  console.log('Audit review scheduler started.');
+}
+
+const app = createHttpApp({
+  db,
+  config: { ...config, dbPath },
+  runStore,
+  runtime,
+  scheduler,
+  reviewStore,
+  visualization: reviewVisualization,
+  dashboardAuth,
+});
 const portIndex = process.argv.indexOf('--port');
 const portArg = portIndex >= 0 ? Number(process.argv[portIndex + 1]) : 9320;
 const port = Number.isFinite(portArg) ? portArg : 9320;
@@ -93,6 +161,7 @@ app.listen(port, '127.0.0.1', () => {
 });
 
 process.on('SIGINT', () => {
+  scheduler.stop();
   clearInterval(flushInterval);
   db.close();
   process.exit(0);

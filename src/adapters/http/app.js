@@ -1,6 +1,7 @@
 // src/adapters/http/app.js
 import http from 'http';
 import { queryEvents, dailySummary, errorReport, toolUsageStats } from '../../../scripts/lib/db.js';
+import { renderDashboard } from '../../auditReview/dashboardTemplate.js';
 
 function json(res, status, data) {
   res.writeHead(status, {
@@ -10,6 +11,38 @@ function json(res, status, data) {
     'access-control-allow-headers': 'content-type',
   });
   res.end(JSON.stringify(data));
+}
+
+// Response helper for audit-review routes: applies CORS headers from dashboardAuth
+// and supports bearer-token authorization. Used by the new /v1/audit-* and /dashboard routes.
+function auditJson(res, status, data, corsHeaders) {
+  const headers = {
+    'content-type': 'application/json; charset=utf-8',
+    'access-control-allow-methods': 'GET, POST, OPTIONS',
+    'access-control-allow-headers': 'content-type, authorization',
+  };
+  Object.assign(headers, corsHeaders ?? {});
+  res.writeHead(status, headers);
+  res.end(JSON.stringify(data));
+}
+
+function html(res, status, body, corsHeaders) {
+  const headers = {
+    'content-type': 'text/html; charset=utf-8',
+    'access-control-allow-methods': 'GET, OPTIONS',
+    'access-control-allow-headers': 'content-type, authorization',
+  };
+  Object.assign(headers, corsHeaders ?? {});
+  res.writeHead(status, headers);
+  res.end(body);
+}
+
+// Map dashboardAuth authorize failures to HTTP status + body.
+function mapAuthFailure(authResult) {
+  if (authResult.ok) return null;
+  const status = authResult.status ?? 401;
+  const code = authResult.code ?? 'unauthorized';
+  return { status, body: { error_code: code, error: 'Unauthorized' } };
 }
 
 async function readJson(req) {
@@ -50,7 +83,15 @@ function mapRuntimeError(error) {
   return { status: 500, body: { error_code: 'internal_error', error: 'Internal server error' } };
 }
 
-export function createHttpApp({ db, config, runStore, runtime }) {
+export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth } = {}) {
+  // Helpers for audit-review routes. These are optional — if not provided
+  // (e.g. in the existing runs-api test), the new routes return 503.
+  const hasReviewDeps = !!(scheduler && reviewStore && visualization && dashboardAuth);
+  function reviewCors(req) {
+    if (!dashboardAuth) return {};
+    const origin = req.headers.origin;
+    return dashboardAuth.corsHeaders(origin);
+  }
   return http.createServer(async (req, res) => {
     const url = parseUrl(req);
 
@@ -60,6 +101,117 @@ export function createHttpApp({ db, config, runStore, runtime }) {
     }
 
     try {
+      // ===================== Audit Review API (v1.4) =====================
+      if (hasReviewDeps && req.method === 'GET' && url.pathname === '/v1/audit-reviews') {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const fail = mapAuthFailure(auth);
+        if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
+        const limit = Number(url.searchParams.get('limit') ?? 50);
+        const offset = Number(url.searchParams.get('offset') ?? 0);
+        const runs = reviewStore.listRuns({ limit, offset });
+        auditJson(res, 200, { count: runs.length, results: runs }, cors);
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/v1/audit-reviews/') && url.pathname !== '/v1/audit-reviews/run') {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const fail = mapAuthFailure(auth);
+        if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
+        const reviewId = decodeURIComponent(url.pathname.split('/').pop());
+        const run = reviewStore.getRun(reviewId);
+        if (!run) { auditJson(res, 404, { error_code: 'review_not_found', error: 'Review not found' }, cors); return; }
+        auditJson(res, 200, run, cors);
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'GET' && url.pathname === '/v1/audit-findings') {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const fail = mapAuthFailure(auth);
+        if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
+        const limit = Number(url.searchParams.get('limit') ?? 100);
+        const offset = Number(url.searchParams.get('offset') ?? 0);
+        const severity = url.searchParams.get('severity') ?? undefined;
+        const category = url.searchParams.get('category') ?? undefined;
+        const agentId = url.searchParams.get('agent_id') ?? undefined;
+        const toolName = url.searchParams.get('tool_name') ?? undefined;
+        const statusFilter = url.searchParams.get('status') ?? undefined;
+        const reviewId = url.searchParams.get('review_id') ?? undefined;
+        const findings = reviewStore.listFindings({ limit, offset, severity, category, agentId, toolName, status: statusFilter, reviewId });
+        auditJson(res, 200, { count: findings.length, results: findings }, cors);
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/v1/audit-findings/')) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const fail = mapAuthFailure(auth);
+        if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
+        const findingId = decodeURIComponent(url.pathname.split('/').pop());
+        const finding = reviewStore.getFinding(findingId);
+        if (!finding) { auditJson(res, 404, { error_code: 'finding_not_found', error: 'Finding not found' }, cors); return; }
+        auditJson(res, 200, finding, cors);
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'POST' && url.pathname === '/v1/audit-reviews/run') {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorize(req, { isWrite: true });
+        const fail = mapAuthFailure(auth);
+        if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
+        try {
+          const result = await scheduler.runOnce({ triggerType: 'manual' });
+          if (result.status === 'skipped') {
+            auditJson(res, 409, { error_code: 'review_already_running', error: 'A review is already running', review_id: result.reviewId }, cors);
+          } else {
+            auditJson(res, 202, { review_id: result.reviewId, status: result.status }, cors);
+          }
+        } catch (error) {
+          auditJson(res, 500, { error_code: 'internal_error', error: error.message }, cors);
+        }
+        return;
+      }
+
+      // ===================== Dashboard Pages (v1.4) =====================
+      if (hasReviewDeps && req.method === 'GET' && url.pathname === '/dashboard') {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
+        const page = visualization.overviewPage();
+        html(res, 200, renderDashboard(page), cors);
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/dashboard/audit-reviews/')) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
+        const reviewId = decodeURIComponent(url.pathname.split('/').pop());
+        const run = reviewStore.getRun(reviewId);
+        if (!run) { html(res, 404, '<h1>Review not found</h1>', cors); return; }
+        const page = visualization.reviewDetailPage(reviewId);
+        html(res, 200, renderDashboard(page), cors);
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/dashboard/audit-findings/')) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
+        const findingId = decodeURIComponent(url.pathname.split('/').pop());
+        const finding = reviewStore.getFinding(findingId);
+        if (!finding) { html(res, 404, '<h1>Finding not found</h1>', cors); return; }
+        const page = visualization.findingDetailPage(findingId);
+        html(res, 200, renderDashboard(page), cors);
+        return;
+      }
+
+      // ===================== Existing Routes (unchanged) =====================
       if (req.method === 'GET' && url.pathname === '/health') {
         json(res, 200, { status: 'ok', dbPath: config.dbPath });
         return;
