@@ -148,7 +148,6 @@ test('audit review HTTP integration smoke test', async () => {
           {
             category: 'high_risk_permission',
             severity: 'high',
-            confidence: 0.9,
             agent_id: 'agent-test',
             tool_name: 'db.delete',
             trace_id: 'trace-del-1',

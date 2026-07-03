@@ -160,7 +160,6 @@ function makeFakeLlmClient(reviewOverride) {
           {
             category: 'failed_call',
             severity: 'medium',
-            confidence: 0.8,
             agent_id: 'mt-agent',
             tool_name: 'some.tool',
             trace_id: 'trace-1',
