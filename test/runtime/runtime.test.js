@@ -186,13 +186,13 @@ test('runtime pauses for user decision and resumes to final result', async () =>
   });
 
   const created = await runtime.startRun({
-    channel: 'feishu',
-    conversationId: 'oc_test',
+    sourceType: 'manual',
+    sessionId: 'session_test',
     messageId: 'om_test',
-    userOpenId: 'ou_test',
+    requesterId: 'user_test',
     requestText: '帮我处理异常任务',
     deliveryMode: 'callback',
-    callbackUrl: 'http://127.0.0.1:9999/agent-events',
+    deliveryTargetUrl: 'http://127.0.0.1:9999/agent-events',
     metadata: {},
   });
 

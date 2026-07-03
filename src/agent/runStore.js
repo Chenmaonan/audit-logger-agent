@@ -75,6 +75,14 @@ export function createRunStore(db) {
 
   return {
     createRun(input) {
+      // Map generic delivery ingress names onto the existing persisted columns.
+      // Legacy DB column names (channel, conversation_id, user_open_id,
+      // delivery_callback_url) remain as internal storage detail.
+      const channel = input.sourceType ?? input.channel;
+      const conversationId = input.sessionId ?? input.conversationId;
+      const userOpenId = input.requesterId ?? input.userOpenId;
+      const callbackUrl = input.deliveryTargetUrl ?? input.callbackUrl;
+
       // P2-05: idempotency. Prefer an explicit idempotency key, then fall back
       // to (channel, message_id). A duplicate request returns the existing run
       // rather than creating a new one.
@@ -82,8 +90,8 @@ export function createRunStore(db) {
         const existing = findByIdempotencyStmt.get(input.idempotencyKey);
         if (existing) return hydrateRun(existing);
       }
-      if (input.channel && input.messageId) {
-        const existing = findByMessageStmt.get({ channel: input.channel, message_id: input.messageId });
+      if (channel && input.messageId) {
+        const existing = findByMessageStmt.get({ channel, message_id: input.messageId });
         if (existing) return hydrateRun(existing);
       }
 
@@ -91,14 +99,14 @@ export function createRunStore(db) {
       const runId = `run_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
       insertRunStmt.run({
         run_id: runId,
-        channel: input.channel,
-        conversation_id: input.conversationId,
+        channel,
+        conversation_id: conversationId,
         message_id: input.messageId,
-        user_open_id: input.userOpenId,
+        user_open_id: userOpenId,
         status: 'created',
         request_text: input.requestText,
         delivery_mode: input.deliveryMode,
-        delivery_callback_url: input.callbackUrl,
+        delivery_callback_url: callbackUrl,
         metadata_json: JSON.stringify(input.metadata ?? {}),
         plan_json: null,
         current_step_index: 0,

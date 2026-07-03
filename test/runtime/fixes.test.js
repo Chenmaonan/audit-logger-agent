@@ -153,13 +153,13 @@ function freshRuntime({ registry } = {}) {
 }
 
 const baseInput = {
-  channel: 'feishu',
-  conversationId: 'oc_test',
+  sourceType: 'manual',
+  sessionId: 'session_test',
   messageId: 'om_test',
-  userOpenId: 'ou_test',
+  requesterId: 'user_test',
   requestText: '帮我处理异常任务',
   deliveryMode: 'callback',
-  callbackUrl: 'http://127.0.0.1:9999/agent-events',
+  deliveryTargetUrl: 'http://127.0.0.1:9999/agent-events',
   metadata: {},
 };
 
@@ -243,7 +243,7 @@ test('P2-05: duplicate message_id returns the same run', async () => {
   await waitForTerminal(ctx.runStore, first.run_id);
   const second = await ctx.runtime.startRun(baseInput);
   assert.equal(first.run_id, second.run_id);
-  const total = ctx.db.prepare(`SELECT COUNT(*) AS c FROM agent_runs WHERE channel = ? AND message_id = ?`).get('feishu', 'om_test').c;
+  const total = ctx.db.prepare(`SELECT COUNT(*) AS c FROM agent_runs WHERE channel = ? AND message_id = ?`).get('manual', 'om_test').c;
   assert.equal(total, 1, 'duplicate message_id must not create a second run');
   ctx.cleanup();
 });

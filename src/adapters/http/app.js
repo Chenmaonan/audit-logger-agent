@@ -60,17 +60,49 @@ function isNonEmptyString(value) {
   return typeof value === 'string' && value.trim() !== '';
 }
 
-function validateCreateRunBody(body) {
+function validateCreateRunInput(input) {
   const errors = [];
-  if (!isNonEmptyString(body.channel)) errors.push({ field: 'channel', message: 'channel is required' });
-  if (!isNonEmptyString(body.conversation_id)) errors.push({ field: 'conversation_id', message: 'conversation_id is required' });
-  if (!body.user || !isNonEmptyString(body.user.open_id)) errors.push({ field: 'user.open_id', message: 'user.open_id is required' });
-  if (!body.request || !isNonEmptyString(body.request.text)) errors.push({ field: 'request.text', message: 'request.text is required' });
-  if (!body.delivery || !isNonEmptyString(body.delivery.mode)) errors.push({ field: 'delivery.mode', message: 'delivery.mode is required' });
-  if (body.delivery && body.delivery.mode === 'callback' && !isNonEmptyString(body.delivery.callback_url)) {
-    errors.push({ field: 'delivery.callback_url', message: 'delivery.callback_url is required when delivery.mode is callback' });
+  if (!isNonEmptyString(input.sourceType)) errors.push({ field: 'source.type', message: 'source.type is required' });
+  if (!isNonEmptyString(input.sessionId)) errors.push({ field: 'source.session_id', message: 'source.session_id is required' });
+  if (!isNonEmptyString(input.requesterId)) errors.push({ field: 'source.requester_id', message: 'source.requester_id is required' });
+  if (!isNonEmptyString(input.requestText)) errors.push({ field: 'request.text', message: 'request.text is required' });
+  if (!isNonEmptyString(input.deliveryMode)) errors.push({ field: 'delivery.mode', message: 'delivery.mode is required' });
+  if (input.deliveryMode === 'callback' && !isNonEmptyString(input.deliveryTargetUrl)) {
+    errors.push({ field: 'delivery.target_url', message: 'delivery.target_url is required when delivery.mode is callback' });
   }
   return errors;
+}
+
+// Normalizes the incoming run request into a generic shape consumed by
+// runtime.startRun. Accepts both the new generic envelope
+// ({ source, request, delivery, metadata }) and the legacy Bot-shaped body
+// ({ channel, conversation_id, user, request, delivery }) for backwards compat.
+function normalizeRunRequest(body, headers) {
+  if (body?.source && body?.request) {
+    return {
+      sourceType: body.source.type,
+      sessionId: body.source.session_id,
+      messageId: body.source.message_id,
+      requesterId: body.source.requester_id,
+      requestText: body.request.text,
+      deliveryMode: body.delivery?.mode,
+      deliveryTargetUrl: body.delivery?.target_url,
+      metadata: body.metadata,
+      idempotencyKey: body.idempotency_key ?? headers['idempotency-key'],
+    };
+  }
+
+  return {
+    sourceType: body.channel,
+    sessionId: body.conversation_id,
+    messageId: body.message_id,
+    requesterId: body.user?.open_id,
+    requestText: body.request?.text,
+    deliveryMode: body.delivery?.mode,
+    deliveryTargetUrl: body.delivery?.callback_url,
+    metadata: body.metadata,
+    idempotencyKey: body.idempotency_key ?? headers['idempotency-key'],
+  };
 }
 
 // Maps runtime-thrown errors (carrying a stable `code`) to HTTP status + body.
@@ -249,24 +281,15 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (req.method === 'POST' && url.pathname === '/v1/runs') {
         const body = await readJson(req);
-        const validationErrors = validateCreateRunBody(body);
+        const normalized = normalizeRunRequest(body, req.headers);
+        const validationErrors = validateCreateRunInput(normalized);
         if (validationErrors.length > 0) {
           json(res, 400, { error_code: 'invalid_request', error: 'Invalid request body', details: validationErrors });
           return;
         }
         // P2-01: startRun now creates the run synchronously and kicks off
         // execution in the background, so this returns immediately (async ACK).
-        const created = await runtime.startRun({
-          channel: body.channel,
-          conversationId: body.conversation_id,
-          messageId: body.message_id,
-          userOpenId: body.user?.open_id,
-          requestText: body.request?.text,
-          deliveryMode: body.delivery?.mode,
-          callbackUrl: body.delivery?.callback_url,
-          metadata: body.metadata,
-          idempotencyKey: body.idempotency_key ?? req.headers['idempotency-key'],
-        });
+        const created = await runtime.startRun(normalized);
         json(res, 202, { run_id: created.run_id, status: created.status });
         return;
       }

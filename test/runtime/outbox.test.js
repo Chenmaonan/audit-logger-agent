@@ -7,7 +7,7 @@ import http from 'http';
 import { openDb } from '../../scripts/lib/db.js';
 import { ensureRuntimeSchema } from '../../src/db/runtimeSchema.js';
 import { createOutboxStore } from '../../src/agent/outboxStore.js';
-import { createCallbackClient } from '../../src/adapters/bot/callbackClient.js';
+import { createCallbackClient } from '../../src/adapters/delivery/callbackClient.js';
 import { createEventPublisher } from '../../src/agent/eventPublisher.js';
 
 test('outbox event is delivered to callback url and marked delivered', async () => {

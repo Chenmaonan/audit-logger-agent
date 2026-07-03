@@ -2,7 +2,7 @@
 import crypto from 'crypto';
 import { insertEvents } from '../../scripts/lib/db.js';
 
-export function createRuntimeAuditLogger(db, { agentId = 'feishu-independent-agent' } = {}) {
+export function createRuntimeAuditLogger(db, { agentId = 'audit-runtime-agent', channel = 'system' } = {}) {
   return {
     async log({ runId, traceId = null, event, status, summary, toolName = 'agent.runtime' }) {
       const ts = new Date().toISOString();
@@ -20,7 +20,7 @@ export function createRuntimeAuditLogger(db, { agentId = 'feishu-independent-age
         status,
         result_summary: summary,
         duration_ms: null,
-        channel: 'feishu',
+        channel,
         user_id: null,
         product_id: null,
         error_code: null,

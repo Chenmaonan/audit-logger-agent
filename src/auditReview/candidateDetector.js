@@ -72,6 +72,7 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
   const slowCallDurationMs = policy.slowCallDurationMs ?? 30000;
   const highRiskToolPatterns = policy.highRiskToolPatterns ?? [];
   const agentToolAllowlists = policy.agentToolAllowlists ?? {};
+  const trustedChannels = policy.trustedChannels ?? [];
 
   const selectSql = `
     SELECT id, ts, agent_id, trace_id, span_id, parent_span_id, event, tool_name,
@@ -154,7 +155,7 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
           makeCandidate(row, 'high_risk_permission', `tool_name matches high-risk pattern`),
         );
         // 5. abnormal channel for high-risk tool
-        if (row.channel != null && row.channel !== 'feishu') {
+        if (trustedChannels.length > 0 && row.channel != null && !trustedChannels.includes(row.channel)) {
           candidates.push(
             makeCandidate(row, 'anomalous_call', `high-risk tool on unexpected channel=${row.channel}`),
           );

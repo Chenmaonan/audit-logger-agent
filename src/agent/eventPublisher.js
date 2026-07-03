@@ -1,5 +1,8 @@
 // src/agent/eventPublisher.js
-export function createEventPublisher({ outboxStore, callbackClient }) {
+// Accepts either `deliveryClient` or the legacy `callbackClient` name for
+// backwards-compatible construction.
+export function createEventPublisher({ outboxStore, deliveryClient, callbackClient }) {
+  const sender = deliveryClient ?? callbackClient;
   return {
     enqueueRunEvent(run, type, payload) {
       outboxStore.enqueue({
@@ -15,7 +18,7 @@ export function createEventPublisher({ outboxStore, callbackClient }) {
       const pending = outboxStore.listPending(limit);
       for (const event of pending) {
         try {
-          await callbackClient.send(event.callback_url, event.payload_json);
+          await sender.send(event.callback_url, event.payload_json);
           outboxStore.markDelivered(event.event_id);
         } catch (error) {
           outboxStore.markFailed(event.event_id, error);

@@ -64,13 +64,13 @@ test('runtime executes an OpenAI-planned audit task through the real Responses A
   });
 
   const created = await runtime.startRun({
-    channel: 'feishu',
-    conversationId: 'oc_test',
+    sourceType: 'manual',
+    sessionId: 'session_test',
     messageId: 'om_openai',
-    userOpenId: 'ou_test',
+    requesterId: 'user_test',
     requestText: 'Analyze all audit error events for today (2026-07-02) and summarize them. Do not ask for clarification — execute directly.',
     deliveryMode: 'callback',
-    callbackUrl: 'http://127.0.0.1:9999/agent-events',
+    deliveryTargetUrl: 'http://127.0.0.1:9999/agent-events',
     metadata: {},
   });
 

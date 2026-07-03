@@ -1,4 +1,4 @@
-// src/adapters/bot/callbackClient.js
+// src/adapters/delivery/callbackClient.js
 export function createCallbackClient({ fetchImpl = globalThis.fetch } = {}) {
   if (typeof fetchImpl !== 'function') {
     throw new Error('fetch implementation is required');
@@ -13,7 +13,7 @@ export function createCallbackClient({ fetchImpl = globalThis.fetch } = {}) {
       });
 
       if (!response.ok) {
-        throw new Error(`Bot callback failed with HTTP ${response.status}`);
+        throw new Error(`Delivery callback failed with HTTP ${response.status}`);
       }
     },
   };
