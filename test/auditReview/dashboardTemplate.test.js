@@ -1,46 +1,44 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { renderDashboard, renderOverviewHtml } from '../../src/auditReview/dashboardTemplate.js';
+import { renderDashboard } from '../../src/auditReview/dashboardTemplate.js';
 
-const sampleInput = {
-  page: { title: '审计审查 Dashboard', subtitle: '最近审查风险概览', updated_at: '2026-07-03T10:30:00.000Z' },
-  summary_metrics: [
-    { label: 'Critical', value: 0, tone: 'critical' },
-    { label: 'High', value: 3, tone: 'high' },
-    { label: 'Medium', value: 5, tone: 'medium' },
-    { label: 'Low', value: 2, tone: 'low' },
-  ],
-  filters: [
-    { id: 'severity', type: 'select', label: 'Severity' },
-    { id: 'agent_id', type: 'select', label: 'Agent' },
-  ],
-  sections: [
-    { id: 'latest_findings', title: '最新风险', type: 'table', data_source: '/v1/audit-findings?limit=20' },
-  ],
-};
+test('renderDashboard renders Chinese labels and no browser fetch', () => {
+  const html = renderDashboard({
+    page: { title: '审计审查总览', subtitle: '最近审查与风险概览', updated_at: '2026-07-03T10:30:00.000Z' },
+    summary_metrics: [{ label: '高风险', value: 3, tone: 'high' }],
+    sections: [{
+      id: 'latest_findings',
+      type: 'table',
+      title: '最新风险发现',
+      columns: [{ key: 'title', label: '标题' }],
+      rows: [{ title: '高危删除操作' }],
+    }],
+  });
 
-test('renderDashboard returns a complete HTML string', () => {
-  const html = renderDashboard(sampleInput);
-  assert.equal(typeof html, 'string');
-  assert.ok(html.toLowerCase().includes('<html'), 'should contain <html');
-  assert.ok(html.includes('Severity'), 'should contain Severity');
-  assert.ok(html.includes(sampleInput.page.title), 'should contain the page title');
-  assert.ok(html.includes('<!DOCTYPE html>'), 'should be a complete doctype document');
-  assert.ok(html.includes('<style>'), 'should have inline css');
+  assert.ok(html.includes('审计审查总览'));
+  assert.ok(html.includes('最新风险发现'));
+  assert.equal(html.includes('Data source'), false);
+  assert.equal(html.includes('fetch('), false);
+  assert.equal(html.includes('Severity'), false);
 });
 
-test('renderOverviewHtml is an alias for renderDashboard', () => {
-  const html = renderOverviewHtml(sampleInput);
-  assert.equal(html, renderDashboard(sampleInput));
-});
+test('renderDashboard hides empty metrics and empty sections', () => {
+  const html = renderDashboard({
+    page: { title: '审计审查总览' },
+    summary_metrics: [
+      { label: '严重', value: 0, tone: 'critical' },
+      { label: '高风险', value: 2, tone: 'high' },
+    ],
+    sections: [
+      { id: 'empty_table', type: 'table', title: '空表格', columns: [{ key: 'name', label: '名称' }], rows: [] },
+      { id: 'detail', type: 'definition_list', title: '详情', items: [
+        { label: 'Agent', value: 'mt-agent' },
+        { label: '空字段', value: '' },
+      ] },
+    ],
+  });
 
-test('renderDashboard renders metric values and legend', () => {
-  const html = renderDashboard(sampleInput);
-  assert.ok(html.includes('Critical'), 'should render Critical legend');
-  assert.ok(html.includes('High'), 'should render High legend');
-});
-
-test('renderDashboard renders empty state when sections is empty', () => {
-  const html = renderDashboard({ page: { title: 'Empty' }, summary_metrics: [], filters: [], sections: [] });
-  assert.ok(html.includes('empty-state'), 'should render empty state');
+  assert.equal(html.includes('空表格'), false);
+  assert.equal(html.includes('空字段'), false);
+  assert.ok(html.includes('mt-agent'));
 });
