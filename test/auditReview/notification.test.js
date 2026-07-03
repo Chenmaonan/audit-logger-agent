@@ -119,6 +119,11 @@ test('enqueue emits audit_review_summary with dashboard_url and top_findings', (
   assert.deepEqual(payload.severity_counts, { critical: 0, high: 2, medium: 0, low: 0 });
   assert.equal(payload.top_findings.length, 2);
   assert.equal(payload.top_findings[0].finding_id, 'f1');
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(payload.top_findings[0], 'confidence'),
+    false,
+    'top_findings must not carry confidence (removed in v1.5)',
+  );
   assert.equal(payload.top_findings[0].agent_name, 'MT 审计 Agent', 'top_findings should prefer agent_name from evidence');
   assert.equal(payload.actions[0].id, 'open_dashboard');
   assert.equal(payload.actions[0].label, '打开 Dashboard');
