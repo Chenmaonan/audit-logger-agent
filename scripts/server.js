@@ -115,6 +115,7 @@ const scheduler = createAuditReviewScheduler({
   notifier: reviewNotifier,
   visualization: reviewVisualization,
   auditLogger: reviewAuditLogger,
+  llmModel: openAIConfig.model,
   now: () => new Date(),
 });
 

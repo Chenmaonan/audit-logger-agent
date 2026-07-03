@@ -155,6 +155,7 @@ export function createAuditReviewScheduler({
   notifier,
   visualization,
   auditLogger,
+  llmModel: llmModelOpt,
   now = () => new Date(),
 } = {}) {
   if (!db) throw new Error('createAuditReviewScheduler: db is required');
@@ -176,7 +177,7 @@ export function createAuditReviewScheduler({
   const riskPolicyVersion = auditConfig.riskPolicy?.version ?? 'risk-policy-v1';
   const promptVersion = auditConfig.llmReview?.promptVersion ?? 'audit-review-prompt-v1';
   const reviewerVersion = auditConfig.llmReview?.reviewerVersion ?? 'audit-reviewer-v1';
-  const llmModel = config.planner?.model ?? config.auditReview?.llmReview?.model ?? null;
+  const llmModel = llmModelOpt ?? config.planner?.model ?? config.auditReview?.llmReview?.model ?? null;
 
   let intervalTimer = null;
   let refreshTimer = null;
@@ -421,7 +422,7 @@ export function createAuditReviewScheduler({
 
       if (!llmResult.ok) {
         status = 'completed_degraded';
-        errorCode = llmResult.error ?? 'llm_error';
+        errorCode = 'llm_error';
       }
 
       // 8. Persist findings.
