@@ -68,7 +68,9 @@ const RISK_POLICY = {
 function makeConfig(overrides = {}) {
   return {
     dbPath: ':memory:',
-    agents: {},
+    agents: {
+      'mt-agent': { displayName: 'MT 审计 Agent' },
+    },
     auditReview: {
       enabled: true,
       intervalMinutes: 30,
@@ -167,7 +169,7 @@ function makeFakeLlmClient(reviewOverride) {
             title: '工具调用失败',
             summary: 'some.tool 状态为 error',
             recommendation: '检查工具调用',
-            evidence_event_ids: [],
+            evidence_event_ids: [1],
             requires_action: false,
           },
         ],
@@ -238,6 +240,14 @@ test('scheduler.runOnce happy path: creates completed run, persists findings, re
   // Findings should be persisted.
   const findings = deps.reviewStore.listFindings({ limit: 100 });
   assert.ok(findings.length > 0, 'should have at least one finding');
+
+  // Evidence should be structured with agent_name and log_detail.
+  const firstFinding = findings[0];
+  assert.ok(Array.isArray(firstFinding.evidence));
+  assert.ok(firstFinding.evidence.length > 0, 'finding should carry at least one evidence entry');
+  assert.equal(firstFinding.evidence[0].agent_id, 'mt-agent');
+  assert.ok(firstFinding.evidence[0].agent_name, 'evidence should carry agent_name');
+  assert.ok(firstFinding.evidence[0].log_detail, 'evidence should carry log_detail');
 
   // Lock should be released.
   const lock = deps.lockStore.getLock('audit_review_scheduler');

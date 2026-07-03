@@ -37,7 +37,6 @@ function makeReview() {
         finding_id: 'f1',
         category: 'failed_call',
         severity: 'high',
-        confidence: 0.9,
         agent_id: 'mt-agent',
         tool_name: 'publicTraffic.runReport',
         trace_id: 'trace_1',
@@ -45,12 +44,22 @@ function makeReview() {
         summary: '10 分钟内失败 5 次。',
         recommendation: '检查上游服务。',
         requires_action: true,
+        evidence: [
+          {
+            event_id: 1,
+            agent_id: 'mt-agent',
+            agent_name: 'MT 审计 Agent',
+            tool_name: 'publicTraffic.runReport',
+            trace_id: 'trace_1',
+            span_id: 'span-1',
+            log_detail: { ts: '2026-07-03T10:00:00.000Z', event: 'tool.end', status: 'error', duration_ms: 120, product_id: 'product-1', result_summary: 'failed', error_code: 'boom', error_message: 'down', reason: 'repeated failure' },
+          },
+        ],
       },
       {
         finding_id: 'f2',
         category: 'high_risk_permission',
         severity: 'high',
-        confidence: 0.85,
         agent_id: 'rental-agent',
         tool_name: 'permission.grant',
         trace_id: 'trace_2',
@@ -58,6 +67,17 @@ function makeReview() {
         summary: '非预期用户执行了 permission.grant。',
         recommendation: '确认授权。',
         requires_action: true,
+        evidence: [
+          {
+            event_id: 2,
+            agent_id: 'rental-agent',
+            agent_name: '租赁 Agent',
+            tool_name: 'permission.grant',
+            trace_id: 'trace_2',
+            span_id: 'span-2',
+            log_detail: { ts: '2026-07-03T10:01:00.000Z', event: 'tool.end', status: 'ok', duration_ms: 50, product_id: null, result_summary: 'granted', error_code: null, error_message: null, reason: 'high-risk permission' },
+          },
+        ],
       },
     ],
   };
@@ -99,6 +119,7 @@ test('enqueue emits audit_review_summary with dashboard_url and top_findings', (
   assert.deepEqual(payload.severity_counts, { critical: 0, high: 2, medium: 0, low: 0 });
   assert.equal(payload.top_findings.length, 2);
   assert.equal(payload.top_findings[0].finding_id, 'f1');
+  assert.equal(payload.top_findings[0].agent_name, 'MT 审计 Agent', 'top_findings should prefer agent_name from evidence');
   assert.equal(payload.actions[0].id, 'open_dashboard');
   assert.equal(payload.actions[0].label, '打开 Dashboard');
   assert.equal(payload.actions[0].url, payload.dashboard_url);
@@ -151,10 +172,21 @@ test('enqueueFinding enqueues high/critical findings individually', () => {
     title: '失败调用',
     summary: '失败 5 次',
     recommendation: '检查',
-    agent_id: 'a',
+    agent_id: 'mt-agent',
     tool_name: 't',
     trace_id: 'tr',
     product_id: 'p',
+    evidence: [
+      {
+        event_id: 1,
+        agent_id: 'mt-agent',
+        agent_name: 'MT 审计 Agent',
+        tool_name: 't',
+        trace_id: 'tr',
+        span_id: 's1',
+        log_detail: { ts: '2026-07-03T10:00:00.000Z', event: 'tool.end', status: 'error', duration_ms: 100, product_id: 'p', result_summary: 'failed', error_code: 'boom', error_message: 'down', reason: 'repeated' },
+      },
+    ],
   };
   const result = notifier.enqueueFinding({
     finding,
@@ -165,8 +197,12 @@ test('enqueueFinding enqueues high/critical findings individually', () => {
   assert.equal(result.enqueued, true);
   assert.equal(outbox.calls.length, 1);
   assert.equal(outbox.calls[0].type, 'audit_review_finding');
-  assert.equal(outbox.calls[0].payload.finding_id, 'f1');
-  assert.equal(outbox.calls[0].payload.severity, 'high');
+  const payload = outbox.calls[0].payload;
+  assert.equal(payload.finding_id, 'f1');
+  assert.equal(payload.severity, 'high');
+  assert.equal(payload.agent_name, 'MT 审计 Agent', 'finding payload should prefer agent_name from evidence');
+  assert.ok(Array.isArray(payload.evidence), 'finding payload should include evidence array');
+  assert.ok(payload.evidence.length > 0, 'finding payload evidence should be non-empty');
 });
 
 test('enqueueFinding skips medium findings', () => {

@@ -11,6 +11,7 @@
 //   - Emit runtime audit events for every lifecycle step (agent_id='audit-logger-agent').
 
 import crypto from 'crypto';
+import { agentDisplayName, buildEvidenceDetail, buildEvidenceIndex, evidenceForEventIds } from './evidence.js';
 
 const LOCK_NAME = 'audit_review_scheduler';
 const LEASE_MINUTES = 10;
@@ -41,7 +42,8 @@ function lastSuccessfulWindowTo(reviewStore) {
 /**
  * Build a minimal finding from a candidate (used in degraded mode when LLM fails).
  */
-function findingFromCandidate(candidate, reviewId, riskPolicyVersion, promptVersion, reviewerVersion) {
+function findingFromCandidate(candidate, reviewId, riskPolicyVersion, promptVersion, reviewerVersion, agentsConfig) {
+  const evidence = [buildEvidenceDetail(candidate, agentsConfig)];
   return {
     finding_id: `finding_${crypto.randomUUID()}`,
     review_id: reviewId,
@@ -57,7 +59,7 @@ function findingFromCandidate(candidate, reviewId, riskPolicyVersion, promptVers
     requires_action: 0,
     evidence_event_ids: [candidate.event_id],
     evidence_event_ids_json: JSON.stringify([candidate.event_id]),
-    evidence_json: null,
+    evidence_json: JSON.stringify(evidence),
     normalized_error_code: candidate.error_code ?? null,
     risk_policy_version: riskPolicyVersion,
     prompt_version: promptVersion,
@@ -103,7 +105,7 @@ function degradedReview({ reviewId, window, candidates }) {
 /**
  * Build findings from ingest parse errors (design 5.3).
  */
-function parseErrorFindings(parseErrors, reviewId, riskPolicyVersion, reviewerVersion) {
+function parseErrorFindings(parseErrors, reviewId, riskPolicyVersion, reviewerVersion, agentsConfig) {
   if (!parseErrors || parseErrors.length === 0) return [];
   // Group by agent_id
   const byAgent = new Map();
@@ -116,6 +118,19 @@ function parseErrorFindings(parseErrors, reviewId, riskPolicyVersion, reviewerVe
     const uniqueFiles = new Set(errors.map((e) => e.file));
     const severity = uniqueFiles.size >= 3 ? 'high' : 'medium';
     const samples = errors.slice(0, 3).map((e) => `${e.file}:${e.line} ${e.error}`);
+    const errorEvidence = errors.slice(0, 3).map((errorRow) => ({
+      event_id: null,
+      agent_id: agentId,
+      agent_name: agentDisplayName(agentId, agentsConfig),
+      tool_name: 'audit.ingest',
+      trace_id: null,
+      span_id: null,
+      log_detail: {
+        file: errorRow.file,
+        line: errorRow.line,
+        error: errorRow.error,
+      },
+    }));
     findings.push({
       finding_id: `finding_${crypto.randomUUID()}`,
       review_id: reviewId,
@@ -131,7 +146,7 @@ function parseErrorFindings(parseErrors, reviewId, riskPolicyVersion, reviewerVe
       requires_action: 0,
       evidence_event_ids: [],
       evidence_event_ids_json: '[]',
-      evidence_json: JSON.stringify(errors.slice(0, 3)),
+      evidence_json: JSON.stringify(errorEvidence),
       risk_policy_version: riskPolicyVersion,
       prompt_version: null,
       reviewer_version: reviewerVersion,
@@ -167,6 +182,12 @@ export function createAuditReviewScheduler({
   if (!auditLogger) throw new Error('createAuditReviewScheduler: auditLogger is required');
 
   const auditConfig = config.auditReview ?? {};
+  // Evidence helpers expect a config object with an `agents` map at its top
+  // level. Resolve the correct slice so agentDisplayName works regardless of
+  // whether agents are declared at the root or under auditReview.
+  const agentsConfig = config.agents
+    ? config
+    : (config.auditReview?.agents ? { agents: config.auditReview.agents } : config);
   const intervalMinutes = auditConfig.intervalMinutes ?? 30;
   const initialDelaySeconds = auditConfig.initialDelaySeconds ?? 30;
   const lookbackOverlapMinutes = auditConfig.lookbackOverlapMinutes ?? 5;
@@ -375,12 +396,16 @@ export function createAuditReviewScheduler({
         candidates = { candidates: [], totalEvents: 0, trimmed: false };
       }
 
+      // 6a. Build a structured evidence index keyed by event_id for LLM findings.
+      const evidenceIndex = buildEvidenceIndex(candidates.candidates, agentsConfig);
+
       // 6b. Persist parse-error findings.
       const parseFindings = parseErrorFindings(
         ingestResult.parseErrors,
         reviewId,
         riskPolicyVersion,
         reviewerVersion,
+        agentsConfig,
       );
       for (const f of parseFindings) {
         try {
@@ -425,31 +450,35 @@ export function createAuditReviewScheduler({
       // 8. Persist findings.
       let findingsToPersist = [];
       if (llmResult.ok && llmResult.review && Array.isArray(llmResult.review.findings)) {
-        findingsToPersist = llmResult.review.findings.map((f) => ({
-          finding_id: `finding_${crypto.randomUUID()}`,
-          review_id: reviewId,
-          category: f.category,
-          severity: f.severity,
-          agent_id: f.agent_id,
-          tool_name: f.tool_name,
-          trace_id: f.trace_id,
-          product_id: f.product_id,
-          title: f.title,
-          summary: f.summary,
-          recommendation: f.recommendation,
-          requires_action: f.requires_action ? 1 : 0,
-          evidence_event_ids: Array.isArray(f.evidence_event_ids) ? f.evidence_event_ids : [],
-          evidence_event_ids_json: JSON.stringify(f.evidence_event_ids ?? []),
-          evidence_json: null,
-          normalized_error_code: f.error_code ?? null,
-          risk_policy_version: riskPolicyVersion,
-          prompt_version: promptVersion,
-          reviewer_version: reviewerVersion,
-        }));
+        findingsToPersist = llmResult.review.findings.map((f) => {
+          const evidenceIds = Array.isArray(f.evidence_event_ids) ? f.evidence_event_ids : [];
+          const evidence = evidenceForEventIds(evidenceIds, evidenceIndex);
+          return {
+            finding_id: `finding_${crypto.randomUUID()}`,
+            review_id: reviewId,
+            category: f.category,
+            severity: f.severity,
+            agent_id: f.agent_id,
+            tool_name: f.tool_name,
+            trace_id: f.trace_id,
+            product_id: f.product_id,
+            title: f.title,
+            summary: f.summary,
+            recommendation: f.recommendation,
+            requires_action: f.requires_action ? 1 : 0,
+            evidence_event_ids: evidenceIds,
+            evidence_event_ids_json: JSON.stringify(evidenceIds),
+            evidence_json: JSON.stringify(evidence),
+            normalized_error_code: f.error_code ?? null,
+            risk_policy_version: riskPolicyVersion,
+            prompt_version: promptVersion,
+            reviewer_version: reviewerVersion,
+          };
+        });
       } else {
         // Degraded mode: convert each candidate to a basic finding.
         findingsToPersist = candidates.candidates.map((c) =>
-          findingFromCandidate(c, reviewId, riskPolicyVersion, promptVersion, reviewerVersion),
+          findingFromCandidate(c, reviewId, riskPolicyVersion, promptVersion, reviewerVersion, agentsConfig),
         );
       }
 
