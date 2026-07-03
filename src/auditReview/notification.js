@@ -27,6 +27,7 @@ function pickTopFindings(findings, limit = 5) {
       category: f.category,
       title: f.title,
       agent_id: f.agent_id,
+      agent_name: f.evidence?.[0]?.agent_name ?? f.agent_name ?? f.agent_id,
       tool_name: f.tool_name,
       summary: f.summary,
     }));
@@ -69,9 +70,11 @@ export function buildFindingPayload({ finding, reviewId, run, dashboardUrl }) {
     summary: finding.summary,
     recommendation: finding.recommendation,
     agent_id: finding.agent_id,
+    agent_name: finding.evidence?.[0]?.agent_name ?? finding.agent_name ?? finding.agent_id,
     tool_name: finding.tool_name,
     trace_id: finding.trace_id,
     product_id: finding.product_id,
+    evidence: Array.isArray(finding.evidence) ? finding.evidence.slice(0, 5) : [],
     dashboard_url: dashboardUrl,
     window: { from: windowFrom, to: windowTo },
     actions: [
