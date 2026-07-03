@@ -16,7 +16,6 @@ function goodReview() {
       {
         category: 'failed_call',
         severity: 'high',
-        confidence: 0.92,
         agent_id: 'mt-agent',
         tool_name: 'publicTraffic.runReport',
         trace_id: 'trace-1',
@@ -53,9 +52,16 @@ test('validateReview rejects bad category', () => {
   assert.match(result.error.message, /category/);
 });
 
-test('validateReview rejects confidence out of range', () => {
+test('validateReview accepts a finding without confidence', () => {
   const r = goodReview();
-  r.findings[0].confidence = 1.5;
+  delete r.findings[0].confidence;
+  const result = validateReview(r);
+  assert.equal(result.ok, true);
+});
+
+test('validateReview rejects confidence because v1.5 removed the field', () => {
+  const r = goodReview();
+  r.findings[0].confidence = 0.92;
   const result = validateReview(r);
   assert.equal(result.ok, false);
   assert.match(result.error.message, /confidence/);

@@ -53,8 +53,8 @@ export function validateReview(review) {
     if (!REVIEW_CATEGORIES.includes(f.category)) return invalid(`${ctx}.category must be one of ${REVIEW_CATEGORIES.join(', ')}`);
     if (!SEVERITIES.includes(f.severity)) return invalid(`${ctx}.severity must be one of ${SEVERITIES.join(', ')}`);
 
-    if (typeof f.confidence !== 'number' || !Number.isFinite(f.confidence) || f.confidence < 0 || f.confidence > 1) {
-      return invalid(`${ctx}.confidence must be a number in [0, 1]`);
+    if (Object.prototype.hasOwnProperty.call(f, 'confidence')) {
+      return invalid(`${ctx}.confidence has been removed in v1.5`);
     }
 
     if (!isString(f.agent_id) && f.agent_id != null) return invalid(`${ctx}.agent_id must be a string or null/omitted`);
@@ -126,7 +126,6 @@ export function reviewJsonSchema() {
             properties: {
               category: { type: 'string', enum: REVIEW_CATEGORIES },
               severity: { type: 'string', enum: SEVERITIES },
-              confidence: { type: 'number', minimum: 0, maximum: 1 },
               agent_id: { type: ['string', 'null'] },
               tool_name: { type: ['string', 'null'] },
               trace_id: { type: ['string', 'null'] },
@@ -140,7 +139,6 @@ export function reviewJsonSchema() {
             required: [
               'category',
               'severity',
-              'confidence',
               'agent_id',
               'tool_name',
               'trace_id',

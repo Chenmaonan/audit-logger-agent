@@ -28,7 +28,6 @@ CREATE TABLE IF NOT EXISTS audit_review_findings (
   finding_hash TEXT NOT NULL,
   category TEXT NOT NULL,
   severity TEXT NOT NULL,
-  confidence REAL,
   agent_id TEXT,
   tool_name TEXT,
   trace_id TEXT,

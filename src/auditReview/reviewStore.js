@@ -23,6 +23,31 @@ export function computeFindingHash({ category, agentId, toolName, traceId, produ
   return crypto.createHash('sha256').update(parts.join('|')).digest('hex').slice(0, 16);
 }
 
+function parseJson(value, fallback) {
+  if (value == null || value === '') return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Hydrate a raw DB row into a finding object, stripping any legacy
+ * `confidence` column (removed in v1.5) and parsing JSON text columns
+ * (`evidence_event_ids_json`, `evidence_json`) into structured values.
+ */
+function hydrateFinding(row) {
+  if (!row) return null;
+  const { confidence, evidence_event_ids_json, evidence_json, ...rest } = row;
+  void confidence;
+  return {
+    ...rest,
+    evidence_event_ids: parseJson(evidence_event_ids_json, []),
+    evidence: parseJson(evidence_json, []),
+  };
+}
+
 export function createReviewStore(db) {
   const insertRunStmt = db.prepare(`
     INSERT INTO audit_review_runs (
@@ -73,7 +98,7 @@ export function createReviewStore(db) {
 
   const insertFindingStmt = db.prepare(`
     INSERT INTO audit_review_findings (
-      finding_id, review_id, finding_hash, category, severity, confidence,
+      finding_id, review_id, finding_hash, category, severity,
       agent_id, tool_name, trace_id, product_id,
       title, summary, recommendation, requires_action,
       evidence_event_ids_json, evidence_json,
@@ -82,7 +107,7 @@ export function createReviewStore(db) {
       acknowledged_at, acknowledged_by,
       risk_policy_version, prompt_version, reviewer_version
     ) VALUES (
-      @finding_id, @review_id, @finding_hash, @category, @severity, @confidence,
+      @finding_id, @review_id, @finding_hash, @category, @severity,
       @agent_id, @tool_name, @trace_id, @product_id,
       @title, @summary, @recommendation, @requires_action,
       @evidence_event_ids_json, @evidence_json,
@@ -217,7 +242,7 @@ export function createReviewStore(db) {
           clear_notified: severityEscalated ? 1 : 0,
         });
         const updated = findExistingStmt.get(findingHash);
-        return { finding: updated, isNew: false, severityEscalated };
+        return { finding: hydrateFinding(updated), isNew: false, severityEscalated };
       }
       const findingId = finding.finding_id ?? `fnd_${crypto.randomUUID()}`;
       insertFindingStmt.run({
@@ -226,7 +251,6 @@ export function createReviewStore(db) {
         finding_hash: findingHash,
         category: finding.category,
         severity: finding.severity,
-        confidence: finding.confidence ?? null,
         agent_id: finding.agent_id ?? null,
         tool_name: finding.tool_name ?? null,
         trace_id: finding.trace_id ?? null,
@@ -253,7 +277,7 @@ export function createReviewStore(db) {
         reviewer_version: finding.reviewer_version,
       });
       const inserted = getFindingStmt.get(findingId);
-      return { finding: inserted, isNew: true, severityEscalated: false };
+      return { finding: hydrateFinding(inserted), isNew: true, severityEscalated: false };
     },
 
     insertFinding(finding) {
@@ -261,7 +285,7 @@ export function createReviewStore(db) {
     },
 
     getFinding(findingId) {
-      return getFindingStmt.get(findingId) ?? null;
+      return hydrateFinding(getFindingStmt.get(findingId) ?? null);
     },
 
     listFindings({ limit = 100, offset = 0, severity, category, agentId, toolName, status, reviewId } = {}) {
@@ -274,9 +298,10 @@ export function createReviewStore(db) {
       if (status) { conditions.push('status = @status'); params.status = status; }
       if (reviewId) { conditions.push('review_id = @reviewId'); params.reviewId = reviewId; }
       const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-      return db.prepare(
+      const rows = db.prepare(
         `SELECT * FROM audit_review_findings ${where} ORDER BY last_seen_at DESC LIMIT @limit OFFSET @offset`
       ).all(params);
+      return rows.map(hydrateFinding);
     },
 
     updateFinding(findingId, patch) {
@@ -289,7 +314,7 @@ export function createReviewStore(db) {
         resolved_at: patch.resolved_at ?? null,
         last_notified_at: patch.last_notified_at ?? null,
       });
-      return getFindingStmt.get(findingId) ?? null;
+      return hydrateFinding(getFindingStmt.get(findingId) ?? null);
     },
 
     listDeadLetterCount() {
