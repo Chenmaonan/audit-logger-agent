@@ -2,7 +2,7 @@
 
 跨 Agent 的结构化审计日志采集、查询、报表，基于 LLM 的审计分析 Agent 运行时，以及 v1.4 的常驻式 LLM 日志审查与主动告警守护进程。
 
-本项目把其它 Agent（rental-price-agent、MT-agent 及未来新增 Agent）在工具调用时产出的审计日志，统一汇聚到本地 SQLite，提供查询与报表接口；通过一个带状态机的 Agent 运行时，由 LLM 规划、本地执行工具，对审计异常进行分析与汇总；并自 v1.4 起，常驻周期性地采集其他 Agent 日志、用规则预筛 + LLM 结构化审查识别高危调用，主动通过飞书 Bot 推送审查摘要，并提供本地 Web Dashboard 钻取。
+本项目把其它 Agent（rental-price-agent、MT-agent 及未来新增 Agent）在工具调用时产出的审计日志，统一汇聚到本地 SQLite，提供查询与报表接口；通过一个带状态机的 Agent 运行时，由 LLM 规划、本地执行工具，对审计异常进行分析与汇总；并自 v1.4 起，常驻周期性地采集其他 Agent 日志、用规则预筛 + LLM 结构化审查识别高危调用，主动通过通用回调投递审查摘要，并提供本地 Web Dashboard 钻取。
 
 ---
 
@@ -13,7 +13,7 @@
 - **报表**：日报、错误报表、工具统计报表。
 - **HTTP 服务**：本地 HTTP API，支持在线查询与报表。
 - **LLM Agent 运行时**：v1.3 起，planner 由 OpenAI 兼容的 LLM 驱动，输出结构化执行计划或决策请求；工具仍在本地执行，全过程可审计。
-- **常驻式 LLM 日志审查（v1.4）**：`AuditReviewScheduler` 默认每 30 分钟运行一次审查周期——增量采集日志、规则预筛候选事件、LLM 结构化审查分级、持久化审查批次与去重 findings、生成飞书 Bot 摘要写入 outbox 主动投递，并提供本地 Dashboard 可视化。
+- **常驻式 LLM 日志审查（v1.4）**：`AuditReviewScheduler` 默认每 30 分钟运行一次审查周期——增量采集日志、规则预筛候选事件、LLM 结构化审查分级、持久化审查批次与去重 findings、生成通用回调投递摘要写入 outbox 主动投递，并提供本地 Dashboard 可视化。
 
 ---
 
@@ -172,18 +172,20 @@ node scripts/server.js --port 9320
 Invoke-RestMethod -Uri "http://127.0.0.1:9320/health" -Method Get
 ```
 
-启动后，通过 `POST /v1/runs` 给 Agent 派发一个任务。`request.text` 是用户要安排的任务内容；`delivery.callback_url` 是 Agent 投递进度、用户决策请求和最终结果的回调地址。
+启动后，通过 `POST /v1/runs` 给 Agent 派发一个任务。`request.text` 是用户要安排的任务内容；`delivery.target_url` 是 Agent 投递进度、用户决策请求和最终结果的回调接收端地址。
 
 ```powershell
 $body = @{
-  channel = "manual"
-  conversation_id = "oc_manual"
-  message_id = "om_manual_001"
-  user = @{ open_id = "ou_manual" }
+  source = @{
+    channel = "manual"
+    conversation_id = "oc_manual"
+    message_id = "om_manual_001"
+    user = @{ open_id = "ou_manual" }
+  }
   request = @{ text = "分析今天所有审计异常，并汇总风险最高的链路" }
   delivery = @{
     mode = "callback"
-    callback_url = "http://127.0.0.1:9999/agent-events"
+    target_url = "http://127.0.0.1:9999/agent-events"
   }
   metadata = @{ tenant_key = "tenant_manual" }
 } | ConvertTo-Json -Depth 8
@@ -210,7 +212,7 @@ Invoke-RestMethod `
 Invoke-RestMethod -Uri "http://127.0.0.1:9320/v1/runs/<run_id>" -Method Get
 ```
 
-如果 Agent 认为任务范围不明确，它会向 `callback_url` 投递 `decision_request`，其中包含 `run_id`、`decision_id`、`options` 和可选的 `form_schema`。调用方收集用户选择后，用 `/resume` 恢复任务：
+如果 Agent 认为任务范围不明确，它会向 `delivery.target_url` 投递 `decision_request`，其中包含 `run_id`、`decision_id`、`options` 和可选的 `form_schema`。调用方收集用户选择后，用 `/resume` 恢复任务：
 
 ```powershell
 $resumeBody = @{
@@ -245,7 +247,7 @@ Invoke-RestMethod `
   -> agent_run_steps
   -> LLM 合成最终结果
   -> agent_outbox_events
-  -> Bot callback_url
+  -> delivery target (callback receiver)
 ```
 
 ### 工作方式
@@ -260,12 +262,14 @@ Invoke-RestMethod `
 
 ```powershell
 $body = @{
-  channel = "feishu"
-  conversation_id = "oc_manual"
-  message_id = "om_manual_openai"
-  user = @{ open_id = "ou_manual" }
+  source = @{
+    channel = "manual"
+    conversation_id = "oc_manual"
+    message_id = "om_manual_openai"
+    user = @{ open_id = "ou_manual" }
+  }
   request = @{ text = "分析今天所有的审计异常并汇总风险最高的链路" }
-  delivery = @{ mode = "callback"; callback_url = "http://127.0.0.1:9999/agent-events" }
+  delivery = @{ mode = "callback"; target_url = "http://127.0.0.1:9999/agent-events" }
   metadata = @{ tenant_key = "tenant_manual" }
 } | ConvertTo-Json -Depth 8
 
@@ -292,7 +296,7 @@ v1.4 把 audit-logger-agent 从“被动查询、按需分析”升级为“常�
 2. **规则预筛**：`candidateDetector` 确定性识别失败调用、连续重复调用、高危工具名、超长耗时、未知工具、span 不完整、日志解析错误等候选事件，保证 LLM 不可用时也能发现基础风险。
 3. **LLM 结构化审查**：`llmReviewer` 把候选摘要交由 LLM 合并同类、判断严重程度、给出解释与建议，输出经本地 schema 校验后入库；LLM 异常时降级为 `completed_degraded`，仍持久化规则层 findings 并标注“本轮仅包含规则检测结果”。
 4. **持久化**：写入 `audit_review_runs`（含 `risk_policy_version` / `prompt_version` / `reviewer_version` / `llm_model`）与 `audit_review_findings`。`finding_hash`（不含 severity）跨重叠窗口去重，同一问题升级/降级时更新原 finding 的 severity 与 `occurrence_count`。
-5. **主动通知**：生成 `audit_review_summary`（及对 high/critical 的单条 `audit_review_finding`）写入 `agent_outbox_events`，由现有 outbox flush 机制投递到飞书 Bot callback URL；摘要必带 `dashboard_url`。
+5. **主动通知**：生成 `audit_review_summary`（及对 high/critical 的单条 `audit_review_finding`）写入 `agent_outbox_events`，由现有 outbox flush 机制投递到通用回调接收端；摘要必带 `dashboard_url`。
 6. **可视化**：本地 Dashboard 提供总览、审查详情、finding 证据钻取，复用通用模板布局。
 
 ### 并发与恢复
@@ -377,7 +381,7 @@ curl -H "Authorization: Bearer $AUDIT_AGENT_DASHBOARD_TOKEN" \
       "baseUrl": "http://127.0.0.1:9320",
       "dashboardPath": "/dashboard",
       "template": "audit-review-dashboard-v1",
-      "attachDashboardUrlToFeishu": true
+      "attachDashboardUrlToCallback": true
     }
   }
 }
@@ -423,7 +427,7 @@ src/
     reviewSchema.js       LLM 输出 JSON schema 与本地校验
     reviewStore.js        audit_review_runs/findings 持久化与去重
     lockStore.js          审查租约锁
-    notification.js       审查结果转 outbox 飞书 payload
+    notification.js       审查结果转 outbox 通用投递 payload
     visualization.js      dashboard/API 数据聚合
     dashboardTemplate.js  通用 Dashboard 模板渲染
     dashboardAuth.js      Dashboard 与审查 API 鉴权/CORS
@@ -450,8 +454,8 @@ v1.4/               v1.4 设计文档
 - 对源日志文件只做只读操作，SQLite 数据库是唯一可写产物。
 - 密钥只放在 git-ignored 的 `.config` 或环境变量，绝不写入 `config.json`、数据库、审计事件、outbox 或文档示例中的真实值。
 - 模型输出永远先经本地校验，不会被直接信任并改变运行状态。
-- v1.4：发给 LLM 的 evidence 只含摘要字段，默认不含原始 input/output；飞书摘要不展示敏感参数，只展示 tool/agent/trace/错误摘要与建议。
-- v1.4：Dashboard 与 `/v1/audit-*` API 默认只面向本机；对外监听时必须启用 token 鉴权与受限 CORS；手动触发审查 API 始终需鉴权，避免任何能访问端口者触发 LLM 调用与飞书通知。
+- v1.4：发给 LLM 的 evidence 只含摘要字段，默认不含原始 input/output；回调摘要不展示敏感参数，只展示 tool/agent/trace/错误摘要与建议。
+- v1.4：Dashboard 与 `/v1/audit-*` API 默认只面向本机；对外监听时必须启用 token 鉴权与受限 CORS；手动触发审查 API 始终需鉴权，避免任何能访问端口者触发 LLM 调用与回调通知。
 - v1.4：若 `callbackUrl` / `baseUrl` 实际包含 token，应迁移到 `.config` 或环境变量，不写入 `config.json`。
 
 ---

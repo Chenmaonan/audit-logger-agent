@@ -1,5 +1,7 @@
 # v1.4 常驻式 LLM 日志审查与主动告警设计方案
 
+> v1.5 delta: review payloads are still delivered through the outbox/callback mechanism, but the implementation no longer treats Flybook/Bot as a required platform. `confidence` has been removed from the active review contract. Dashboard pages now render direct data with Chinese labels and hide empty sections. Finding evidence includes log id, agent id, agent display name, and sanitized log details.
+
 ## 1. 文档目标
 
 v1.4 的目标是把当前的 audit-logger-agent 从“可被动查询、可按用户请求分析”的审计工具，升级为“常驻运行、周期采集、主动审核、主动通知、可视化追踪”的审计守护进程。
@@ -7,7 +9,7 @@ v1.4 的目标是把当前的 audit-logger-agent 从“可被动查询、可按�
 本次变更围绕三件事展开：
 
 1. Agent 启动后保持常驻，周期性获取其他 Agent 的审计日志，默认建议每 30 分钟执行一次。
-2. 每次获取日志后，由 LLM 对高危权限调用、异常调用、连续重复调用、失败调用等进行审查，并主动通过飞书 Bot 展示给用户。
+2. 每次获取日志后，由 LLM 对高危权限调用、异常调用、连续重复调用、失败调用等进行审查，并主动通过通用回调接收端展示给用户。
 3. 为日志审查结果提供可视化能力，并给出推荐方案。
 
 ---
@@ -24,7 +26,7 @@ v1.4 的目标是把当前的 audit-logger-agent 从“可被动查询、可按�
 | 常驻 HTTP 服务 | `scripts/server.js` 已常驻运行 | 高 |
 | LLM Planner | v1.3 已接入 OpenAI 兼容 LLM，并使用结构化输出 | 高 |
 | Outbox 投递 | `agent_outbox_events` 已支持 pending、重试、dead_letter | 高 |
-| Bot 回调 | `callbackClient` 可把标准 payload POST 到 Bot callback URL | 高 |
+| 回调 | `callbackClient` 可把标准 payload POST 到通用回调接收端 | 高 |
 
 当前主要缺口：
 
@@ -48,11 +50,11 @@ v1.4 的目标是把当前的 audit-logger-agent 从“可被动查询、可按�
 4. 先用本地规则做预筛，降低 LLM 输入量，并保证关键风险即使 LLM 不可用也能被发现。
 5. 调用 LLM 进行结构化审查，输出风险分级、证据、解释和建议。
 6. 持久化审查批次和风险发现。
-7. 生成飞书 Bot 展示 payload，写入 outbox。
-8. 由现有 outbox flush 机制主动投递给 Bot。
+7. 生成通用回调投递 payload，写入 outbox。
+8. 由现有 outbox flush 机制主动投递给回调接收端。
 9. 同时通过审查结果 API 和本地 Web Dashboard 提供后续钻取。
 
-飞书卡片摘要和本地 Web Dashboard 是 v1.4 的固定可视化组合。每次飞书摘要必须携带本地 Dashboard 链接；Dashboard 必须基于通用模板实现，后续审查类页面通过复用模板保持布局、组件和视觉风格一致。
+通用回调卡片摘要和本地 Web Dashboard 是 v1.4 的固定可视化组合。每次回调摘要必须携带本地 Dashboard 链接；Dashboard 必须基于通用模板实现，后续审查类页面通过复用模板保持布局、组件和视觉风格一致。
 
 ```mermaid
 flowchart TD
@@ -64,8 +66,8 @@ flowchart TD
   F --> G["audit_review_runs / audit_review_findings"]
   G --> H["审查结果 payload"]
   H --> I["agent_outbox_events"]
-  I --> J["Bot callbackClient"]
-  J --> K["飞书 Bot / 飞书卡片"]
+  I --> J["回调 callbackClient"]
+  J --> K["回调接收端 / 通用卡片"]
   G --> L["审查 API / 可视化 Dashboard"]
 ```
 
@@ -194,7 +196,7 @@ audit-YYYY-MM-DD.jsonl
 
 - 严重程度默认 `medium`
 - 如果同一 agent 连续多个文件解析失败，升级为 `high`
-- 飞书摘要中展示 parse error 数量和前 3 条样例
+- 回调摘要中展示 parse error 数量和前 3 条样例
 
 ### 5.4 文件游标与大文件性能
 
@@ -285,14 +287,14 @@ LLM 负责：
 - 合并同类候选项，避免一堆重复告警刷屏。
 - 结合 trace、agent、tool、错误信息判断严重程度。
 - 给出用户可读解释。
-- 给出建议动作，例如“检查某 trace”、“确认该工具调用是否授权”、“查看 Bot 回调失败原因”。
+- 给出建议动作，例如"检查某 trace"、"确认该工具调用是否授权"、"查看回调投递失败原因"。
 - 输出结构化 JSON，必须经过本地 schema 校验。
 
 LLM 不负责：
 
 - 直接执行工具。
 - 直接修改数据库状态。
-- 直接发送飞书消息。
+- 直接发送回调消息。
 - 绕过本地规则和 schema 校验。
 
 ### 6.6 LLM 输入裁剪与脱敏
@@ -370,7 +372,7 @@ LLM 不负责：
 - `category` 必须属于固定枚举。
 - `evidence_event_ids` 必须引用本轮候选事件。
 - `confidence` 必须是 0 到 1 的数字。
-- 单条 `summary` 和 `recommendation` 需要长度上限，避免飞书卡片过长。
+- 单条 `summary` 和 `recommendation` 需要长度上限，避免回调卡片过长。
 
 ### 6.8 策略与 Prompt 版本化
 
@@ -531,17 +533,17 @@ finding 生命周期建议：
 
 ---
 
-## 8. 主动飞书 Bot 通知设计
+## 8. 主动回调通知设计
 
 ### 8.1 投递边界
 
 推荐继续保持当前边界：
 
-- audit-logger-agent 负责产出标准结构化 payload，并调用 Bot callback URL。
-- 飞书 Bot 服务负责把 payload 渲染成飞书卡片并调用飞书平台。
-- audit-logger-agent 不直接持有飞书 tenant secret、app secret 或 webhook secret。
+- audit-logger-agent 负责产出标准结构化 payload，并调用回调接收端 URL。
+- 回调接收端服务负责把 payload 渲染成最终展示（如卡片、IM 消息等）并投递到目标平台。
+- audit-logger-agent 不直接持有目标平台的 secret（如 IM 平台 tenant secret、app secret 或 webhook secret）。
 
-如果后续必须由 audit-logger-agent 直连飞书 webhook，webhook URL 或 secret 必须放在 `.config` 或环境变量，不得写入 `config.json`。
+如果后续必须由 audit-logger-agent 直连外部 webhook，webhook URL 或 secret 必须放在 `.config` 或环境变量，不得写入 `config.json`。
 
 ### 8.2 通知目标配置
 
@@ -565,7 +567,7 @@ finding 生命周期建议：
 }
 ```
 
-`callbackUrl` 是 Bot 服务提供给 audit-logger-agent 的接收地址。如果该地址包含敏感 token，应改放 `.config`，并让 `config.json` 只保存非敏感逻辑配置。
+`callbackUrl` 是回调接收端提供给 audit-logger-agent 的接收地址。如果该地址包含敏感 token，应改放 `.config`，并让 `config.json` 只保存非敏感逻辑配置。
 
 ### 8.3 通知节流
 
@@ -576,9 +578,9 @@ finding 生命周期建议：
 - `low`：只入库和可视化，不推送。
 - 如果本轮无 finding，默认不推送；可通过 `sendEmptyReview` 打开“平安报告”。
 
-### 8.4 飞书卡片 payload
+### 8.4 通用回调投递 payload
 
-audit-logger-agent 输出给 Bot 的 payload 建议与飞书卡片解耦：
+audit-logger-agent 输出给回调接收端的 payload 建议与具体平台卡片解耦：
 
 ```json
 {
@@ -618,14 +620,14 @@ audit-logger-agent 输出给 Bot 的 payload 建议与飞书卡片解耦：
 }
 ```
 
-Bot 渲染建议：
+回调渲染建议：
 
 - 顶部展示窗口时间、总事件数、风险总数。
 - 使用颜色区分 `critical/high/medium/low`。
 - 只展示 Top 3 到 Top 5 findings，避免卡片过长。
-- 必须附带 `dashboard_url`，并提供“打开 Dashboard”按钮跳转到本地审查详情页。
-- 如果 Bot 渲染端无法访问本地 Dashboard，应仍展示完整摘要，并把 `dashboard_url` 作为纯文本链接保留。
-- 后续可增加“已确认”“忽略本规则 24 小时”等交互，但不作为 MVP 必须项。
+- 必须附带 `dashboard_url`，并提供"打开 Dashboard"按钮跳转到本地审查详情页。
+- 如果回调渲染端无法访问本地 Dashboard，应仍展示完整摘要，并把 `dashboard_url` 作为纯文本链接保留。
+- 后续可增加"已确认""忽略本规则 24 小时"等交互，但不作为 MVP 必须项。
 
 ---
 
@@ -633,15 +635,15 @@ Bot 渲染建议：
 
 ### 9.1 已确定方案
 
-v1.4 可视化明确采用 **本地 Web Dashboard + 飞书卡片摘要**。
+v1.4 可视化明确采用 **本地 Web Dashboard + 通用回调卡片摘要**。
 
-- 飞书卡片摘要负责主动触达用户，展示本轮审查窗口、风险数量、Top findings 和 Dashboard 链接。
+- 通用回调卡片摘要负责主动触达用户，展示本轮审查窗口、风险数量、Top findings 和 Dashboard 链接。
 - 本地 Web Dashboard 负责历史趋势、审查批次列表、finding 详情、证据链钻取和后续复用展示。
 - 不再把 Markdown/HTML 静态报告或外部 BI 作为 v1.4 默认方案；这些可以作为后续导出或集成能力。
 
-### 9.2 飞书卡片与 Dashboard 链接契约
+### 9.2 回调卡片与 Dashboard 链接契约
 
-每一条 `audit_review_summary` payload 必须包含 `dashboard_url`。Bot 渲染飞书卡片时必须把该链接展示为主操作按钮。
+每一条 `audit_review_summary` payload 必须包含 `dashboard_url`。回调渲染端展示卡片时必须把该链接展示为主操作按钮。
 
 推荐 URL 结构：
 
@@ -657,7 +659,7 @@ GET /dashboard/audit-findings/{findingId}
 - `/dashboard/audit-reviews/{reviewId}` 是某一轮审查详情页。
 - `/dashboard/audit-findings/{findingId}` 是单条 finding 证据页。
 
-`dashboard_url` 由 audit-logger-agent 根据 `auditReview.visualization.baseUrl` 和 route path 生成。Bot 不拼接 URL，只渲染 payload 中的链接，避免 Bot 侧重复实现路由规则。
+`dashboard_url` 由 audit-logger-agent 根据 `auditReview.visualization.baseUrl` 和 route path 生成。回调接收端不拼接 URL，只渲染 payload 中的链接，避免接收端侧重复实现路由规则。
 
 ### 9.3 Dashboard 通用模板规范
 
@@ -683,7 +685,7 @@ DashboardShell
 - **统一布局**：所有审查类页面使用相同 Header、时间范围、指标卡、筛选条和内容区结构。
 - **统一视觉语言**：严重程度颜色、状态标签、表格密度、按钮样式、空状态和错误状态保持一致。
 - **数据驱动**：模板只接收 `title`、`summaryMetrics`、`filters`、`sections`、`tables`、`actions` 等结构化数据，不把审查业务写死在 HTML 中。
-- **可扩展模块**：后续新增 agent 健康检查、工具调用趋势、Bot 投递监控等页面时，继续复用同一套模板组件。
+- **可扩展模块**：后续新增 agent 健康检查、工具调用趋势、回调投递监控等页面时，继续复用同一套模板组件。
 - **本地优先**：默认不依赖外部 CDN、外部图表服务或登录态；需要图表时优先使用内置轻量 SVG/Canvas 或本地静态资源。
 
 建议模板输入结构：
@@ -733,7 +735,7 @@ DashboardShell
 - 本轮 severity 分布和 category 分布。
 - Top findings 列表。
 - LLM 降级状态，例如 `completed_degraded`。
-- 飞书摘要 payload 预览，方便排查 Bot 展示问题。
+- 通用回调摘要 payload 预览，方便排查接收端展示问题。
 
 Finding 详情页包含：
 
@@ -781,7 +783,7 @@ Dashboard 和 `/v1/audit-*` API 默认只面向本机或内网运维场景，不
 - `POST /v1/audit-reviews/run` 属于主动执行入口，必须要求 admin token。
 - 如果 `bindHost` 改为非 loopback 地址，Dashboard 和所有 `/v1/audit-*` API 都必须启用 bearer token。
 - CORS 默认只允许同源；只有明确配置 `allowedOrigins` 时才允许跨源。
-- 飞书卡片中的 `dashboard_url` 只作为跳转链接，不携带 token。
+- 回调卡片中的 `dashboard_url` 只作为跳转链接，不携带 token。
 
 建议鉴权方式：
 
@@ -850,7 +852,7 @@ Authorization: Bearer <AUDIT_AGENT_DASHBOARD_TOKEN>
       "baseUrl": "http://127.0.0.1:9320",
       "dashboardPath": "/dashboard",
       "template": "audit-review-dashboard-v1",
-      "attachDashboardUrlToFeishu": true
+      "attachDashboardUrlToCallback": true
     }
   }
 }
@@ -919,10 +921,10 @@ src/auditReview/
 
 - 规则层 findings 入库。
 - `audit_review_runs.status = completed_degraded`。
-- 飞书推送中明确标注“LLM 审查失败，本轮仅包含规则检测结果”。
+- 回调推送中明确标注"LLM 审查失败，本轮仅包含规则检测结果"。
 - 下轮继续正常执行。
 
-### 12.3 Bot 投递失败
+### 12.3 回调投递失败
 
 沿用 outbox：
 
@@ -951,7 +953,7 @@ audit-logger-agent 在审查其他 Agent 的同时，也必须记录自己的审
 | `review.ingest.completed` | `ok/error` | 采集完成或失败，包含扫描文件数、新增事件数、解析错误数 |
 | `review.detector.completed` | `ok/error` | 规则预筛完成或失败，包含候选数量 |
 | `review.llm.completed` | `ok/error` | LLM 审查完成或失败，包含模型和 prompt 版本 |
-| `review.notification.enqueued` | `ok/error` | 飞书摘要写入 outbox |
+| `review.notification.enqueued` | `ok/error` | 回调摘要写入 outbox |
 | `review.completed` | `ok/error` | 本轮审查结束，包含最终状态 |
 | `review.recovered` | `ok/error` | 启动时恢复 stale running review |
 
@@ -963,13 +965,13 @@ audit-logger-agent 在审查其他 Agent 的同时，也必须记录自己的审
 
 v1.4 必须遵守以下约束：
 
-- 不把真实 LLM API key、飞书 app secret、webhook secret 写入 `config.json`、SQLite 或文档示例。
+- 不把真实 LLM API key、目标平台 app secret、webhook secret 写入 `config.json`、SQLite 或文档示例。
 - 发送给 LLM 的 evidence 必须是摘要字段，默认不包含原始 input/output。
-- Bot 通知中不展示敏感参数，只展示 tool、agent、trace、错误摘要和建议。
+- 回调通知中不展示敏感参数，只展示 tool、agent、trace、错误摘要和建议。
 - LLM 输出必须本地 schema 校验后才能入库或投递。
 - 用户确认、忽略、关闭 finding 等操作后续必须写审计日志。
 - Dashboard 和审查 API 默认不得公网裸奔；对外监听时必须启用 token 鉴权和受限 CORS。
-- 手动触发审查 API 必须鉴权，避免任何能访问 HTTP 端口的人触发 LLM 调用和飞书通知。
+- 手动触发审查 API 必须鉴权，避免任何能访问 HTTP 端口的人触发 LLM 调用和回调通知。
 
 ---
 
@@ -1029,21 +1031,21 @@ v1.4 必须遵守以下约束：
 - golden eval 能覆盖高危、失败、重复、误报抑制和降级说明场景。
 - Dashboard finding 详情页能展示本轮策略和 prompt 版本。
 
-### 阶段 4：主动飞书 Bot 通知
+### 阶段 4：主动回调通知
 
 目标：
 
 - 新增 `audit_review_summary` payload。
-- 复用 outbox 投递到固定 Bot callback URL。
+- 复用 outbox 投递到固定回调接收端 URL。
 - 支持最小严重程度过滤和空报告开关。
-- 飞书摘要 payload 必须携带 `dashboard_url`，并指向本地 Dashboard 审查详情页。
+- 回调摘要 payload 必须携带 `dashboard_url`，并指向本地 Dashboard 审查详情页。
 
 验收：
 
-- high/critical finding 会主动推送给 Bot。
-- Bot callback 失败会进入重试，最终失败进入 dead letter。
+- high/critical finding 会主动推送给回调接收端。
+- 回调投递失败会进入重试，最终失败进入 dead letter。
 - 同一 finding 不会因重叠窗口重复刷屏。
-- 飞书卡片中可看到“打开 Dashboard”操作入口。
+- 回调卡片中可看到"打开 Dashboard"操作入口。
 
 ### 阶段 5：可视化 API 与 Dashboard
 
@@ -1052,7 +1054,7 @@ v1.4 必须遵守以下约束：
 - 新增审查批次和 finding 查询 API。
 - 新增本地 Web Dashboard。
 - 抽象通用 Dashboard 模板，后续审查类页面复用同一模板。
-- 飞书卡片可跳转 Dashboard 详情页。
+- 回调卡片可跳转 Dashboard 详情页。
 - 增加 Dashboard/API 访问控制和手动触发鉴权。
 
 验收：
@@ -1130,8 +1132,8 @@ test/evals/auditReview/
 3. 调用 `POST /v1/audit-reviews/run`。
 4. 查询 `/v1/audit-reviews`，确认有审查批次。
 5. 查询 `/v1/audit-findings`，确认有 findings。
-6. 检查 Bot callback mock 服务收到 `audit_review_summary`。
-7. 确认飞书摘要 payload 中包含 `dashboard_url`。
+6. 检查回调接收端 mock 服务收到 `audit_review_summary`。
+7. 确认回调摘要 payload 中包含 `dashboard_url`。
 8. 打开 dashboard，确认趋势与详情可见。
 9. 打开审查详情页和 finding 详情页，确认它们使用同一套模板风格。
 10. 使用无 token 请求手动触发 API，确认被拒绝。
@@ -1152,15 +1154,15 @@ v1.4 完成时至少满足：
 8. LLM 审查输出结构化结果，并经本地校验后入库。
 9. 每轮审查记录 risk policy、prompt 和 reviewer 版本。
 10. LLM 审查 eval 覆盖高危、失败、重复、误报抑制和降级场景。
-11. high/critical 风险会主动发送给飞书 Bot。
-12. 飞书摘要必须附带本地 Dashboard 链接。
-13. Bot 投递失败可重试，不丢失通知。
+11. high/critical 风险会主动发送给回调接收端。
+12. 回调摘要必须附带本地 Dashboard 链接。
+13. 回调投递失败可重试，不丢失通知。
 14. 用户可通过 API 或 dashboard 查看历史审查结果和 finding 详情。
 15. Dashboard 使用通用模板，后续审查类页面能复用同一布局和视觉规范。
 16. Dashboard/API 对外监听时必须启用 token 鉴权和受限 CORS。
 17. LLM 不可用时系统可降级为规则审查，不阻塞采集。
 18. 审查系统自身生命周期事件写入 `audit_events`。
-19. 所有敏感配置不进入 git、SQLite 审查结果或飞书卡片正文。
+19. 所有敏感配置不进入 git、SQLite 审查结果或回调卡片正文。
 
 ---
 
@@ -1168,19 +1170,19 @@ v1.4 完成时至少满足：
 
 ### 17.1 需要确认
 
-- 飞书 Bot 是否已经能提供固定 callback URL 接收主动审查消息。
+- 回调接收端是否已经能提供固定 callback URL 接收主动审查消息。
 - high-risk tool 的第一版 allowlist/denylist 由哪些业务工具组成。
-- 本地 Dashboard 的 `baseUrl` 在飞书用户环境中是否可访问；如果不可访问，需要明确内网代理或部署地址。
-- 是否需要用户在飞书卡片中直接确认/忽略 finding。
+- 本地 Dashboard 的 `baseUrl` 在回调接收端用户环境中是否可访问；如果不可访问，需要明确内网代理或部署地址。
+- 是否需要用户在回调卡片中直接确认/忽略 finding。
 - 非本机访问 Dashboard 时采用哪种部署方式：内网代理、固定机器 IP、还是只允许本机查看。
 
 ### 17.2 主要风险
 
-- 如果高危工具规则过宽，飞书通知会噪声过大。
+- 如果高危工具规则过宽，回调通知会噪声过大。
 - 如果高危工具规则过窄，会漏掉真实风险。
 - 如果 LLM 输入未裁剪，成本和延迟会快速上升。
 - 如果周期任务和手动任务没有锁，可能重复审查和重复通知。
-- 如果 Bot callback URL 是敏感 webhook，放在 `config.json` 会有泄漏风险。
+- 如果回调 callback URL 是敏感 webhook，放在 `config.json` 会有泄漏风险。
 - 如果 Dashboard 模板没有抽象好，后续每个页面都会复制布局和样式，维护成本会上升。
 - 如果不做 LLM eval，prompt 调整可能悄悄降低召回率或增加误报。
 - 如果不做文件游标，大日志文件会让 30 分钟周期越来越慢。

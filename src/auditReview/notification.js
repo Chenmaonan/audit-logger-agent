@@ -1,5 +1,8 @@
 // src/auditReview/notification.js
-// Build audit review notification payloads and enqueue them into the outbox.
+// Build generic audit review delivery payloads and enqueue them into the outbox.
+// Payload types `audit_review_summary` / `audit_review_finding` are generic
+// delivery payloads: they are platform-agnostic and rely on the outbox flush
+// mechanism to deliver them to whatever callback receiver is configured.
 
 const SEVERITY_ORDER = ['low', 'medium', 'high', 'critical'];
 
@@ -27,7 +30,7 @@ function pickTopFindings(findings, limit = 5) {
       category: f.category,
       title: f.title,
       agent_id: f.agent_id,
-      agent_name: f.evidence?.[0]?.agent_name ?? f.agent_name ?? f.agent_id,
+      agent_name: f.agent_name ?? f.evidence?.[0]?.agent_name ?? f.agent_id,
       tool_name: f.tool_name,
       summary: f.summary,
     }));
@@ -70,7 +73,7 @@ export function buildFindingPayload({ finding, reviewId, run, dashboardUrl }) {
     summary: finding.summary,
     recommendation: finding.recommendation,
     agent_id: finding.agent_id,
-    agent_name: finding.evidence?.[0]?.agent_name ?? finding.agent_name ?? finding.agent_id,
+    agent_name: finding.agent_name ?? finding.evidence?.[0]?.agent_name ?? finding.agent_id,
     tool_name: finding.tool_name,
     trace_id: finding.trace_id,
     product_id: finding.product_id,

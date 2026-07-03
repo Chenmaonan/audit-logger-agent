@@ -457,6 +457,24 @@ test('audit review HTTP integration smoke test', async () => {
     // (the summary notification for the successful run).
     // ------------------------------------------------------------------
     assert.ok(enqueued.length >= 1, 'notifier should have enqueued at least 1 notification');
+    // v1.5 regression: captured payloads must be generic delivery payloads
+    // and must NOT carry Feishu/Bot-specific required fields. The generic
+    // delivery target is the callback receiver; no bot-specific field is
+    // required in the payload shape.
+    for (const item of enqueued) {
+      assert.ok(item.type === 'audit_review_summary' || item.type === 'audit_review_finding',
+        `outbox item type should be a generic review payload, got ${item.type}`);
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(item, 'callback_url'),
+        false,
+        'outbox item must not carry callback_url as a bot-specific required field',
+      );
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(item.payload, 'confidence'),
+        false,
+        'outbox payload must not carry confidence (removed in v1.5)',
+      );
+    }
   } finally {
     app.close();
     db.close();

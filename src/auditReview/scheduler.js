@@ -496,7 +496,7 @@ export function createAuditReviewScheduler({
         const dashboardUrl = visualization.dashboardUrlFor(reviewId);
         const run = reviewStore.getRun(reviewId);
         // Attach persisted finding_ids back onto the review findings so the
-        // Feishu summary's top_findings carry a usable finding_id link.
+        // callback summary's top_findings carry a usable finding_id link.
         // Query ALL findings (not filtered by reviewId): finding_hash dedup keeps
         // the earliest review_id on a re-observed finding, so filtering by this
         // run's review_id would miss rows that were merged into an earlier run.

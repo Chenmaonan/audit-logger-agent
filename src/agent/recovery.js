@@ -9,7 +9,7 @@ function nowIso() {
 
 // On process restart, in-flight runs left in created/planning/running can never
 // resume (the executor died). Mark stale ones as failed and emit a failed
-// final_result so the Bot/user see a terminal state. waiting_user runs are
+// final_result so the callback receiver/user see a terminal state. waiting_user runs are
 // left intact so the user can still respond to the pending decision card.
 export function recoverInflightRuns({ runStore, eventPublisher, auditLogger, staleThresholdMs = STALE_THRESHOLD_MS }) {
   const recovered = [];
