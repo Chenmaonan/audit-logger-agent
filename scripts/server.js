@@ -11,7 +11,7 @@ import { createRuntime } from '../src/agent/runtime.js';
 import { createToolRegistry } from '../src/tools/registry.js';
 import { buildAuditQueryTool } from '../src/tools/auditQueryTool.js';
 import { buildReportTool } from '../src/tools/reportTool.js';
-import { createCallbackClient } from '../src/adapters/bot/callbackClient.js';
+import { createCallbackClient } from '../src/adapters/delivery/callbackClient.js';
 import { createEventPublisher } from '../src/agent/eventPublisher.js';
 import { createRuntimeAuditLogger } from '../src/observability/runtimeAudit.js';
 import { createHttpApp } from '../src/adapters/http/app.js';

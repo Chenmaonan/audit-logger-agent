@@ -53,19 +53,19 @@ test('run store creates and transitions runs', () => {
   const runStore = createRunStore(db);
 
   const created = runStore.createRun({
-    channel: 'feishu',
-    conversationId: 'oc_test',
+    sourceType: 'manual',
+    sessionId: 'session_test',
     messageId: 'om_test',
-    userOpenId: 'ou_test',
+    requesterId: 'user_test',
     requestText: '帮我处理异常任务',
     deliveryMode: 'callback',
-    callbackUrl: 'http://127.0.0.1:9999/agent-events',
+    deliveryTargetUrl: 'http://127.0.0.1:9999/agent-events',
     metadata: { tenant_key: 'tenant_test' },
   });
 
   assert.equal(created.status, 'created');
-  assert.equal(created.channel, 'feishu');
-  assert.equal(created.user_open_id, 'ou_test');
+  assert.equal(created.channel, 'manual');
+  assert.equal(created.user_open_id, 'user_test');
 
   const planned = runStore.transitionRun(created.run_id, 'planning');
   assert.equal(planned.status, 'planning');

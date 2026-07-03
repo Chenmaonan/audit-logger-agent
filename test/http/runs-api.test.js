@@ -36,12 +36,14 @@ test('POST /v1/runs creates a run and GET /v1/runs/:id returns it', async () => 
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      channel: 'feishu',
-      conversation_id: 'oc_test',
-      message_id: 'om_test',
-      user: { open_id: 'ou_test', name: 'Alice' },
-      request: { text: '帮我查询今天的异常任务并给出处理建议', attachments: [] },
-      delivery: { mode: 'callback', callback_url: 'http://127.0.0.1:9999/agent-events' },
+      source: {
+        type: 'manual',
+        session_id: 'session_test',
+        message_id: 'msg_test',
+        requester_id: 'user_test',
+      },
+      request: { text: '帮我查询今天的异常任务并给出处理建议' },
+      delivery: { mode: 'callback', target_url: 'http://127.0.0.1:9999/agent-events' },
       metadata: { tenant_key: 'tenant_test' },
     }),
   });
@@ -55,7 +57,10 @@ test('POST /v1/runs creates a run and GET /v1/runs/:id returns it', async () => 
   assert.equal(readResponse.status, 200);
   const run = await readResponse.json();
   assert.equal(run.run_id, created.run_id);
-  assert.equal(run.user_open_id, 'ou_test');
+  assert.equal(run.request_text, '帮我查询今天的异常任务并给出处理建议');
+  assert.equal(run.channel, 'manual');
+  assert.equal(run.conversation_id, 'session_test');
+  assert.equal(run.user_open_id, 'user_test');
 
   server.close();
   db.close();

@@ -12,7 +12,7 @@ test('runtime audit logger writes run lifecycle events into audit_events', async
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-audit-'));
   const db = openDb(path.join(tmpDir, 'runtime.db'));
   ensureRuntimeSchema(db);
-  const auditLogger = createRuntimeAuditLogger(db, { agentId: 'feishu-independent-agent' });
+  const auditLogger = createRuntimeAuditLogger(db, { agentId: 'audit-runtime-agent' });
 
   await auditLogger.log({
     runId: 'run_test',
@@ -22,7 +22,7 @@ test('runtime audit logger writes run lifecycle events into audit_events', async
     summary: 'Run created',
   });
 
-  const rows = queryEvents(db, { agent_id: 'feishu-independent-agent' });
+  const rows = queryEvents(db, { agent_id: 'audit-runtime-agent' });
   assert.equal(rows.length, 1);
   assert.equal(rows[0].event, 'run.start');
   assert.equal(rows[0].result_summary, 'Run created');
@@ -35,7 +35,7 @@ test('runtime audit events round-trip through ndjson parser', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-audit-'));
   const db = openDb(path.join(tmpDir, 'runtime.db'));
   ensureRuntimeSchema(db);
-  const auditLogger = createRuntimeAuditLogger(db, { agentId: 'feishu-independent-agent' });
+  const auditLogger = createRuntimeAuditLogger(db, { agentId: 'audit-runtime-agent' });
 
   await auditLogger.log({
     runId: 'run_test',
@@ -53,7 +53,7 @@ test('runtime audit events round-trip through ndjson parser', async () => {
     summary: 'Run failed',
   });
 
-  const rows = queryEvents(db, { agent_id: 'feishu-independent-agent', limit: 10 });
+  const rows = queryEvents(db, { agent_id: 'audit-runtime-agent', limit: 10 });
   const content = rows.map((row) => row.raw_json).join('\n');
 
   const { entries, errors } = parseNdjson(content);
