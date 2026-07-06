@@ -1,6 +1,6 @@
 # Audit Logger Agent
 
-`audit-logger-agent` 是一个本地运行的 Agent 审计日志中台。它负责采集多个 Agent 输出的 NDJSON 审计日志，写入本地 SQLite，提供命令行查询、HTTP API、周期性 LLM 审查、风险发现 Dashboard 和回调通知。
+`audit-logger-agent` 是一个 Agent 审计日志中台。它负责采集多个 Agent 输出的 NDJSON 审计日志，写入本地 SQLite，提供命令行查询、HTTP API、周期性 LLM 审查、风险发现 Dashboard 和回调通知。
 
 本文档面向部署和运维，说明如何配置、启动、关闭、采集日志、查询数据，以及上游 Agent 需要携带哪些日志字段。
 
