@@ -101,7 +101,7 @@ const llmReviewer = createLlmReviewer({
   reviewerVersion: config.auditReview?.llmReview?.reviewerVersion,
 });
 const reviewNotifier = createReviewNotifier({ outboxStore, config });
-const reviewVisualization = createVisualization({ reviewStore, config });
+const reviewVisualization = createVisualization({ reviewStore, config, llmClient, model: openAIConfig.model });
 const dashboardAuth = createDashboardAuth({ config, env: process.env });
 const scheduler = createAuditReviewScheduler({
   db,

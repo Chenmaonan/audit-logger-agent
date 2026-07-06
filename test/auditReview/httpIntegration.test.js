@@ -377,7 +377,7 @@ test('audit review HTTP integration smoke test', async () => {
       assert.equal(html.includes('Confidence'), false, 'dashboard should not contain English Confidence');
       assert.equal(html.includes('Data source'), false, 'dashboard should not contain Data source');
       assert.ok(html.includes('链路 ID'), 'dashboard should contain trace link column');
-      assert.ok(html.includes('#trace_timeline'), 'dashboard should link trace ids to the finding trace timeline');
+      assert.ok(html.includes('#trace_sequence'), 'dashboard should link trace ids to the finding trace sequence');
     }
 
     // ------------------------------------------------------------------
@@ -390,7 +390,7 @@ test('audit review HTTP integration smoke test', async () => {
       const html = await res.text();
       assert.ok(html.includes('<html'), 'review detail html should contain <html');
       assert.ok(html.includes('链路 ID'), 'review detail should contain trace link column');
-      assert.ok(html.includes('#trace_timeline'), 'review detail should link trace ids to the finding trace timeline');
+      assert.ok(html.includes('#trace_sequence'), 'review detail should link trace ids to the finding trace sequence');
     }
 
     // ------------------------------------------------------------------
@@ -402,11 +402,10 @@ test('audit review HTTP integration smoke test', async () => {
       assert.equal(res.headers.get('content-type'), 'text/html; charset=utf-8');
       const html = await res.text();
       assert.ok(html.includes('<html'), 'finding detail html should contain <html');
-      assert.ok(html.includes('日志 ID'), 'finding detail should contain 日志 ID');
-      assert.ok(html.includes('Agent 名称'), 'finding detail should contain Agent 名称');
-      assert.ok(html.includes('日志摘要'), 'finding detail should contain 日志摘要');
-      assert.ok(html.includes('id="trace_timeline"'), 'finding detail should render trace timeline anchor');
-      assert.ok(html.includes('工具调用链路'), 'finding detail should contain trace timeline section');
+      assert.ok(html.includes('id="trace_sequence"'), 'finding detail should render trace sequence anchor');
+      assert.ok(html.includes('工具调用顺序'), 'finding detail should contain trace sequence section');
+      assert.equal(html.includes('id="trace_timeline"'), false, 'finding detail should not render old trace timeline table');
+      assert.equal(html.includes('id="evidence_events"'), false, 'finding detail should not render old evidence table');
       assert.ok(html.includes('trace-del-1'), 'finding detail should contain the finding trace id');
       assert.ok(html.includes('db.delete'), 'finding detail should contain the trace tool call');
       assert.ok(html.includes('deleted 5 rows'), 'finding detail should contain the trace event summary');

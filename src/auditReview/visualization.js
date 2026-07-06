@@ -57,29 +57,40 @@ const REVIEWS_TABLE_COLUMNS = [
   { key: 'finished_at', label: '完成时间' },
 ];
 
-const EVIDENCE_COLUMNS = [
-  { key: 'event_id', label: '日志 ID' },
-  { key: 'ts', label: '时间' },
-  { key: 'event', label: '事件' },
-  { key: 'status', label: '状态' },
-  { key: 'agent_name', label: 'Agent 名称' },
-  { key: 'tool_name', label: '工具' },
-  { key: 'result_summary', label: '日志摘要' },
-  { key: 'error_message', label: '错误详情' },
-];
+const TRACE_ANALYSIS_SYSTEM_PROMPT = [
+  'You analyze audit-log tool call traces for a Chinese audit dashboard.',
+  'Return ONLY a JSON object matching the schema. No markdown, no prose outside JSON.',
+  'Explain the likely purpose of the tool calls, the call order, and risks visible in the trace.',
+  'All narrative fields MUST be written in Simplified Chinese. Keep tool names, IDs, trace IDs, and error codes verbatim.',
+  'Do not invent events or outcomes that are not present in the provided trace.',
+].join('\n');
 
-const TRACE_EVENT_COLUMNS = [
-  { key: 'event_id', label: '日志 ID' },
-  { key: 'ts', label: '时间' },
-  { key: 'event', label: '事件' },
-  { key: 'status', label: '状态' },
-  { key: 'tool_name', label: '工具' },
-  { key: 'span_id', label: 'Span ID' },
-  { key: 'parent_span_id', label: '父 Span' },
-  { key: 'duration_ms', label: '耗时 ms' },
-  { key: 'result_summary', label: '日志摘要' },
-  { key: 'error_message', label: '错误详情' },
-];
+function traceAnalysisJsonSchema() {
+  return {
+    type: 'json_schema',
+    name: 'audit_trace_analysis',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        purpose: { type: 'string', maxLength: 300 },
+        chain_summary: { type: 'string', maxLength: 500 },
+        risk_points: {
+          type: 'array',
+          items: { type: 'string', maxLength: 220 },
+          maxItems: 5,
+        },
+        next_actions: {
+          type: 'array',
+          items: { type: 'string', maxLength: 220 },
+          maxItems: 5,
+        },
+      },
+      required: ['purpose', 'chain_summary', 'risk_points', 'next_actions'],
+    },
+  };
+}
 
 function defaultVisualizationConfig(config) {
   return config?.auditReview?.visualization ?? {};
@@ -151,6 +162,19 @@ function compareByIsoDesc(left, right) {
   return b - a;
 }
 
+function compareTraceEventsAsc(left, right) {
+  const a = left?.ts ? Date.parse(left.ts) : Number.POSITIVE_INFINITY;
+  const b = right?.ts ? Date.parse(right.ts) : Number.POSITIVE_INFINITY;
+  if (a !== b) return a - b;
+  const leftId = Number(left?.id ?? left?.event_id ?? 0);
+  const rightId = Number(right?.id ?? right?.event_id ?? 0);
+  return leftId - rightId;
+}
+
+function orderedTraceEvents(events) {
+  return Array.isArray(events) ? events.slice().sort(compareTraceEventsAsc) : [];
+}
+
 function compareFindings(left, right) {
   const severityDelta = severityRank(right?.severity) - severityRank(left?.severity);
   if (severityDelta !== 0) return severityDelta;
@@ -188,10 +212,119 @@ function lastSeenAtOf(finding) {
     .sort((a, b) => compareByIsoDesc(a, b))[0] ?? '';
 }
 
-export function createVisualization({ reviewStore, config }) {
+function traceSequenceSteps(events) {
+  return orderedTraceEvents(events).map((event, index) => ({
+    order: index + 1,
+    timestamp: formatTime(event.ts),
+    event: event.event ?? '',
+    status: {
+      text: labelOf(STATUS_LABELS, event.status),
+      tone: statusTone(event.status),
+    },
+    tool_name: event.tool_name ?? '',
+    span_id: event.span_id ?? '',
+    parent_span_id: event.parent_span_id ?? '',
+    duration_ms: isPresent(event.duration_ms) ? `${event.duration_ms} ms` : '',
+    summary: event.result_summary ?? '',
+    error_message: event.error_message ?? '',
+  }));
+}
+
+function compactTraceEventForLlm(event, index) {
+  return {
+    order: index + 1,
+    event_id: event.id ?? event.event_id ?? null,
+    ts: event.ts ?? null,
+    event: event.event ?? null,
+    status: event.status ?? null,
+    tool_name: event.tool_name ?? null,
+    trace_id: event.trace_id ?? null,
+    span_id: event.span_id ?? null,
+    parent_span_id: event.parent_span_id ?? null,
+    duration_ms: event.duration_ms ?? null,
+    result_summary: event.result_summary ?? null,
+    error_message: event.error_message ?? null,
+  };
+}
+
+function buildTraceAnalysisInput({ finding, traceEvents }) {
+  const orderedEvents = orderedTraceEvents(traceEvents);
+  const payload = {
+    finding: {
+      finding_id: finding.finding_id ?? null,
+      title: finding.title ?? null,
+      severity: finding.severity ?? null,
+      category: finding.category ?? null,
+      summary: finding.summary ?? null,
+      recommendation: finding.recommendation ?? null,
+      agent_id: finding.agent_id ?? null,
+      agent_name: finding.agent_name ?? null,
+      tool_name: finding.tool_name ?? null,
+      trace_id: finding.trace_id ?? null,
+      product_id: finding.product_id ?? null,
+    },
+    trace_events: orderedEvents.map(compactTraceEventForLlm),
+  };
+
+  return [
+    { role: 'system', content: TRACE_ANALYSIS_SYSTEM_PROMPT },
+    { role: 'user', content: JSON.stringify(payload) },
+  ];
+}
+
+function boundedText(value, maxLength) {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  return trimmed.length > maxLength ? trimmed.slice(0, maxLength) : trimmed;
+}
+
+function boundedTextList(value, { maxItems, maxLength }) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => boundedText(item, maxLength))
+    .filter(isPresent)
+    .slice(0, maxItems);
+}
+
+function localTraceChainSummary(traceEvents) {
+  const orderedEvents = orderedTraceEvents(traceEvents);
+  if (orderedEvents.length === 0) return '';
+  const chain = orderedEvents.map((event, index) => {
+    const toolName = event.tool_name ?? '未知工具';
+    const eventName = event.event ?? '未知事件';
+    const status = labelOf(STATUS_LABELS, event.status) || event.status || '未知状态';
+    return `${index + 1}. ${toolName} ${eventName}（${status}）`;
+  }).join(' -> ');
+  const errors = orderedEvents.map((event) => event.error_message).filter(isPresent);
+  const lastError = errors[errors.length - 1];
+  return lastError ? `按时间顺序：${chain}。末尾错误：${lastError}` : `按时间顺序：${chain}。`;
+}
+
+function normalizeTraceAnalysis(raw, traceEvents = []) {
+  if (!raw || typeof raw !== 'object') throw new Error('LLM 链路分析结果不是对象');
+  const analysis = {
+    purpose: boundedText(raw.purpose, 300),
+    chain_summary: boundedText(raw.chain_summary, 500) || localTraceChainSummary(traceEvents),
+    risk_points: boundedTextList(raw.risk_points, { maxItems: 5, maxLength: 220 }),
+    next_actions: boundedTextList(raw.next_actions, { maxItems: 5, maxLength: 220 }),
+  };
+  if (!isPresent(analysis.purpose) && !isPresent(analysis.chain_summary)) {
+    throw new Error('LLM 链路分析缺少 purpose 或 chain_summary');
+  }
+  return analysis;
+}
+
+function insertSectionAfter(sections, anchorId, section) {
+  const anchorIndex = sections.findIndex((item) => item?.id === anchorId);
+  const insertIndex = anchorIndex >= 0 ? anchorIndex + 1 : sections.length;
+  sections.splice(insertIndex, 0, section);
+}
+
+export function createVisualization({ reviewStore, config, llmClient, model } = {}) {
   const vizConfig = defaultVisualizationConfig(config);
   const baseUrl = vizConfig.baseUrl ?? 'http://127.0.0.1:9320';
   const dashboardPath = vizConfig.dashboardPath ?? '/dashboard';
+  const traceAnalysisModel = model ?? config?.auditReview?.llmReview?.model ?? config?.planner?.model ?? null;
 
   function dashboardUrlFor(reviewId) {
     return `${baseUrl}${dashboardPath}/audit-reviews/${encodeURIComponent(reviewId)}`;
@@ -284,7 +417,7 @@ export function createVisualization({ reviewStore, config }) {
 
   function traceTimelineHref(finding) {
     if (!finding?.trace_id || !finding?.finding_id) return undefined;
-    return `${findingUrl(finding.finding_id)}#trace_timeline`;
+    return `${findingUrl(finding.finding_id)}#trace_sequence`;
   }
 
   function traceCellFor(finding) {
@@ -294,39 +427,6 @@ export function createVisualization({ reviewStore, config }) {
       href: traceTimelineHref(finding),
       mono: true,
     };
-  }
-
-  function traceEventRows(events) {
-    return events.map((event) => ({
-      event_id: {
-        text: String(event.id ?? event.event_id ?? ''),
-        mono: true,
-      },
-      ts: {
-        text: formatTime(event.ts),
-        mono: true,
-      },
-      event: event.event ?? '',
-      status: {
-        text: labelOf(STATUS_LABELS, event.status),
-        tone: statusTone(event.status),
-      },
-      tool_name: event.tool_name ?? '',
-      span_id: {
-        text: event.span_id ?? '',
-        mono: true,
-      },
-      parent_span_id: {
-        text: event.parent_span_id ?? '',
-        mono: true,
-      },
-      duration_ms: {
-        text: isPresent(event.duration_ms) ? String(event.duration_ms) : '',
-        mono: true,
-      },
-      result_summary: event.result_summary ?? '',
-      error_message: event.error_message ?? '',
-    }));
   }
 
   function rawLogSnippets(events) {
@@ -690,34 +790,8 @@ export function createVisualization({ reviewStore, config }) {
       { label: '最近出现时间', value: formatTime(lastSeenAtOf(finding)) },
     ].filter((item) => isPresent(item.value));
 
-    const evidenceRows = Array.isArray(finding.evidence)
-      ? finding.evidence
-          .slice()
-          .sort((left, right) => Date.parse(evidenceTimestamp(left) || 0) - Date.parse(evidenceTimestamp(right) || 0))
-          .map((ev) => {
-            const details = ev.log_detail ?? {};
-            return {
-              event_id: String(ev.event_id ?? ''),
-              ts: {
-                text: formatTime(details.ts ?? ev.ts),
-                mono: true,
-              },
-              event: details.event ?? '',
-              status: {
-                text: labelOf(STATUS_LABELS, details.status),
-                tone: statusTone(details.status),
-              },
-              agent_name: ev.agent_name ?? '',
-              tool_name: ev.tool_name ?? '',
-              result_summary: details.result_summary ?? '',
-              error_message: details.error_message ?? '',
-              agent_id: ev.agent_id ?? '',
-            };
-          })
-      : [];
-
-    const traceEvents = listTraceEvents(finding.trace_id, 200);
-    const traceRows = traceEventRows(traceEvents);
+    const traceEvents = orderedTraceEvents(listTraceEvents(finding.trace_id, 200));
+    const traceSteps = traceSequenceSteps(traceEvents);
     const rawEvidenceEvents = listRawEventsByIds(evidenceEventIdsOf(finding), 200);
     const rawEvidenceSnippets = rawLogSnippets(rawEvidenceEvents);
 
@@ -752,29 +826,20 @@ export function createVisualization({ reviewStore, config }) {
         items: definitionItems,
       });
     }
-    if (traceRows.length > 0) {
+    if (traceSteps.length > 0) {
       sections.push({
-        id: 'trace_timeline',
-        title: `工具调用链路（共 ${traceRows.length} 条）`,
-        type: 'table',
-        columns: TRACE_EVENT_COLUMNS,
-        rows: traceRows,
-      });
-    } else if (isPresent(finding.trace_id)) {
-      sections.push({
-        id: 'trace_timeline_empty',
-        title: '工具调用链路',
-        type: 'callout',
-        body: `未找到链路 ID ${finding.trace_id} 对应的完整工具调用事件，请结合下方证据日志继续排查。`,
+        id: 'trace_sequence',
+        title: `工具调用顺序（共 ${traceSteps.length} 步）`,
+        type: 'trace_sequence',
+        steps: traceSteps,
       });
     }
-    if (evidenceRows.length > 0) {
+    if (traceSteps.length === 0 && isPresent(finding.trace_id)) {
       sections.push({
-        id: 'evidence_events',
-        title: evidenceRows.length > 1 ? `证据日志（共 ${evidenceRows.length} 条）` : '证据日志',
-        type: 'table',
-        columns: EVIDENCE_COLUMNS,
-        rows: evidenceRows,
+        id: 'trace_sequence_empty',
+        title: '工具调用顺序',
+        type: 'callout',
+        body: `未找到链路 ID ${finding.trace_id} 对应的完整工具调用事件，请结合下方原始日志片段继续排查。`,
       });
     }
     if (rawEvidenceSnippets.length > 0) {
@@ -809,11 +874,46 @@ export function createVisualization({ reviewStore, config }) {
     };
   }
 
+  async function findingDetailPageWithAnalysis(findingId) {
+    const page = findingDetailPage(findingId);
+    const finding = getFinding(findingId);
+    if (!finding || !llmClient || !traceAnalysisModel || !Array.isArray(page.sections)) return page;
+
+    const traceEvents = orderedTraceEvents(listTraceEvents(finding.trace_id, 200));
+    if (traceEvents.length === 0) return page;
+
+    try {
+      const raw = await llmClient.createStructuredResponse({
+        model: traceAnalysisModel,
+        input: buildTraceAnalysisInput({ finding, traceEvents }),
+        schema: traceAnalysisJsonSchema(),
+      });
+      const analysis = normalizeTraceAnalysis(raw, traceEvents);
+      insertSectionAfter(page.sections, 'trace_sequence', {
+        id: 'trace_llm_analysis',
+        title: 'LLM 链路分析',
+        type: 'trace_analysis',
+        model: traceAnalysisModel,
+        ...analysis,
+      });
+    } catch (error) {
+      insertSectionAfter(page.sections, 'trace_sequence', {
+        id: 'trace_llm_analysis',
+        title: 'LLM 链路分析不可用',
+        type: 'callout',
+        body: `无法生成链路分析：${error?.message ?? String(error)}`,
+      });
+    }
+
+    return page;
+  }
+
   return {
     dashboardUrlFor,
     findingUrlFor,
     overviewPage,
     reviewDetailPage,
     findingDetailPage,
+    findingDetailPageWithAnalysis,
   };
 }

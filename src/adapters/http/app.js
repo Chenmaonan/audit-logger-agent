@@ -238,7 +238,9 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         const findingId = decodeURIComponent(url.pathname.split('/').pop());
         const finding = reviewStore.getFinding(findingId);
         if (!finding) { html(res, 404, '<h1>Finding not found</h1>', cors); return; }
-        const page = visualization.findingDetailPage(findingId);
+        const page = typeof visualization.findingDetailPageWithAnalysis === 'function'
+          ? await visualization.findingDetailPageWithAnalysis(findingId)
+          : visualization.findingDetailPage(findingId);
         html(res, 200, renderDashboard(page), cors);
         return;
       }

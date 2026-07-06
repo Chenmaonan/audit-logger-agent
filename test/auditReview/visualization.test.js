@@ -231,10 +231,11 @@ function fakeStore({ traceEventsById, rawEventsById } = {}) {
   };
 }
 
-function createViz(storeOptions) {
+function createViz(storeOptions, visualizationOptions = {}) {
   return createVisualization({
     reviewStore: fakeStore(storeOptions),
     config: { auditReview: { visualization: { dashboardPath: '/dashboard' } } },
+    ...visualizationOptions,
   });
 }
 
@@ -259,7 +260,7 @@ test('overviewPage adds actions links split sections and clickable finding rows'
   assert.ok(findingsSection.columns.some((column) => column.key === 'trace_id' && column.label === '链路 ID'));
   assert.match(findingsSection.rows[0].title.href, /\/dashboard\/audit-findings\//);
   assert.equal(findingsSection.rows[0].trace_id.text, 'trace-critical-1');
-  assert.match(findingsSection.rows[0].trace_id.href, /\/dashboard\/audit-findings\/f-critical#trace_timeline$/);
+  assert.match(findingsSection.rows[0].trace_id.href, /\/dashboard\/audit-findings\/f-critical#trace_sequence$/);
   assert.equal(findingsSection.rows[0].trace_id.mono, true);
   assert.match(findingsSection.rows[0].review_id.href, /\/dashboard\/audit-reviews\//);
 
@@ -286,7 +287,7 @@ test('reviewDetailPage links finding rows and shows degraded callout', () => {
   assert.ok(findingsSection);
   assert.ok(findingsSection.columns.some((column) => column.key === 'trace_id' && column.label === '链路 ID'));
   assert.match(findingsSection.rows[0].title.href, /\/dashboard\/audit-findings\//);
-  assert.match(findingsSection.rows[0].trace_id.href, /\/dashboard\/audit-findings\/f-critical#trace_timeline$/);
+  assert.match(findingsSection.rows[0].trace_id.href, /\/dashboard\/audit-findings\/f-critical#trace_sequence$/);
   assert.equal(typeof findingsSection.rows[0].evidence_count, 'object');
 
   const degradedCallout = page.sections.find((section) => section.type === 'callout' && section.title === '降级完成说明');
@@ -309,10 +310,7 @@ test('findingDetailPage includes breadcrumbs summary callouts and overview navig
   assert.equal(summarySection.body, '检测到关键删除操作，且返回异常。');
   assert.ok(recommendationSection);
 
-  const evidenceSection = page.sections.find((section) => section.id === 'evidence_events');
-  assert.ok(evidenceSection);
-  assert.equal(evidenceSection.rows[0].agent_name, '测试 Agent');
-  assert.equal(evidenceSection.rows[1].result_summary, 'delete failed after partial mutation');
+  assert.equal(page.sections.some((section) => section.id === 'evidence_events'), false);
 
   const rawSection = page.sections.find((section) => section.id === 'evidence_raw_logs');
   assert.ok(rawSection);
@@ -323,25 +321,107 @@ test('findingDetailPage includes breadcrumbs summary callouts and overview navig
     '{"event":"tool.end","tool_name":"db.delete","error_message":"permission denied"}',
   ]);
 
-  const traceSection = page.sections.find((section) => section.id === 'trace_timeline');
-  assert.ok(traceSection);
-  assert.equal(traceSection.title, '工具调用链路（共 2 条）');
-  assert.deepEqual(traceSection.rows.map((row) => row.span_id.text), ['span-critical-1', 'span-critical-2']);
-  assert.equal(traceSection.rows[1].parent_span_id.text, 'span-critical-1');
-  assert.equal(traceSection.rows[1].duration_ms.text, '640');
-  assert.equal(traceSection.rows[1].error_message, 'permission denied');
+  assert.equal(page.sections.some((section) => section.id === 'trace_timeline'), false);
 
   const linkSection = page.sections.find((section) => section.type === 'link_list');
   assert.ok(linkSection.links.some((link) => link.href === '/dashboard'));
+});
+
+test('findingDetailPage adds an ordered visual trace sequence without the old raw trace table', () => {
+  const page = createViz().findingDetailPage('f-critical');
+
+  const sequenceSection = page.sections.find((section) => section.id === 'trace_sequence');
+  assert.ok(sequenceSection);
+  assert.equal(page.sections.some((section) => section.id === 'trace_timeline'), false);
+  assert.equal(page.sections.some((section) => section.id === 'evidence_events'), false);
+  assert.equal(sequenceSection.type, 'trace_sequence');
+  assert.equal(sequenceSection.title, '工具调用顺序（共 2 步）');
+  assert.deepEqual(sequenceSection.steps.map((step) => step.order), [1, 2]);
+  assert.deepEqual(sequenceSection.steps.map((step) => step.tool_name), ['db.delete', 'db.delete']);
+  assert.deepEqual(sequenceSection.steps.map((step) => step.event), ['tool.start', 'tool.end']);
+  assert.equal(sequenceSection.steps[0].status.text, '正常');
+  assert.equal(sequenceSection.steps[1].status.text, '错误');
+  assert.equal(sequenceSection.steps[1].duration_ms, '640 ms');
+  assert.equal(sequenceSection.steps[1].parent_span_id, 'span-critical-1');
+  assert.equal(sequenceSection.steps[1].summary, 'delete failed after partial mutation');
+});
+
+test('findingDetailPageWithAnalysis calls LLM and adds chain purpose analysis', async () => {
+  const calls = [];
+  const llmClient = {
+    async createStructuredResponse(request) {
+      calls.push(request);
+      return {
+        purpose: '尝试执行 db.delete 删除操作。',
+        chain_summary: '链路先启动 db.delete，随后同一调用链返回 permission denied。',
+        risk_points: ['删除操作失败但摘要显示可能已发生部分变更。'],
+        next_actions: ['核查调用来源与实际数据变更。'],
+      };
+    },
+  };
+
+  const page = await createViz({}, { llmClient, model: 'test-model' }).findingDetailPageWithAnalysis('f-critical');
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].model, 'test-model');
+  assert.ok(JSON.stringify(calls[0].input).includes('trace-critical-1'));
+  const analysisSection = page.sections.find((section) => section.id === 'trace_llm_analysis');
+  assert.ok(analysisSection);
+  assert.equal(analysisSection.type, 'trace_analysis');
+  assert.equal(analysisSection.title, 'LLM 链路分析');
+  assert.equal(analysisSection.purpose, '尝试执行 db.delete 删除操作。');
+  assert.equal(analysisSection.chain_summary, '链路先启动 db.delete，随后同一调用链返回 permission denied。');
+  assert.deepEqual(analysisSection.risk_points, ['删除操作失败但摘要显示可能已发生部分变更。']);
+  assert.deepEqual(analysisSection.next_actions, ['核查调用来源与实际数据变更。']);
+  assert.equal(analysisSection.model, 'test-model');
+});
+
+test('findingDetailPageWithAnalysis degrades when LLM analysis fails', async () => {
+  const llmClient = {
+    async createStructuredResponse() {
+      throw new Error('llm unavailable');
+    },
+  };
+
+  const page = await createViz({}, { llmClient, model: 'test-model' }).findingDetailPageWithAnalysis('f-critical');
+
+  const sequenceSection = page.sections.find((section) => section.id === 'trace_sequence');
+  assert.ok(sequenceSection);
+  const analysisSection = page.sections.find((section) => section.id === 'trace_llm_analysis');
+  assert.ok(analysisSection);
+  assert.equal(analysisSection.type, 'callout');
+  assert.equal(analysisSection.title, 'LLM 链路分析不可用');
+  assert.ok(analysisSection.body.includes('llm unavailable'));
+});
+
+test('findingDetailPageWithAnalysis fills a local chain summary when LLM omits it', async () => {
+  const llmClient = {
+    async createStructuredResponse() {
+      return {
+        purpose: '尝试执行 db.delete 删除操作。',
+        chain_summary: '',
+        risk_points: [],
+        next_actions: [],
+      };
+    },
+  };
+
+  const page = await createViz({}, { llmClient, model: 'test-model' }).findingDetailPageWithAnalysis('f-critical');
+
+  const analysisSection = page.sections.find((section) => section.id === 'trace_llm_analysis');
+  assert.ok(analysisSection);
+  assert.match(analysisSection.chain_summary, /tool.start/);
+  assert.match(analysisSection.chain_summary, /tool.end/);
+  assert.match(analysisSection.chain_summary, /permission denied/);
 });
 
 test('findingDetailPage shows a trace fallback callout when no timeline events exist', () => {
   const page = createViz({ traceEventsById: {} }).findingDetailPage('f-critical');
 
   assert.equal(page.sections.some((section) => section.id === 'trace_timeline'), false);
-  const traceFallback = page.sections.find((section) => section.id === 'trace_timeline_empty');
+  const traceFallback = page.sections.find((section) => section.id === 'trace_sequence_empty');
   assert.ok(traceFallback);
-  assert.equal(traceFallback.title, '工具调用链路');
+  assert.equal(traceFallback.title, '工具调用顺序');
   assert.ok(traceFallback.body.includes('trace-critical-1'));
 });
 

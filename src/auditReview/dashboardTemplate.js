@@ -36,6 +36,12 @@ function visibleSections(sections = []) {
     if (section.type === 'link_list') return Array.isArray(section.links) && section.links.length > 0;
     if (section.type === 'callout') return hasValue(section.body) || hasValue(section.title);
     if (section.type === 'raw_log_list') return Array.isArray(section.snippets) && section.snippets.some((snippet) => hasValue(snippet.body));
+    if (section.type === 'trace_sequence') return Array.isArray(section.steps) && section.steps.length > 0;
+    if (section.type === 'trace_analysis') {
+      return hasValue(section.purpose) || hasValue(section.chain_summary)
+        || (Array.isArray(section.risk_points) && section.risk_points.length > 0)
+        || (Array.isArray(section.next_actions) && section.next_actions.length > 0);
+    }
     return false;
   });
 }
@@ -256,6 +262,67 @@ function renderRawLogListSection(section) {
   </section>`;
 }
 
+function renderTraceSequenceSection(section) {
+  const id = section.id ?? '';
+  const title = escapeHtml(section.title ?? '');
+  const steps = Array.isArray(section.steps) ? section.steps : [];
+  if (steps.length === 0) return '';
+
+  const items = steps.map((step) => {
+    const status = step.status && typeof step.status === 'object'
+      ? renderStatusTag(step.status.text ?? '', step.status.tone)
+      : '';
+    const metaItems = [
+      hasValue(step.timestamp) ? `<span>${escapeHtml(step.timestamp)}</span>` : '',
+      hasValue(step.span_id) ? `<span>Span ${escapeHtml(step.span_id)}</span>` : '',
+      hasValue(step.parent_span_id) ? `<span>父 Span ${escapeHtml(step.parent_span_id)}</span>` : '',
+      hasValue(step.duration_ms) ? `<span>${escapeHtml(step.duration_ms)}</span>` : '',
+    ].filter(Boolean).join('');
+    const summary = hasValue(step.error_message) ? step.error_message : step.summary;
+
+    return `<li class="trace-step">
+        <span class="trace-step-index">${escapeHtml(step.order ?? '')}</span>
+        <div class="trace-step-body">
+          <div class="trace-step-head">
+            <span class="trace-step-tool mono">${escapeHtml(step.tool_name ?? '')}</span>
+            <span class="trace-step-event">${escapeHtml(step.event ?? '')}</span>
+            ${status}
+          </div>
+          ${metaItems ? `<div class="trace-step-meta mono">${metaItems}</div>` : ''}
+          ${hasValue(summary) ? `<div class="trace-step-summary">${escapeHtml(summary)}</div>` : ''}
+        </div>
+      </li>`;
+  }).join('');
+
+  return `<section${renderSectionIdAttr(id)} class="data-section trace-sequence-section">
+    <h3>${title}</h3>
+    <ol class="trace-sequence">${items}</ol>
+  </section>`;
+}
+
+function renderTraceAnalysisSection(section) {
+  const id = section.id ?? '';
+  const title = escapeHtml(section.title ?? '');
+  const riskPoints = Array.isArray(section.risk_points) ? section.risk_points.filter(hasValue) : [];
+  const nextActions = Array.isArray(section.next_actions) ? section.next_actions.filter(hasValue) : [];
+  if (!hasValue(section.purpose) && !hasValue(section.chain_summary) && riskPoints.length === 0 && nextActions.length === 0) return '';
+
+  const renderList = (items) => items.length > 0
+    ? `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
+    : '';
+
+  return `<section${renderSectionIdAttr(id)} class="data-section trace-analysis-section">
+    <h3>${title}</h3>
+    <div class="trace-analysis-grid">
+      ${hasValue(section.purpose) ? `<div class="trace-analysis-block"><div class="trace-analysis-label">调用目的</div><p>${escapeHtml(section.purpose)}</p></div>` : ''}
+      ${hasValue(section.chain_summary) ? `<div class="trace-analysis-block"><div class="trace-analysis-label">链路解读</div><p>${escapeHtml(section.chain_summary)}</p></div>` : ''}
+      ${riskPoints.length > 0 ? `<div class="trace-analysis-block"><div class="trace-analysis-label">风险点</div>${renderList(riskPoints)}</div>` : ''}
+      ${nextActions.length > 0 ? `<div class="trace-analysis-block"><div class="trace-analysis-label">建议动作</div>${renderList(nextActions)}</div>` : ''}
+    </div>
+    ${hasValue(section.model) ? `<div class="trace-analysis-model mono">模型：${escapeHtml(section.model)}</div>` : ''}
+  </section>`;
+}
+
 function renderSection(section) {
   if (!section) return '';
   switch (section.type) {
@@ -264,6 +331,8 @@ function renderSection(section) {
     case 'link_list': return renderLinkListSection(section);
     case 'callout': return renderCalloutSection(section);
     case 'raw_log_list': return renderRawLogListSection(section);
+    case 'trace_sequence': return renderTraceSequenceSection(section);
+    case 'trace_analysis': return renderTraceAnalysisSection(section);
     default: return '';
   }
 }
@@ -544,6 +613,95 @@ a:hover {
 .link-list { list-style: none; padding: 0; margin: 0; }
 .link-list li { padding: 6px 0; }
 .callout-body { font-size: 14px; color: var(--text); }
+.trace-sequence {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.trace-step {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  gap: 12px;
+}
+.trace-step-index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+}
+.trace-step-body {
+  min-width: 0;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.trace-step:last-child .trace-step-body {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+.trace-step-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.trace-step-tool {
+  font-weight: 700;
+  word-break: break-all;
+}
+.trace-step-event {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.trace-step-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.trace-step-summary {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--text);
+}
+.trace-analysis-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px 20px;
+}
+.trace-analysis-block {
+  min-width: 0;
+}
+.trace-analysis-label {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+.trace-analysis-block p {
+  margin: 0;
+  font-size: 14px;
+}
+.trace-analysis-block ul {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 14px;
+}
+.trace-analysis-model {
+  margin-top: 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
 .empty-state, .empty, .error-state, .error { color: var(--text-muted); font-size: 13px; padding: 12px; }
 .error-state, .error { color: var(--critical); }
 footer { text-align: center; color: var(--text-muted); font-size: 12px; padding: 24px; }
