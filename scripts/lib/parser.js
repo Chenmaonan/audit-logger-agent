@@ -1,6 +1,7 @@
 const REQUIRED_FIELDS = ['ts', 'agent_id', 'trace_id', 'span_id', 'event', 'tool_name', 'status', 'result_summary'];
 const VALID_EVENTS = ['tool.start', 'tool.end', 'tool.error', 'agent.start', 'agent.end', 'agent.error', 'run.start', 'run.resume', 'run.waiting_user', 'run.final_result', 'run.failed'];
 const VALID_STATUSES = ['ok', 'error', 'timeout', 'cancelled'];
+const DEFAULT_MAX_LINE_BYTES = 64 * 1024;
 
 export function validateLogEntry(entry, lineNumber) {
   const errors = [];
@@ -38,15 +39,23 @@ export function validateLogEntry(entry, lineNumber) {
   return errors;
 }
 
-export function parseNdjson(content) {
+export function parseNdjson(content, options = {}) {
+  const maxLineBytes = Number.isFinite(Number(options.maxLineBytes)) && Number(options.maxLineBytes) > 0
+    ? Math.floor(Number(options.maxLineBytes))
+    : DEFAULT_MAX_LINE_BYTES;
   const lines = content.split('\n').filter(line => line.trim() !== '');
   const entries = [];
   const errors = [];
 
   for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].endsWith('\r') ? lines[i].slice(0, -1) : lines[i];
+    const lineNumber = i + 1;
+    if (Buffer.byteLength(line, 'utf-8') > maxLineBytes) {
+      errors.push(`line ${lineNumber}: exceeds maxLineBytes (${maxLineBytes})`);
+      continue;
+    }
     try {
-      const entry = JSON.parse(lines[i]);
-      const lineNumber = i + 1;
+      const entry = JSON.parse(line);
       const validationErrors = validateLogEntry(entry, lineNumber);
       if (validationErrors.length > 0) {
         errors.push(...validationErrors);

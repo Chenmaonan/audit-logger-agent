@@ -1,4 +1,4 @@
-{
+﻿{
   "dbPath": "data/audit.db",
   "agents": {
     "rental-price-agent": {
@@ -18,7 +18,12 @@
     },
     "spoolDir": "data/incoming"
   },
-  "retention": {
+  "limits": {
+    "maxLineBytes": 65536,
+    "maxChunkBytes": 16777216,
+    "maxQueryLimit": 1000,
+    "maxBodyBytes": 1048576
+  },  "retention": {
     "enabled": true,
     "runAtHour": 4,
     "eventsDays": 90,

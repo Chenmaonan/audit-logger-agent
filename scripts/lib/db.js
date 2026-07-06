@@ -36,8 +36,31 @@ CREATE INDEX IF NOT EXISTS idx_audit_product ON audit_events(product_id);
 
 import crypto from 'crypto';
 
+const DEFAULT_QUERY_LIMIT = 100;
+const DEFAULT_MAX_QUERY_LIMIT = 1000;
+
 function hashRow(rawJson) {
   return crypto.createHash('sha256').update(rawJson).digest('hex').slice(0, 16);
+}
+
+function clampPositiveInteger(value, defaultValue, maxValue) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return defaultValue;
+  const integer = Math.floor(parsed);
+  if (integer < 1) return 1;
+  return Math.min(integer, maxValue);
+}
+
+function clampOffset(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return Math.floor(parsed);
+}
+
+function configuredMaxQueryLimit(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_MAX_QUERY_LIMIT;
+  return Math.floor(parsed);
 }
 
 export function openDb(dbPath) {
@@ -75,7 +98,7 @@ export function insertEvents(db, events) {
   return insertMany(events);
 }
 
-export function queryEvents(db, filters = {}) {
+export function queryEvents(db, filters = {}, options = {}) {
   const conditions = [];
   const params = {};
 
@@ -121,8 +144,11 @@ export function queryEvents(db, filters = {}) {
   }
 
   const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
-  const limit = filters.limit || 100;
-  const offset = filters.offset || 0;
+  const maxQueryLimit = configuredMaxQueryLimit(options.maxQueryLimit);
+  const limit = filters.limit == null
+    ? DEFAULT_QUERY_LIMIT
+    : clampPositiveInteger(filters.limit, DEFAULT_QUERY_LIMIT, maxQueryLimit);
+  const offset = clampOffset(filters.offset);
 
   const sql = `SELECT * FROM audit_events ${where} ORDER BY ts DESC LIMIT @limit OFFSET @offset`;
   params.limit = limit;

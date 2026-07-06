@@ -4,6 +4,45 @@ import { queryEvents, dailySummary, errorReport, toolUsageStats } from '../../..
 import { renderDashboard } from '../../auditReview/dashboardTemplate.js';
 import { handleIngestRoute, isHttpIngestEnabled } from './ingestRoute.js';
 
+const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
+const DEFAULT_MAX_QUERY_LIMIT = 1000;
+
+function positiveInteger(value, defaultValue) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) return defaultValue;
+  return Math.floor(parsed);
+}
+
+function maxBodyBytes(config = {}) {
+  return positiveInteger(config.limits?.maxBodyBytes, DEFAULT_MAX_BODY_BYTES);
+}
+
+function maxQueryLimit(config = {}) {
+  return positiveInteger(config.limits?.maxQueryLimit, DEFAULT_MAX_QUERY_LIMIT);
+}
+
+function clampLimit(value, defaultValue, maxValue) {
+  if (value == null) return defaultValue;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return defaultValue;
+  const integer = Math.floor(parsed);
+  if (integer < 1) return 1;
+  return Math.min(integer, maxValue);
+}
+
+function clampOffset(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return Math.floor(parsed);
+}
+
+function paginationFromUrl(url, { defaultLimit, config }) {
+  return {
+    limit: clampLimit(url.searchParams.get('limit'), defaultLimit, maxQueryLimit(config)),
+    offset: clampOffset(url.searchParams.get('offset')),
+  };
+}
+
 function json(res, status, data) {
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
@@ -46,9 +85,25 @@ function mapAuthFailure(authResult) {
   return { status, body: { error_code: code, error: 'Unauthorized' } };
 }
 
-async function readJson(req) {
+async function readJson(req, limitBytes = DEFAULT_MAX_BODY_BYTES) {
+  const declared = Number(req.headers['content-length']);
+  if (Number.isFinite(declared) && declared > limitBytes) {
+    const error = new Error('Request body exceeds maxBodyBytes');
+    error.code = 'body_too_large';
+    throw error;
+  }
+
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > limitBytes) {
+      const error = new Error('Request body exceeds maxBodyBytes');
+      error.code = 'body_too_large';
+      throw error;
+    }
+    chunks.push(chunk);
+  }
   const raw = Buffer.concat(chunks).toString('utf-8');
   return raw ? JSON.parse(raw) : {};
 }
@@ -109,6 +164,7 @@ function normalizeRunRequest(body, headers) {
 // Maps runtime-thrown errors (carrying a stable `code`) to HTTP status + body.
 function mapRuntimeError(error) {
   const code = error?.code;
+  if (code === 'body_too_large') return { status: 413, body: { error_code: 'payload_too_large', error: error.message } };
   if (code === 'run_not_found') return { status: 404, body: { error_code: code, error: error.message } };
   if (code === 'resume_conflict') return { status: 409, body: { error_code: code, error: error.message } };
   if (code === 'invalid_decision_response') return { status: 400, body: { error_code: code, error: error.message } };
@@ -140,8 +196,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         const auth = dashboardAuth.authorize(req, { isWrite: false });
         const fail = mapAuthFailure(auth);
         if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
-        const limit = Number(url.searchParams.get('limit') ?? 50);
-        const offset = Number(url.searchParams.get('offset') ?? 0);
+        const { limit, offset } = paginationFromUrl(url, { defaultLimit: 50, config });
         const runs = reviewStore.listRuns({ limit, offset });
         auditJson(res, 200, { count: runs.length, results: runs }, cors);
         return;
@@ -164,8 +219,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         const auth = dashboardAuth.authorize(req, { isWrite: false });
         const fail = mapAuthFailure(auth);
         if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
-        const limit = Number(url.searchParams.get('limit') ?? 100);
-        const offset = Number(url.searchParams.get('offset') ?? 0);
+        const { limit, offset } = paginationFromUrl(url, { defaultLimit: 100, config });
         const severity = url.searchParams.get('severity') ?? undefined;
         const category = url.searchParams.get('category') ?? undefined;
         const agentId = url.searchParams.get('agent_id') ?? undefined;
@@ -259,8 +313,10 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (req.method === 'GET' && url.pathname === '/query') {
         const filters = Object.fromEntries(url.searchParams.entries());
-        if (filters.limit) filters.limit = Number(filters.limit);
-        const results = queryEvents(db, filters);
+        const { limit, offset } = paginationFromUrl(url, { defaultLimit: 100, config });
+        filters.limit = limit;
+        filters.offset = offset;
+        const results = queryEvents(db, filters, { maxQueryLimit: maxQueryLimit(config) });
         json(res, 200, { count: results.length, results });
         return;
       }
@@ -288,7 +344,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
       }
 
       if (req.method === 'POST' && url.pathname === '/v1/runs') {
-        const body = await readJson(req);
+        const body = await readJson(req, maxBodyBytes(config));
         const normalized = normalizeRunRequest(body, req.headers);
         const validationErrors = validateCreateRunInput(normalized);
         if (validationErrors.length > 0) {
@@ -304,7 +360,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (req.method === 'POST' && url.pathname.startsWith('/v1/runs/') && url.pathname.endsWith('/resume')) {
         const runId = url.pathname.split('/')[3];
-        const body = await readJson(req);
+        const body = await readJson(req, maxBodyBytes(config));
         if (!body || !body.decision_id) {
           json(res, 400, { error_code: 'invalid_request', error: 'decision_id is required' });
           return;
