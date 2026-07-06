@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createVisualization } from '../../src/auditReview/visualization.js';
 
-function fakeStore() {
+function fakeStore({ traceEventsById, rawEventsById } = {}) {
   const findings = [
     {
       finding_id: 'f-critical',
@@ -162,6 +162,44 @@ function fakeStore() {
     },
   ];
 
+  const traces = traceEventsById ?? {
+    'trace-critical-1': [
+      {
+        id: 11,
+        ts: '2026-07-03T10:28:00.000Z',
+        event: 'tool.start',
+        status: 'ok',
+        agent_id: 'agent-critical',
+        tool_name: 'db.delete',
+        trace_id: 'trace-critical-1',
+        span_id: 'span-critical-1',
+        parent_span_id: null,
+        result_summary: 'delete requested',
+        duration_ms: null,
+        error_message: null,
+      },
+      {
+        id: 12,
+        ts: '2026-07-03T10:29:00.000Z',
+        event: 'tool.end',
+        status: 'error',
+        agent_id: 'agent-critical',
+        tool_name: 'db.delete',
+        trace_id: 'trace-critical-1',
+        span_id: 'span-critical-2',
+        parent_span_id: 'span-critical-1',
+        result_summary: 'delete failed after partial mutation',
+        duration_ms: 640,
+        error_message: 'permission denied',
+      },
+    ],
+  };
+
+  const rawEvents = rawEventsById ?? {
+    1: { id: 1, raw_json: '{"event":"tool.start","tool_name":"db.delete","payload":{"b":2,"a":1}}' },
+    2: { id: 2, raw_json: '{"event":"tool.end","tool_name":"db.delete","error_message":"permission denied"}' },
+  };
+
   return {
     listFindings({ severity, status, reviewId, limit } = {}) {
       let rows = findings.slice();
@@ -179,15 +217,23 @@ function fakeStore() {
     getFinding(id) {
       return findings.find((finding) => finding.finding_id === id) ?? null;
     },
+    listTraceEvents({ traceId, limit } = {}) {
+      const rows = traces[traceId] ?? [];
+      return typeof limit === 'number' ? rows.slice(0, limit) : rows.slice();
+    },
+    listRawEventsByIds({ eventIds, limit } = {}) {
+      const rows = (eventIds ?? []).map((id) => rawEvents[id]).filter(Boolean);
+      return typeof limit === 'number' ? rows.slice(0, limit) : rows;
+    },
     listDeadLetterCount() {
       return 0;
     },
   };
 }
 
-function createViz() {
+function createViz(storeOptions) {
   return createVisualization({
-    reviewStore: fakeStore(),
+    reviewStore: fakeStore(storeOptions),
     config: { auditReview: { visualization: { dashboardPath: '/dashboard' } } },
   });
 }
@@ -210,7 +256,11 @@ test('overviewPage adds actions links split sections and clickable finding rows'
   const findingsSection = page.sections.find((section) => section.id === 'pending_findings');
   assert.ok(findingsSection);
   assert.equal(findingsSection.title, '待处理风险发现');
+  assert.ok(findingsSection.columns.some((column) => column.key === 'trace_id' && column.label === '链路 ID'));
   assert.match(findingsSection.rows[0].title.href, /\/dashboard\/audit-findings\//);
+  assert.equal(findingsSection.rows[0].trace_id.text, 'trace-critical-1');
+  assert.match(findingsSection.rows[0].trace_id.href, /\/dashboard\/audit-findings\/f-critical#trace_timeline$/);
+  assert.equal(findingsSection.rows[0].trace_id.mono, true);
   assert.match(findingsSection.rows[0].review_id.href, /\/dashboard\/audit-reviews\//);
 
   const reviewsWithFindings = page.sections.find((section) => section.id === 'reviews_with_findings');
@@ -234,7 +284,9 @@ test('reviewDetailPage links finding rows and shows degraded callout', () => {
 
   const findingsSection = page.sections.find((section) => section.id === 'review_findings');
   assert.ok(findingsSection);
+  assert.ok(findingsSection.columns.some((column) => column.key === 'trace_id' && column.label === '链路 ID'));
   assert.match(findingsSection.rows[0].title.href, /\/dashboard\/audit-findings\//);
+  assert.match(findingsSection.rows[0].trace_id.href, /\/dashboard\/audit-findings\/f-critical#trace_timeline$/);
   assert.equal(typeof findingsSection.rows[0].evidence_count, 'object');
 
   const degradedCallout = page.sections.find((section) => section.type === 'callout' && section.title === '降级完成说明');
@@ -262,8 +314,49 @@ test('findingDetailPage includes breadcrumbs summary callouts and overview navig
   assert.equal(evidenceSection.rows[0].agent_name, '测试 Agent');
   assert.equal(evidenceSection.rows[1].result_summary, 'delete failed after partial mutation');
 
+  const rawSection = page.sections.find((section) => section.id === 'evidence_raw_logs');
+  assert.ok(rawSection);
+  assert.equal(rawSection.title, '原始日志片段（共 2 条）');
+  assert.deepEqual(rawSection.snippets.map((snippet) => snippet.label), ['日志 ID 1', '日志 ID 2']);
+  assert.deepEqual(rawSection.snippets.map((snippet) => snippet.body), [
+    '{"event":"tool.start","tool_name":"db.delete","payload":{"b":2,"a":1}}',
+    '{"event":"tool.end","tool_name":"db.delete","error_message":"permission denied"}',
+  ]);
+
+  const traceSection = page.sections.find((section) => section.id === 'trace_timeline');
+  assert.ok(traceSection);
+  assert.equal(traceSection.title, '工具调用链路（共 2 条）');
+  assert.deepEqual(traceSection.rows.map((row) => row.span_id.text), ['span-critical-1', 'span-critical-2']);
+  assert.equal(traceSection.rows[1].parent_span_id.text, 'span-critical-1');
+  assert.equal(traceSection.rows[1].duration_ms.text, '640');
+  assert.equal(traceSection.rows[1].error_message, 'permission denied');
+
   const linkSection = page.sections.find((section) => section.type === 'link_list');
   assert.ok(linkSection.links.some((link) => link.href === '/dashboard'));
+});
+
+test('findingDetailPage shows a trace fallback callout when no timeline events exist', () => {
+  const page = createViz({ traceEventsById: {} }).findingDetailPage('f-critical');
+
+  assert.equal(page.sections.some((section) => section.id === 'trace_timeline'), false);
+  const traceFallback = page.sections.find((section) => section.id === 'trace_timeline_empty');
+  assert.ok(traceFallback);
+  assert.equal(traceFallback.title, '工具调用链路');
+  assert.ok(traceFallback.body.includes('trace-critical-1'));
+});
+
+test('findingDetailPage uses Chinese labels for basic information fields', () => {
+  const page = createViz().findingDetailPage('f-critical');
+  const basicInfo = page.sections.find((section) => section.id === 'finding_detail');
+  assert.ok(basicInfo);
+
+  const labels = basicInfo.items.map((item) => item.label);
+  assert.ok(labels.includes('风险发现 ID'));
+  assert.ok(labels.includes('智能体 ID'));
+  assert.ok(labels.includes('链路 ID'));
+  assert.equal(labels.includes('Finding ID'), false);
+  assert.equal(labels.includes('Agent ID'), false);
+  assert.equal(labels.includes('Trace ID'), false);
 });
 
 test('visualization view models remain server-renderable data only', () => {

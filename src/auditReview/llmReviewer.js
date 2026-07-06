@@ -17,6 +17,8 @@ const SYSTEM_PROMPT = [
   '- Give a concise one-line title for each finding.',
   '- Summary must be <= 200 chars, describing the issue and evidence.',
   '- Recommendation must be actionable and <= 200 chars.',
+  '- All narrative fields (叙述性字段) MUST be written in Simplified Chinese (简体中文): summary.title, summary.overview, finding.title, finding.summary, and finding.recommendation.',
+  '- If a narrative field references evidence, tool names, error codes, file paths, IDs, trace values, or other machine identifiers, keep those original English identifiers verbatim inside the Chinese sentence. Example: "db.deleteTable 被调用且未触发审批，存在未授权删除风险。"',
   '- evidence_event_ids MUST reference only the event ids provided in the candidates. NEVER invent event ids.',
   '- requires_action=true when the finding needs immediate human attention.',
   '- severity_counts in summary must reflect the count of findings at each severity.',

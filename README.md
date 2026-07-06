@@ -1,42 +1,92 @@
 # Audit Logger Agent
 
-跨 Agent 的结构化审计日志采集、查询、报表，基于 LLM 的审计分析 Agent 运行时，以及 v1.4 的常驻式 LLM 日志审查与主动告警守护进程。
+`audit-logger-agent` 用于统一采集多个 Agent 产出的审计日志，落库到本地 SQLite，并提供查询、报表、LLM 任务运行时、周期性审查、回调通知和本地 Dashboard。
 
-本项目把其它 Agent（rental-price-agent、MT-agent 及未来新增 Agent）在工具调用时产出的审计日志，统一汇聚到本地 SQLite，提供查询与报表接口；通过一个带状态机的 Agent 运行时，由 LLM 规划、本地执行工具，对审计异常进行分析与汇总；并自 v1.4 起，常驻周期性地采集其他 Agent 日志、用规则预筛 + LLM 结构化审查识别高危调用，主动通过通用回调投递审查摘要，并提供本地 Web Dashboard 钻取。
+当前仓库以“当前可运行版本”为准，本文档只描述现在这套实现，不再展开历史迭代说明。
 
----
+## 核心功能
 
-## 功能概览
+- 统一采集多个 Agent 的 NDJSON 审计日志，按 `row_hash` 去重写入 SQLite。
+- 提供命令行查询和报表能力，支持按 Agent、工具、状态、时间范围、Trace 等条件过滤。
+- 提供本地 HTTP API，便于外部系统发起查询、生成报表和触发任务。
+- 内置 LLM 驱动的任务运行时，可把自然语言请求转成结构化计划，并只在本地执行受控工具。
+- 内置周期性审查流程：增量采集日志、规则预筛、LLM 结构化审查、生成 Findings、推送回调通知。
+- 提供本地 Dashboard，查看审查批次、风险发现和证据明细。
+- 具备重启恢复、Outbox 重试和死信统计能力，适合长期驻留运行。
 
-- **日志采集**：扫描各 Agent 配置的日志目录，解析 NDJSON（`.jsonl`）审计日志，按 `row_hash`（原始 JSON 行的 SHA-256）去重入库，保证重复采集幂等、同一 `span_id` 的 start/end/error 事件仍各自独立。
-- **查询**：按 agent、tool、status、trace、product、时间范围等灵活过滤审计事件。
-- **报表**：日报、错误报表、工具统计报表。
-- **HTTP 服务**：本地 HTTP API，支持在线查询与报表。
-- **LLM Agent 运行时**：v1.3 起，planner 由 OpenAI 兼容的 LLM 驱动，输出结构化执行计划或决策请求；工具仍在本地执行，全过程可审计。
-- **常驻式 LLM 日志审查（v1.4）**：`AuditReviewScheduler` 默认每 30 分钟运行一次审查周期——增量采集日志、规则预筛候选事件、LLM 结构化审查分级、持久化审查批次与去重 findings、生成通用回调投递摘要写入 outbox 主动投递，并提供本地 Dashboard 可视化。
+## 适用场景
 
----
+- 需要把多个 Agent 的工具调用日志统一归档和检索。
+- 需要对高风险工具调用、失败调用、重复调用做周期性审查。
+- 需要把“查询审计数据”和“自动生成风险摘要”封装成一个本地服务。
+- 需要一个可被上层平台调用的 Agent 审计分析后端。
+
+## 架构概览
+
+```text
+Agent 日志文件 (*.jsonl)
+  -> 批量采集 / 增量采集
+  -> audit_events (SQLite)
+     -> CLI 查询 / 报表
+     -> HTTP 查询 / 报表 API
+     -> LLM 任务运行时
+     -> 周期性审查
+        -> 规则预筛
+        -> LLM 审查
+        -> audit_review_runs / audit_review_findings
+        -> 回调通知 / 本地 Dashboard
+```
+
+### 主要数据表
+
+- `audit_events`：原始审计事件主表。
+- `agent_runs` / `agent_run_steps` / `agent_waiting_states`：LLM 任务运行时状态。
+- `agent_outbox_events`：待投递事件、重试和死信。
+- `audit_review_runs` / `audit_review_findings`：周期性审查批次与风险发现。
+- `audit_review_locks`：审查任务租约锁，避免并发重复执行。
+- `audit_ingest_cursors`：增量采集游标。
 
 ## 运行环境
 
-- Node.js ≥ 20（项目为 ESM）
-- 依赖见 `package.json`，核心依赖：`better-sqlite3`、`openai`
+- Node.js 20 或更高版本
+- 可访问各 Agent 日志目录的本地文件系统权限
+- SQLite 文件写入权限
+- 如果启动 `server` 模式：
+  - 必须提供 OpenAI 兼容接口凭证
+  - 如果要接收运行结果或审查通知，必须准备回调接收端
 
----
+## 部署前先明确两种运行方式
 
-## 安装
+### 1. 只做采集 / 查询 / 报表
+
+使用 `ingest`、`query`、`report` 三个 CLI 即可。
+
+- 不需要 LLM 凭证
+- 不需要启动 HTTP 服务
+- 不需要回调接收端
+
+### 2. 启动完整服务
+
+使用 `server` 模式。
+
+- 需要 LLM 凭证
+- 会初始化 LLM planner 和审查 reviewer
+- 会启动 HTTP API
+- 默认会启动周期性审查调度器，除非 `auditReview.enabled` 显式设为 `false`
+
+## 部署步骤
+
+### 1. 安装依赖
 
 ```bash
 npm install
 ```
 
----
+### 2. 配置 `config.json`
 
-## 配置
+`config.json` 是主配置文件，至少要定义数据库路径和要采集的 Agent 日志目录。
 
-### 1. 应用配置 `config.json`
-
-设置各 Agent 的日志目录与文件名模式，以及数据库路径。
+示例：
 
 ```json
 {
@@ -50,300 +100,7 @@ npm install
       "logDir": "../../MT-agent-master/output/logs",
       "pattern": "audit-*.jsonl"
     }
-  }
-}
-```
-
-> `config.json` 只放非敏感配置，**不要放任何密钥**。
-
-### 2. LLM 凭证 `.config`（项目级，git-ignored）
-
-LLM 凭证单独存放在仓库根目录的 `.config` 文件（JSON 格式），不会提交到 git。复制示例文件后填入你的值：
-
-```bash
-cp .config.example .config
-```
-
-`.config` 字段（变量名为项目相关命名，不直接暴露供应商）：
-
-```json
-{
-  "AUDIT_AGENT_LLM_API_KEY": "<your-api-key>",
-  "AUDIT_AGENT_LLM_BASE_URL": "https://api.openai.com/v1",
-  "AUDIT_AGENT_LLM_MODEL": "<your-model>",
-  "AUDIT_AGENT_LLM_TIMEOUT_MS": "30000"
-}
-```
-
-加载优先级：**进程环境变量 > `.config` 文件 > `config.json` 的 `planner` 块**（兜底非敏感项）。
-
-- `AUDIT_AGENT_LLM_BASE_URL` 用于代理或 OpenAI 兼容网关；使用官方 OpenAI 时保持默认即可。
-- 也可不使用 `.config`，改为设置同名进程环境变量，环境变量会覆盖 `.config`。
-- `.config` 已在 `.gitignore` 中，模板见 `.config.example`。
-
----
-
-## 可用命令
-
-### 采集 ingest
-
-扫描日志目录、解析 NDJSON、去重并入库。
-
-```bash
-node scripts/ingest.js [--since YYYY-MM-DD]
-```
-
-`--since` 按**文件名日期**（如 `audit-2026-07-02.jsonl`）限制扫描范围，用于增量采集。
-
-### 查询 query
-
-```bash
-node scripts/query.js [options]
-  --agent-id <id>          按 agent 过滤
-  --tool-name <name>       按 tool 过滤（支持 % 通配）
-  --status <status>        按状态过滤（ok, error, timeout, cancelled）
-  --from <ISO timestamp>   时间范围起点
-  --to <ISO timestamp>     时间范围终点
-  --trace-id <id>          按 trace 过滤
-  --product-id <id>        按 product 过滤
-  --limit <n>              最多返回条数（默认 100）
-  --format json|table      输出格式（默认 table）
-```
-
-### 报表 report
-
-```bash
-node scripts/report.js [options]
-  --type daily|errors|tools   报表类型
-  --date YYYY-MM-DD           日报日期
-  --from <ISO>                范围报表起点
-  --to <ISO>                  范围报表终点
-  --agent-id <id>             按 agent 过滤
-```
-
-### 服务端 server
-
-启动 HTTP API 服务，提供在线查询/报表，并承载 LLM Agent 运行时。
-
-```bash
-node scripts/server.js [--port 9320]
-```
-
-HTTP 接口：
-
-- `GET /query?agent_id=...&tool_name=...&from=...&to=...&limit=100`
-- `GET /report/daily?date=YYYY-MM-DD`
-- `GET /report/errors?from=...&to=...`
-- `GET /report/tools?from=...&to=...`
-- `GET /health`
-- `POST /v1/runs` —— 创建一个 Agent 运行任务（异步 ACK）
-- `GET /v1/runs/{runId}` —— 查询运行状态
-- `POST /v1/runs/{runId}/resume` —— 当运行暂停等待用户决策时，提交决策后恢复执行
-
-v1.4 审查相关接口（鉴权见下文）：
-
-- `GET /v1/audit-reviews` —— 审查批次列表（支持 `limit` / `offset`）
-- `GET /v1/audit-reviews/{reviewId}` —— 某轮审查详情
-- `GET /v1/audit-findings` —— findings 列表（支持 `severity` / `category` / `agent_id` / `tool_name` / `status` / `review_id` / `limit` / `offset`）
-- `GET /v1/audit-findings/{findingId}` —— 单条 finding 详情
-- `POST /v1/audit-reviews/run` —— 手动触发一轮审查（需 admin token；已有审查在运行时返回 `409 review_already_running`）
-- `GET /dashboard` —— 审查总览页（HTML）
-- `GET /dashboard/audit-reviews/{reviewId}` —— 审查详情页（HTML）
-- `GET /dashboard/audit-findings/{findingId}` —— finding 证据页（HTML）
-
-### 本地快速启动与手动派发任务
-
-server 启动时会初始化 LLM planner，因此启动前必须通过 `.config` 或同名环境变量配置 `AUDIT_AGENT_LLM_API_KEY` 和 `AUDIT_AGENT_LLM_MODEL`。
-
-```powershell
-npm install
-if (-not (Test-Path .config)) { Copy-Item .config.example .config }
-```
-
-在仓库根目录编辑 `.config`，填入真实的 LLM 网关、模型和密钥后启动：
-
-```powershell
-node scripts/server.js --port 9320
-```
-
-确认服务已经就绪：
-
-```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:9320/health" -Method Get
-```
-
-启动后，通过 `POST /v1/runs` 给 Agent 派发一个任务。`request.text` 是用户要安排的任务内容；`delivery.target_url` 是 Agent 投递进度、用户决策请求和最终结果的回调接收端地址。
-
-```powershell
-$body = @{
-  source = @{
-    channel = "manual"
-    conversation_id = "oc_manual"
-    message_id = "om_manual_001"
-    user = @{ open_id = "ou_manual" }
-  }
-  request = @{ text = "分析今天所有审计异常，并汇总风险最高的链路" }
-  delivery = @{
-    mode = "callback"
-    target_url = "http://127.0.0.1:9999/agent-events"
-  }
-  metadata = @{ tenant_key = "tenant_manual" }
-} | ConvertTo-Json -Depth 8
-
-Invoke-RestMethod `
-  -Uri "http://127.0.0.1:9320/v1/runs" `
-  -Method Post `
-  -ContentType "application/json" `
-  -Body $body
-```
-
-接口会先返回异步 ACK：
-
-```json
-{
-  "run_id": "run_...",
-  "status": "created"
-}
-```
-
-随后可以查询运行状态：
-
-```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:9320/v1/runs/<run_id>" -Method Get
-```
-
-如果 Agent 认为任务范围不明确，它会向 `delivery.target_url` 投递 `decision_request`，其中包含 `run_id`、`decision_id`、`options` 和可选的 `form_schema`。调用方收集用户选择后，用 `/resume` 恢复任务：
-
-```powershell
-$resumeBody = @{
-  decision_id = "<decision_id>"
-  response = @{
-    selected_option = "<option_id>"
-    form_data = @{}
-  }
-} | ConvertTo-Json -Depth 8
-
-Invoke-RestMethod `
-  -Uri "http://127.0.0.1:9320/v1/runs/<run_id>/resume" `
-  -Method Post `
-  -ContentType "application/json" `
-  -Body $resumeBody
-```
-
-`selected_option` 必须来自 `decision_request.options[].id`；如果 `form_schema` 里有必填字段，需要放入 `response.form_data`。
-
----
-
-## LLM Agent 运行时（v1.3）
-
-### 数据流
-
-```text
-调用方 -> POST /v1/runs -> Runtime.startRun
-  -> LLM planner（OpenAI 兼容 Responses API）
-  -> 结构化计划（plan）或决策请求（decision_request）
-  -> 本地 plan 校验
-  -> ToolRegistry 本地执行工具
-  -> agent_run_steps
-  -> LLM 合成最终结果
-  -> agent_outbox_events
-  -> delivery target (callback receiver)
-```
-
-### 工作方式
-
-- LLM **只负责规划**，不直接执行工具；它输出符合结构化 schema 的决策对象，经本地校验后才交给运行时。
-- 工具执行完全在本地、可审计：`audit.queryEvents` 查询审计事件、`report.errorSummary` 汇总错误。
-- 当请求范围不明确时，planner 会返回 `decision_request`，运行时暂停为 `waiting_user` 状态，等待用户通过 `/v1/runs/{runId}/resume` 提交选择后再继续。
-- 模型输出始终先经本地校验（`src/agent/plannerSchema.js`），不合规的输出会被拒绝，不会直接改变运行状态。
-- 进程崩溃重启后，孤儿运行会被恢复机制标记为失败（`recoverInflightRuns`），避免任务卡死。
-
-### 创建一个运行
-
-```powershell
-$body = @{
-  source = @{
-    channel = "manual"
-    conversation_id = "oc_manual"
-    message_id = "om_manual_openai"
-    user = @{ open_id = "ou_manual" }
-  }
-  request = @{ text = "分析今天所有的审计异常并汇总风险最高的链路" }
-  delivery = @{ mode = "callback"; target_url = "http://127.0.0.1:9999/agent-events" }
-  metadata = @{ tenant_key = "tenant_manual" }
-} | ConvertTo-Json -Depth 8
-
-Invoke-RestMethod -Uri "http://127.0.0.1:9320/v1/runs" -Method Post -ContentType "application/json" -Body $body
-```
-
-查询运行：
-
-```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:9320/v1/runs/<run_id>" -Method Get
-```
-
----
-
-## 常驻式 LLM 日志审查（v1.4）
-
-v1.4 把 audit-logger-agent 从“被动查询、按需分析”升级为“常驻运行、周期采集、主动审核、主动通知、可视化追踪”的审计守护进程。完整设计见 `v1.4/PERIODIC_LLM_AUDIT_REVIEW_DESIGN.md`。
-
-### 工作流程
-
-每个审查周期（默认每 30 分钟，启动 30 秒后先跑一次）：
-
-1. **增量采集**：按文件游标（`audit_ingest_cursors`）增量读取新增 NDJSON，文件未变跳过、变大续读、变小从头读、半行 JSON 留待下一轮；`row_hash` 仍是最终幂等保障。
-2. **规则预筛**：`candidateDetector` 确定性识别失败调用、连续重复调用、高危工具名、超长耗时、未知工具、span 不完整、日志解析错误等候选事件，保证 LLM 不可用时也能发现基础风险。
-3. **LLM 结构化审查**：`llmReviewer` 把候选摘要交由 LLM 合并同类、判断严重程度、给出解释与建议，输出经本地 schema 校验后入库；LLM 异常时降级为 `completed_degraded`，仍持久化规则层 findings 并标注“本轮仅包含规则检测结果”。
-4. **持久化**：写入 `audit_review_runs`（含 `risk_policy_version` / `prompt_version` / `reviewer_version` / `llm_model`）与 `audit_review_findings`。`finding_hash`（不含 severity）跨重叠窗口去重，同一问题升级/降级时更新原 finding 的 severity 与 `occurrence_count`。
-5. **主动通知**：生成 `audit_review_summary`（及对 high/critical 的单条 `audit_review_finding`）写入 `agent_outbox_events`，由现有 outbox flush 机制投递到通用回调接收端；摘要必带 `dashboard_url`。
-6. **可视化**：本地 Dashboard 提供总览、审查详情、finding 证据钻取，复用通用模板布局。
-
-### 并发与恢复
-
-- 以数据库租约表 `audit_review_locks` 为准（默认 10 分钟租约，长任务定期刷新），同一进程内、定时与手动触发、甚至误启动多进程都不会重复审查。
-- 租约已过期时可被抢占，旧 `running` 审查标记为 `failed`（`error_code = 'review_interrupted'`）。
-- server 启动时 `recoverStaleRuns` 恢复异常中断的审查并释放过期租约。
-
-### 鉴权与 CORS
-
-- server 默认监听 `127.0.0.1`；Dashboard 只读页可本机无 token 访问（除非显式开启 `requireDashboardToken`）。
-- `POST /v1/audit-reviews/run` 属主动执行入口，**始终要求 admin token**（`Authorization: Bearer <AUDIT_AGENT_DASHBOARD_TOKEN>`，缺失返回 401、错误返回 403）。
-- 若 `bindHost` 改为非 loopback，Dashboard 与所有 `/v1/audit-*` API 都必须启用 bearer token，且未配置 token 时 server 启动失败。
-- CORS 默认只允许同源；仅 `allowedOrigins` 明确配置的来源才放行跨源。
-
-### 审查系统自身的审计事件
-
-审查生命周期会写入 `audit_events`（`agent_id = audit-logger-agent`）：`review.start`、`review.lock.skipped`、`review.ingest.completed`、`review.detector.completed`、`review.llm.completed`、`review.notification.enqueued`、`review.completed`、`review.recovered`，便于周期任务失败后排查。
-
-### 手动触发一轮审查
-
-```bash
-curl -X POST http://127.0.0.1:9320/v1/audit-reviews/run \
-  -H "Authorization: Bearer $AUDIT_AGENT_DASHBOARD_TOKEN"
-```
-
-返回 `{ "review_id": "...", "status": "completed" }`（或 `completed_degraded` / `skipped`）。随后可查询：
-
-```bash
-curl -H "Authorization: Bearer $AUDIT_AGENT_DASHBOARD_TOKEN" \
-  "http://127.0.0.1:9320/v1/audit-reviews?limit=10"
-curl -H "Authorization: Bearer $AUDIT_AGENT_DASHBOARD_TOKEN" \
-  "http://127.0.0.1:9320/v1/audit-findings?severity=high&limit=20"
-```
-
-### 风险类别与严重程度
-
-首批类别：`high_risk_permission`、`anomalous_call`、`repeated_call`、`failed_call`、`trace_integrity`、`ingest_parse_error`。
-
-四级严重程度：`critical` / `high`（必推送）、`medium`（默认进摘要）、`low`（默认不单独推送）。通知节流：已通知 finding 在 `last_notified_at` 后继续出现只更新 `occurrence_count`；severity 升级允许再次通知；`snoozed` finding 在 `snoozed_until` 前不重复推送。
-
-### v1.4 配置块
-
-在 `config.json` 中新增 `auditReview`（非敏感项；含 token 的 `callbackUrl` / `baseUrl` 应改放 `.config` 或环境变量）：
-
-```json
-{
+  },
   "auditReview": {
     "enabled": true,
     "intervalMinutes": 30,
@@ -367,10 +124,19 @@ curl -H "Authorization: Bearer $AUDIT_AGENT_DASHBOARD_TOKEN" \
       "repeatThreshold": 5,
       "slowCallDurationMs": 30000,
       "highRiskToolPatterns": [
-        "*delete*", "*write*", "*update*", "*deploy*",
-        "*permission*", "*credential*", "shell.*", "browser.runScript"
+        "*delete*",
+        "*write*",
+        "*update*",
+        "*deploy*",
+        "*permission*",
+        "*credential*",
+        "shell.*",
+        "browser.runScript"
       ],
-      "agentToolAllowlists": { "rental-price-agent": [], "mt-agent": [] }
+      "agentToolAllowlists": {
+        "rental-price-agent": [],
+        "mt-agent": []
+      }
     },
     "llmReview": {
       "promptVersion": "audit-review-prompt-v1",
@@ -380,86 +146,585 @@ curl -H "Authorization: Bearer $AUDIT_AGENT_DASHBOARD_TOKEN" \
       "enabled": true,
       "baseUrl": "http://127.0.0.1:9320",
       "dashboardPath": "/dashboard",
-      "template": "audit-review-dashboard-v1",
-      "attachDashboardUrlToCallback": true
+      "template": "audit-review-dashboard-v1"
     }
   }
 }
 ```
 
-敏感项可改用环境变量覆盖：`AUDIT_AGENT_REVIEW_CALLBACK_URL`、`AUDIT_AGENT_REVIEW_BASE_URL`、`AUDIT_AGENT_DASHBOARD_TOKEN`。
+关键说明：
 
----
+- `dbPath`：SQLite 文件路径。目录不存在会自动创建。
+- `agents.*.logDir`：日志目录，相对路径基准是 `dbPath` 所在目录的上一级逻辑位置；按当前默认写法，`dbPath = data/audit.db` 时等价于相对项目根目录解析。
+- `agents.*.pattern`：日志文件匹配模式，通常是 `audit-*.jsonl`。
+- `auditReview.notification.mode`：当前实现只真正支持 `callback`。
+- `auditReview.notification.callbackUrl`：审查摘要和高风险 finding 的投递地址。
+- `auditReview.notification.minSeverity`：配置中保留该字段，但当前实现没有用它裁剪摘要发送范围。
+- `auditReview.visualization.baseUrl`：写入回调摘要里的 Dashboard 地址前缀。
 
-## 测试
+### 3. 配置 LLM 凭证
+
+在项目根目录新建 `.config`，内容是 JSON，不是 `.env` 格式。
+
+可以直接复制模板：
 
 ```bash
-# v1.4 审查系统单元/集成测试
-node --test "test/auditReview/**/*.test.js"
-
-# v1.3 Agent 运行时与基础设施测试
-npm run test:agent
+cp .config.example .config
 ```
 
-- 离线测试（配置、schema、工具元数据、运行时状态机、报表、审查存储/调度/检测器/通知/仪表板/鉴权/HTTP 集成等）无需凭证即可运行。
-- 集成测试（`openaiPlanner`、`openaiResponsesClient`、`openaiRuntime`、`planner-factory`）需要真实的 LLM 凭证（`.config` 中填入 `AUDIT_AGENT_LLM_API_KEY` 与 `AUDIT_AGENT_LLM_MODEL`）；未配置时会自动跳过，不会失败。`planner-factory` 因依赖真实 LLM 非确定性输出偶有抖动，属已知项。
-- `test/evals/auditReview/` 为 LLM 审查 eval 数据集（高危权限、连续失败、良性重试误报抑制、解析错误、降级回退共 28 个 case）；每次调整 `risk_policy_version` 或 `prompt_version` 都应跑 `test/auditReview/eval.test.js`。
-- `node test/self-test.js` 为端到端自检脚本。
+或手动创建：
 
----
+```json
+{
+  "AUDIT_AGENT_LLM_API_KEY": "<your-api-key>",
+  "AUDIT_AGENT_LLM_BASE_URL": "https://api.openai.com/v1",
+  "AUDIT_AGENT_LLM_MODEL": "<your-model>",
+  "AUDIT_AGENT_LLM_TIMEOUT_MS": "30000"
+}
+```
+
+LLM 配置加载优先级：
+
+`进程环境变量 > .config > config.json.planner`
+
+说明：
+
+- `AUDIT_AGENT_LLM_API_KEY`：必填
+- `AUDIT_AGENT_LLM_MODEL`：必填
+- `AUDIT_AGENT_LLM_BASE_URL`：可选，默认 `https://api.openai.com/v1`
+- `AUDIT_AGENT_LLM_TIMEOUT_MS`：可选，默认 `30000`
+
+### 4. 配置 Dashboard / 手动审查触发 Token
+
+如果你要调用 `POST /v1/audit-reviews/run`，必须提供 `AUDIT_AGENT_DASHBOARD_TOKEN`。
+
+推荐放在进程环境变量中，而不是写进 `config.json`。
+
+PowerShell：
+
+```powershell
+$env:AUDIT_AGENT_DASHBOARD_TOKEN = "replace-this-token"
+```
+
+Bash：
+
+```bash
+export AUDIT_AGENT_DASHBOARD_TOKEN="replace-this-token"
+```
+
+注意：
+
+- 这个 Token 只从进程环境变量或 `config.auditReview.http.dashboardToken` 读取。
+- `.config` 不参与 Dashboard Token 加载。
+
+### 5. 启动服务
+
+```bash
+npm run server -- --port 9320
+```
+
+等价命令：
+
+```bash
+node scripts/server.js --port 9320
+```
+
+启动时会自动完成：
+
+- 打开 SQLite 并初始化表结构
+- 初始化 LLM planner
+- 恢复中断的运行任务
+- 恢复过期的审查锁和 stale review
+- 启动周期性审查调度器（默认启用）
+- 每 1 秒尝试 flush 一次 Outbox 待投递事件
+
+### 6. 验证部署结果
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:9320/health
+```
+
+正常返回：
+
+```json
+{
+  "status": "ok",
+  "dbPath": "..."
+}
+```
+
+手动触发一轮审查：
+
+```bash
+curl -X POST http://127.0.0.1:9320/v1/audit-reviews/run \
+  -H "Authorization: Bearer $AUDIT_AGENT_DASHBOARD_TOKEN"
+```
+
+### 7. 作为常驻进程运行
+
+建议用进程管理器托管，例如 PM2、systemd、NSSM 或其他现有守护体系。
+
+PM2 示例：
+
+```bash
+pm2 start npm --name audit-logger-agent -- run server -- --port 9320
+```
+
+建议同时做：
+
+- 持久化 `data/` 目录
+- 监控标准输出日志
+- 定期备份 `data/audit.db`
+- 为回调接收端做可用性监控
+
+## 配置项说明
+
+### `config.json`
+
+| 字段 | 说明 |
+| --- | --- |
+| `dbPath` | SQLite 数据库路径 |
+| `agents` | 需要采集的日志源列表 |
+| `agents.<id>.logDir` | 日志目录 |
+| `agents.<id>.pattern` | 日志文件匹配模式 |
+| `auditReview.enabled` | 是否启用周期性审查 |
+| `auditReview.intervalMinutes` | 审查周期，默认 30 分钟 |
+| `auditReview.initialDelaySeconds` | 服务启动后第一次审查的延迟 |
+| `auditReview.lookbackOverlapMinutes` | 审查窗口重叠分钟数，降低漏检风险 |
+| `auditReview.maxEventsPerReview` | 单轮审查最多送入规则/LLM 的候选事件数 |
+| `auditReview.notification.callbackUrl` | 审查通知回调地址 |
+| `auditReview.notification.minSeverity` | 预留字段，当前实现未实际使用 |
+| `auditReview.http.requireDashboardToken` | 是否要求 Dashboard 读接口也携带 Token |
+| `auditReview.http.allowedOrigins` | 审查相关接口和 Dashboard 的 CORS 白名单 |
+| `auditReview.riskPolicy.*` | 本地规则预筛策略 |
+| `auditReview.visualization.baseUrl` | Dashboard 对外基地址 |
+| `auditReview.visualization.dashboardPath` | Dashboard 路由前缀 |
+
+### 环境变量
+
+| 变量名 | 说明 |
+| --- | --- |
+| `AUDIT_AGENT_LLM_API_KEY` | LLM API Key |
+| `AUDIT_AGENT_LLM_BASE_URL` | OpenAI 兼容网关地址 |
+| `AUDIT_AGENT_LLM_MODEL` | 模型名称 |
+| `AUDIT_AGENT_LLM_TIMEOUT_MS` | LLM 调用超时毫秒数 |
+| `AUDIT_AGENT_DASHBOARD_TOKEN` | Dashboard / 手动审查写接口 Bearer Token |
+
+## 日志输入格式
+
+项目期望上游 Agent 输出一行一条 JSON 的 NDJSON 文件。
+
+必填字段：
+
+- `ts`
+- `agent_id`
+- `trace_id`
+- `span_id`
+- `event`
+- `tool_name`
+- `status`
+- `result_summary`
+
+允许的 `event`：
+
+- `tool.start`
+- `tool.end`
+- `tool.error`
+- `agent.start`
+- `agent.end`
+- `agent.error`
+- `run.start`
+- `run.resume`
+- `run.waiting_user`
+- `run.final_result`
+- `run.failed`
+
+允许的 `status`：
+
+- `ok`
+- `error`
+- `timeout`
+- `cancelled`
+
+常见可选字段：
+
+- `parent_span_id`
+- `duration_ms`
+- `channel`
+- `user_id`
+- `product_id`
+- `error`
+- `tags`
+
+示例：
+
+```json
+{"ts":"2026-07-03T10:00:00.000+08:00","agent_id":"mt-agent","trace_id":"trace_001","span_id":"span_001","event":"tool.end","tool_name":"browser.runScript","status":"ok","result_summary":"Page scraped","duration_ms":812,"channel":"http","product_id":"product_42"}
+```
+
+## 常用命令
+
+### 采集日志
+
+```bash
+npm run ingest
+```
+
+按文件名日期做增量过滤：
+
+```bash
+npm run ingest -- --since 2026-07-01
+```
+
+说明：
+
+- CLI 采集是批量扫描。
+- 去重依据是原始 JSON 行的 SHA-256 截断值 `row_hash`。
+- 同一 `span_id` 的 `start` / `end` / `error` 会分别独立入库。
+
+### 查询事件
+
+```bash
+npm run query -- --status error --limit 20
+```
+
+支持参数：
+
+- `--agent-id`
+- `--tool-name`
+- `--status`
+- `--event`
+- `--from`
+- `--to`
+- `--trace-id`
+- `--product-id`
+- `--channel`
+- `--limit`
+- `--offset`
+- `--format json|table`
+
+### 生成报表
+
+```bash
+npm run report -- --type daily --date 2026-07-03
+npm run report -- --type errors --from 2026-07-01 --to 2026-07-03
+npm run report -- --type tools --from 2026-07-01 --to 2026-07-03
+```
+
+### 启动 HTTP 服务
+
+```bash
+npm run server -- --port 9320
+```
+
+### 运行测试
+
+```bash
+npm test
+```
+
+自检脚本：
+
+```bash
+node test/self-test.js
+```
+
+说明：
+
+- 单元和集成测试默认可离线运行。
+- 依赖真实 LLM 的测试在没有配置 LLM 凭证时会自动跳过。
+
+## HTTP API
+
+### 基础查询接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/health` | 健康检查 |
+| `GET` | `/query` | 查询 `audit_events` |
+| `GET` | `/report/daily` | 每日报表 |
+| `GET` | `/report/errors` | 错误报表 |
+| `GET` | `/report/tools` | 工具使用统计 |
+
+### LLM 任务运行时接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/v1/runs` | 创建任务，异步返回 ACK |
+| `GET` | `/v1/runs/{runId}` | 查询任务状态 |
+| `POST` | `/v1/runs/{runId}/resume` | 提交用户决策后恢复任务 |
+
+#### 创建任务请求体
+
+推荐使用当前通用格式：
+
+```json
+{
+  "source": {
+    "type": "manual",
+    "session_id": "session_001",
+    "message_id": "msg_001",
+    "requester_id": "user_001"
+  },
+  "request": {
+    "text": "分析今天所有异常调用并总结高风险链路"
+  },
+  "delivery": {
+    "mode": "callback",
+    "target_url": "http://127.0.0.1:9999/agent-events"
+  },
+  "metadata": {
+    "tenant_key": "tenant_demo"
+  },
+  "idempotency_key": "run-20260703-001"
+}
+```
+
+当前实现说明：
+
+- `delivery.mode` 虽然是字符串字段，但实际只支持 `callback`
+- `idempotency_key` 可选，也可以通过 `Idempotency-Key` 请求头传入
+- 如果 planner 认为信息不足，会先返回 `decision_request`，等待 `/resume`
+
+#### 回调事件类型
+
+运行时会往 `delivery.target_url` 投递：
+
+- `progress_update`
+- `decision_request`
+- `final_result`
+
+### 审查与 Dashboard 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/v1/audit-reviews` | 审查批次列表 |
+| `GET` | `/v1/audit-reviews/{reviewId}` | 单个审查批次详情 |
+| `GET` | `/v1/audit-findings` | 风险发现列表 |
+| `GET` | `/v1/audit-findings/{findingId}` | 单条风险发现详情 |
+| `POST` | `/v1/audit-reviews/run` | 手动触发一轮审查 |
+| `GET` | `/dashboard` | Dashboard 总览页 |
+| `GET` | `/dashboard/audit-reviews/{reviewId}` | 审查批次详情页 |
+| `GET` | `/dashboard/audit-findings/{findingId}` | 风险发现证据页 |
+
+Dashboard 总览页和审查批次详情页会在风险发现表中展示“链路 ID”。点击链路 ID 会进入对应风险发现详情页，并定位到同一 `trace_id` 下按时间排序的工具调用链路。
+
+权限规则：
+
+- `POST /v1/audit-reviews/run` 始终需要 `Authorization: Bearer <AUDIT_AGENT_DASHBOARD_TOKEN>`
+- 在本机 loopback 访问且 `requireDashboardToken=false` 时，审查读接口和 Dashboard 可免 Token
+- 如果改成非 loopback 暴露，必须配置 Token
+
+### 审查通知回调事件类型
+
+周期性审查会往 `auditReview.notification.callbackUrl` 投递：
+
+- `audit_review_summary`
+- `audit_review_finding`
+
+高风险和严重级别的 finding 会单独投递一条事件。
+
+## 运行流程
+
+### 1. 日志采集流程
+
+1. 扫描 `config.json` 里每个 Agent 的日志目录。
+2. 按 `pattern` 找到目标文件。
+3. 解析 NDJSON，每行做字段校验。
+4. 规范化字段并写入 `audit_events`。
+5. 以 `row_hash` 去重，重复行不会重复入库。
+
+### 2. LLM 任务运行时流程
+
+1. 调用方请求 `POST /v1/runs`。
+2. 服务创建 `agent_runs` 记录，并异步进入 `planning`。
+3. Planner 基于当前工具清单生成：
+   - `plan`
+   - 或 `decision_request`
+4. 如果需要用户决策，运行状态进入 `waiting_user`，并回调 `decision_request`。
+5. 收到 `/resume` 后，Planner 基于用户选择继续生成 `plan`。
+6. Runtime 按步骤在本地执行工具。
+7. 结果写入 `agent_run_steps`，并回调 `progress_update`。
+8. Planner 生成最终总结，状态进入 `completed` 或 `failed`。
+9. 所有回调先进入 Outbox，由后台 flush 和重试。
+
+当前 Runtime 暴露给 LLM 的本地工具只有两个：
+
+- `audit.queryEvents`
+- `report.errorSummary`
+
+### 3. 周期性审查流程
+
+1. 服务启动后等待 `initialDelaySeconds`，随后按 `intervalMinutes` 定时运行。
+2. 调度器先抢占数据库租约锁，避免重复审查。
+3. 基于 `audit_ingest_cursors` 做增量采集：
+   - 文件未变化则跳过
+   - 文件追加则续读
+   - 文件截断或轮转则全量重读
+   - 半行 JSON 留待下一轮
+4. 本地规则预筛候选事件：
+   - `failed_call`
+   - `high_risk_permission`
+   - `anomalous_call`
+   - `repeated_call`
+   - `trace_integrity`
+   - `ingest_parse_error`
+5. LLM 对候选事件做结构化审查并输出 findings。
+6. Findings 以哈希去重写入 `audit_review_findings`，重复出现会增加 `occurrence_count`。
+7. 生成审查摘要和高风险 finding 通知，写入 Outbox。
+8. Dashboard 直接从 SQLite 读取审查结果并渲染页面；风险发现详情页会按 `trace_id` 串联展示工具调用链路。
+9. 如果 LLM 失败，系统会降级为仅基于规则结果落库，批次状态记为 `completed_degraded`。
+
+## 安全与部署注意事项
+
+### 1. 当前服务固定监听 `127.0.0.1`
+
+`scripts/server.js` 当前是硬编码：
+
+- 服务总是监听 `127.0.0.1`
+- `config.auditReview.http.bindHost` 当前只参与启动校验和授权策略判断
+- 它不会改变 `app.listen()` 的实际绑定地址
+
+如果你要对外开放：
+
+- 要么在前面加反向代理
+- 要么修改 `scripts/server.js`
+
+### 2. 不要直接裸露到公网
+
+当前这些接口没有内建鉴权：
+
+- `/health`
+- `/query`
+- `/report/*`
+- `/v1/runs`
+- `/v1/runs/{runId}`
+- `/v1/runs/{runId}/resume`
+
+因此推荐部署方式是：
+
+- 服务只监听本机
+- 外部访问统一走受控网关或反向代理
+- 在网关层补鉴权、审计和限流
+
+### 3. 回调模式当前只有 `callback`
+
+无论是 Runtime 还是审查通知，当前实现都依赖 HTTP POST 回调。
+
+如果回调地址不可用：
+
+- 事件会先进入 Outbox
+- 默认最多重试 8 次
+- 采用指数退避
+- 最终会进入 `dead_letter`
+
+### 4. 启动 `server` 必须有 LLM 凭证
+
+即使你只想用 HTTP 查询接口，只要启动 `server`：
+
+- 就会初始化 planner
+- 就会初始化审查 reviewer
+- 因此仍然要求 `AUDIT_AGENT_LLM_API_KEY` 和 `AUDIT_AGENT_LLM_MODEL`
+
+如果不想依赖 LLM，请只使用 CLI。
+
+### 5. 敏感配置建议放环境变量
+
+推荐放环境变量：
+
+- `AUDIT_AGENT_DASHBOARD_TOKEN`
+
+建议不要把真实敏感值提交进：
+
+- `config.json`
+- `.config.example`
+
+### 6. 源日志默认只读，SQLite 是唯一写入产物
+
+系统不会修改上游 Agent 的日志文件，主要写入目标只有：
+
+- `data/audit.db`
+- 运行时和审查相关 SQLite 表
+
+## 故障排查
+
+### 服务启动即报缺少 LLM 配置
+
+原因：
+
+- 没有提供 `.config`
+- 或环境变量里缺少 `AUDIT_AGENT_LLM_API_KEY`
+- 或环境变量里缺少 `AUDIT_AGENT_LLM_MODEL`
+
+### 手动触发审查返回 401 / 403
+
+检查：
+
+- 是否设置了 `AUDIT_AGENT_DASHBOARD_TOKEN`
+- `Authorization` 头是否是 `Bearer <token>`
+- Token 是否和服务进程读取到的一致
+
+### Dashboard 打不开或审查接口跨域失败
+
+检查：
+
+- 访问地址是否在 `auditReview.http.allowedOrigins` 中
+- 是否通过 loopback 访问
+- 是否被反向代理改写了 `Origin`
+
+### 审查有结果但没有通知
+
+检查：
+
+- `auditReview.notification.callbackUrl` 是否可达
+- Outbox 是否出现 `dead_letter`
+- 回调接收端是否返回 2xx
+
+### 明明有日志文件但没有采集到数据
+
+检查：
+
+- `logDir` 是否解析到正确路径
+- 文件名是否匹配 `pattern`
+- 文件名里日期是否被 `--since` 过滤掉
+- 单行 JSON 是否满足必填字段和事件枚举要求
 
 ## 目录结构
 
 ```text
 src/
-  llm/              OpenAI 兼容客户端与配置加载
-  agent/            运行时、planner、状态机、存储、事件发布、恢复
-  tools/            工具注册表与具体工具（审计查询、错误报表）
+  adapters/         HTTP 和回调投递适配层
+  agent/            LLM 运行时、planner、状态机、outbox
   app/              应用配置加载
-  db/               运行时 SQLite schema（含 v1.4 审查相关表 reviewSchema）
+  auditReview/      周期性审查、Dashboard、通知、锁、游标
+  db/               SQLite 表结构
+  llm/              OpenAI 兼容客户端和配置加载
   observability/    运行时审计日志
-  auditReview/      v1.4 审查守护进程模块
-    scheduler.js          周期调度、租约并发、启动恢复
-    ingestService.js      常驻模式复用日志采集（带文件游标）
-    ingestCursorStore.js  文件游标与增量读取状态
-    candidateDetector.js  本地规则预筛
-    llmReviewer.js        LLM 结构化审查（带降级）
-    reviewSchema.js       LLM 输出 JSON schema 与本地校验
-    reviewStore.js        audit_review_runs/findings 持久化与去重
-    lockStore.js          审查租约锁
-    notification.js       审查结果转 outbox 通用投递 payload
-    visualization.js      dashboard/API 数据聚合
-    dashboardTemplate.js  通用 Dashboard 模板渲染
-    dashboardAuth.js      Dashboard 与审查 API 鉴权/CORS
+  tools/            提供给 LLM Runtime 的本地工具
 scripts/
-  ingest.js         日志采集
-  query.js          查询
-  report.js         报表
-  server.js         HTTP 服务 + Agent 运行时 + v1.4 审查调度器启动入口
-  lib/              采集/解析/DB 公共库
+  ingest.js         批量采集
+  query.js          命令行查询
+  report.js         命令行报表
+  server.js         服务启动入口
+  lib/              解析、扫描、数据库基础能力
 test/
-  runtime/          v1.3 运行时测试
+  auditReview/      审查系统测试
   http/             HTTP API 测试
-  llm/              LLM 配置/客户端测试
-  auditReview/      v1.4 审查系统测试（含 httpIntegration）
-  evals/auditReview LLM 审查 eval 数据集
-v1.3/               v1.3 设计与使用文档
-v1.4/               v1.4 设计文档
+  llm/              LLM 相关测试
+  runtime/          运行时测试
 ```
 
----
+## 总结
 
-## 安全
+如果你要的是一个本机常驻的 Agent 审计中台，当前推荐落地方式是：
 
-- 对源日志文件只做只读操作，SQLite 数据库是唯一可写产物。
-- 密钥只放在 git-ignored 的 `.config` 或环境变量，绝不写入 `config.json`、数据库、审计事件、outbox 或文档示例中的真实值。
-- 模型输出永远先经本地校验，不会被直接信任并改变运行状态。
-- v1.4：发给 LLM 的 evidence 只含摘要字段，默认不含原始 input/output；回调摘要不展示敏感参数，只展示 tool/agent/trace/错误摘要与建议。
-- v1.4：Dashboard 与 `/v1/audit-*` API 默认只面向本机；对外监听时必须启用 token 鉴权与受限 CORS；手动触发审查 API 始终需鉴权，避免任何能访问端口者触发 LLM 调用与回调通知。
-- v1.4：若 `callbackUrl` / `baseUrl` 实际包含 token，应迁移到 `.config` 或环境变量，不写入 `config.json`。
+1. 配好 `config.json`
+2. 配好 `.config`
+3. 用环境变量提供 `AUDIT_AGENT_DASHBOARD_TOKEN`
+4. 启动 `npm run server -- --port 9320`
+5. 让上游 Agent 持续往配置目录写审计日志
+6. 让回调接收端接收运行结果和审查摘要
 
----
-
-## 许可
-
-本项目为内部工具，未指定开源许可。
+如果你只需要离线分析，则直接使用 `ingest`、`query`、`report` 三个 CLI 即可。

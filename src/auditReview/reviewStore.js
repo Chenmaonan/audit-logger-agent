@@ -141,6 +141,7 @@ export function createReviewStore(db) {
   `);
 
   let deadLetterCountStmt = null;
+  let traceEventsStmt = null;
   function getDeadLetterCountStmt() {
     if (!deadLetterCountStmt) {
       // Lazy prepare: agent_outbox_events may not exist in isolated tests
@@ -150,6 +151,18 @@ export function createReviewStore(db) {
       `);
     }
     return deadLetterCountStmt;
+  }
+
+  function getTraceEventsStmt() {
+    if (!traceEventsStmt) {
+      traceEventsStmt = db.prepare(`
+        SELECT * FROM audit_events
+        WHERE trace_id = @trace_id
+        ORDER BY ts ASC, id ASC
+        LIMIT @limit
+      `);
+    }
+    return traceEventsStmt;
   }
 
   return {
@@ -302,6 +315,30 @@ export function createReviewStore(db) {
         `SELECT * FROM audit_review_findings ${where} ORDER BY last_seen_at DESC LIMIT @limit OFFSET @offset`
       ).all(params);
       return rows.map(hydrateFinding);
+    },
+
+    listTraceEvents({ traceId, limit = 200 } = {}) {
+      if (!traceId) return [];
+      const parsedLimit = Number(limit);
+      const safeLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : 200;
+      return getTraceEventsStmt().all({ trace_id: traceId, limit: safeLimit });
+    },
+
+    listRawEventsByIds({ eventIds, limit = 200 } = {}) {
+      const ids = Array.isArray(eventIds)
+        ? eventIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)
+        : [];
+      if (ids.length === 0) return [];
+      const parsedLimit = Number(limit);
+      const safeLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : 200;
+      const limitedIds = ids.slice(0, safeLimit);
+      const placeholders = limitedIds.map(() => '?').join(', ');
+      const rows = db.prepare(`
+        SELECT id, raw_json FROM audit_events
+        WHERE id IN (${placeholders})
+      `).all(...limitedIds);
+      const byId = new Map(rows.map((row) => [row.id, row]));
+      return limitedIds.map((id) => byId.get(id)).filter(Boolean);
     },
 
     updateFinding(findingId, patch) {

@@ -97,6 +97,49 @@ test('renderDashboard renders summary metric cards as links only when href is pr
   assert.equal(html.includes('<a href="" class="metric-card-link">'), false);
 });
 
+test('renderDashboard renders safe section ids for anchor navigation', () => {
+  const html = renderDashboard({
+    page: { title: '审计审查总览' },
+    sections: [
+      {
+        id: 'trace_timeline',
+        type: 'table',
+        title: '工具调用链路',
+        columns: [{ key: 'event', label: '事件' }],
+        rows: [{ event: 'tool.end' }],
+      },
+      {
+        id: 'bad" onclick="x',
+        type: 'callout',
+        title: '异常提示',
+        body: '已转义',
+      },
+    ],
+  });
+
+  assert.ok(html.includes('<section id="trace_timeline" class="data-section">'));
+  assert.ok(html.includes('<section id="bad&quot; onclick=&quot;x" class="data-section callout">'));
+  assert.equal(html.includes('id="bad" onclick="x"'), false);
+});
+
+test('renderDashboard renders raw log snippets without parsing or splitting them', () => {
+  const raw = '{"event":"tool.error","payload":{"b":2,"a":1},"text":"<unsafe>&value"}';
+  const html = renderDashboard({
+    page: { title: '审计审查总览' },
+    sections: [{
+      id: 'evidence_raw_logs',
+      type: 'raw_log_list',
+      title: '原始日志片段',
+      snippets: [{ label: '日志 ID 7', body: raw }],
+    }],
+  });
+
+  assert.ok(html.includes('<section id="evidence_raw_logs" class="data-section raw-log-section">'));
+  assert.ok(html.includes('<div class="raw-log-label">日志 ID 7</div>'));
+  assert.ok(html.includes('{&quot;event&quot;:&quot;tool.error&quot;,&quot;payload&quot;:{&quot;b&quot;:2,&quot;a&quot;:1},&quot;text&quot;:&quot;&lt;unsafe&gt;&amp;value&quot;}'));
+  assert.equal(html.includes('<td>{'), false);
+});
+
 test('renderDashboard renders breadcrumbs, context badges, and page actions', () => {
   const html = renderDashboard({
     page: {

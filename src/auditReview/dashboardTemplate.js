@@ -35,6 +35,7 @@ function visibleSections(sections = []) {
     if (section.type === 'definition_list') return Array.isArray(section.items) && section.items.some((item) => hasValue(item.value));
     if (section.type === 'link_list') return Array.isArray(section.links) && section.links.length > 0;
     if (section.type === 'callout') return hasValue(section.body) || hasValue(section.title);
+    if (section.type === 'raw_log_list') return Array.isArray(section.snippets) && section.snippets.some((snippet) => hasValue(snippet.body));
     return false;
   });
 }
@@ -80,6 +81,10 @@ function renderTableCellValue(value) {
   }
 
   return escapeHtml(value ?? '');
+}
+
+function renderSectionIdAttr(id) {
+  return hasValue(id) ? ` id="${escapeHtml(id)}"` : '';
 }
 
 function renderSummaryMetric(metric) {
@@ -156,9 +161,10 @@ function renderPageActions(actions) {
 }
 
 function renderTableSection(section) {
-  const id = escapeHtml(section.id ?? '');
+  const id = section.id ?? '';
+  const escapedId = escapeHtml(id);
   const title = escapeHtml(section.title ?? '');
-  const tableId = `table-${id}`;
+  const tableId = `table-${escapedId}`;
   const columns = Array.isArray(section.columns) ? section.columns : [];
   const rows = Array.isArray(section.rows) ? section.rows : [];
   if (rows.length === 0) return '';
@@ -173,7 +179,7 @@ function renderTableSection(section) {
     return `<tr><td>${escapeHtml(row ?? '')}</td></tr>`;
   }).join('');
 
-  return `<section class="data-section">
+  return `<section${renderSectionIdAttr(id)} class="data-section">
     <h3>${title}</h3>
     <div class="table-scroll"><table id="${tableId}" class="data-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table></div>
   </section>`;
@@ -185,7 +191,8 @@ function isMonoMetaItem(item) {
 }
 
 function renderDefinitionListSection(section) {
-  const id = escapeHtml(section.id ?? '');
+  const id = section.id ?? '';
+  const escapedId = escapeHtml(id);
   const title = escapeHtml(section.title ?? '');
   const items = Array.isArray(section.items) ? section.items.filter((item) => hasValue(item.value)) : [];
   if (items.length === 0) return '';
@@ -197,13 +204,14 @@ function renderDefinitionListSection(section) {
     return `<div class="meta-row"><span class="meta-key">${label}</span><span class="${valueClass}">${value}</span></div>`;
   }).join('');
 
-  return `<section class="data-section">
+  return `<section${renderSectionIdAttr(id)} class="data-section">
     <h3>${title}</h3>
-    <div id="meta-${id}" class="metadata-block">${rows}</div>
+    <div id="meta-${escapedId}" class="metadata-block">${rows}</div>
   </section>`;
 }
 
 function renderLinkListSection(section) {
+  const id = section.id ?? '';
   const title = escapeHtml(section.title ?? '');
   const links = Array.isArray(section.links) ? section.links : [];
   if (links.length === 0) return '';
@@ -214,19 +222,37 @@ function renderLinkListSection(section) {
     return `<li><a href="${href}" class="section-link">${text}</a></li>`;
   }).join('');
 
-  return `<section class="data-section">
+  return `<section${renderSectionIdAttr(id)} class="data-section">
     <h3>${title}</h3>
     <ul class="link-list">${items}</ul>
   </section>`;
 }
 
 function renderCalloutSection(section) {
+  const id = section.id ?? '';
   const title = escapeHtml(section.title ?? '');
   const body = escapeHtml(section.body ?? '');
   if (!title && !body) return '';
-  return `<section class="data-section callout">
+  return `<section${renderSectionIdAttr(id)} class="data-section callout">
     ${title ? `<h3>${title}</h3>` : ''}
     ${body ? `<div class="callout-body">${body}</div>` : ''}
+  </section>`;
+}
+
+function renderRawLogListSection(section) {
+  const id = section.id ?? '';
+  const title = escapeHtml(section.title ?? '');
+  const snippets = Array.isArray(section.snippets) ? section.snippets.filter((snippet) => hasValue(snippet.body)) : [];
+  if (snippets.length === 0) return '';
+
+  const items = snippets.map((snippet) => `<article class="raw-log-snippet">
+      ${hasValue(snippet.label) ? `<div class="raw-log-label">${escapeHtml(snippet.label)}</div>` : ''}
+      <pre class="raw-log-pre"><code>${escapeHtml(snippet.body)}</code></pre>
+    </article>`).join('');
+
+  return `<section${renderSectionIdAttr(id)} class="data-section raw-log-section">
+    <h3>${title}</h3>
+    <div class="raw-log-list">${items}</div>
   </section>`;
 }
 
@@ -237,6 +263,7 @@ function renderSection(section) {
     case 'definition_list': return renderDefinitionListSection(section);
     case 'link_list': return renderLinkListSection(section);
     case 'callout': return renderCalloutSection(section);
+    case 'raw_log_list': return renderRawLogListSection(section);
     default: return '';
   }
 }
@@ -499,6 +526,21 @@ a:hover {
 .meta-row { display: flex; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); }
 .meta-key { width: 180px; color: var(--text-muted); flex-shrink: 0; }
 .meta-val { flex: 1; word-break: break-all; }
+.raw-log-list { display: flex; flex-direction: column; gap: 12px; }
+.raw-log-label { font-size: 12px; color: var(--text-muted); margin-bottom: 6px; }
+.raw-log-pre {
+  margin: 0;
+  padding: 12px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #0f172a;
+  color: #e2e8f0;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre;
+}
+.raw-log-pre code { font-family: "JetBrains Mono", "Cascadia Code", monospace; }
 .link-list { list-style: none; padding: 0; margin: 0; }
 .link-list li { padding: 6px 0; }
 .callout-body { font-size: 14px; color: var(--text); }

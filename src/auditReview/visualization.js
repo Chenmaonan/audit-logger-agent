@@ -31,6 +31,7 @@ const OVERVIEW_FINDINGS_COLUMNS = [
   { key: 'category_label', label: '类别' },
   { key: 'agent_name', label: 'Agent' },
   { key: 'tool_name', label: '工具' },
+  { key: 'trace_id', label: '链路 ID' },
   { key: 'status', label: '状态' },
   { key: 'review_id', label: '所属审查批次' },
   { key: 'last_seen_at', label: '最近出现时间' },
@@ -42,6 +43,7 @@ const REVIEW_FINDINGS_COLUMNS = [
   { key: 'category_label', label: '类别' },
   { key: 'agent_name', label: 'Agent' },
   { key: 'tool_name', label: '工具' },
+  { key: 'trace_id', label: '链路 ID' },
   { key: 'status', label: '状态' },
   { key: 'evidence_count', label: '证据数' },
 ];
@@ -62,6 +64,19 @@ const EVIDENCE_COLUMNS = [
   { key: 'status', label: '状态' },
   { key: 'agent_name', label: 'Agent 名称' },
   { key: 'tool_name', label: '工具' },
+  { key: 'result_summary', label: '日志摘要' },
+  { key: 'error_message', label: '错误详情' },
+];
+
+const TRACE_EVENT_COLUMNS = [
+  { key: 'event_id', label: '日志 ID' },
+  { key: 'ts', label: '时间' },
+  { key: 'event', label: '事件' },
+  { key: 'status', label: '状态' },
+  { key: 'tool_name', label: '工具' },
+  { key: 'span_id', label: 'Span ID' },
+  { key: 'parent_span_id', label: '父 Span' },
+  { key: 'duration_ms', label: '耗时 ms' },
   { key: 'result_summary', label: '日志摘要' },
   { key: 'error_message', label: '错误详情' },
 ];
@@ -156,6 +171,14 @@ function evidenceTimestamp(ev) {
   return ev?.log_detail?.ts ?? ev?.ts ?? '';
 }
 
+function evidenceEventIdsOf(finding) {
+  if (Array.isArray(finding?.evidence_event_ids) && finding.evidence_event_ids.length > 0) {
+    return finding.evidence_event_ids;
+  }
+  if (!Array.isArray(finding?.evidence)) return [];
+  return finding.evidence.map((ev) => ev?.event_id).filter((eventId) => eventId !== null && eventId !== undefined);
+}
+
 function lastSeenAtOf(finding) {
   if (finding?.last_seen_at) return finding.last_seen_at;
   if (!Array.isArray(finding?.evidence)) return '';
@@ -239,6 +262,82 @@ export function createVisualization({ reviewStore, config }) {
     }
   }
 
+  function listTraceEvents(traceId, limit = 200) {
+    if (!traceId) return [];
+    try {
+      const rows = reviewStore.listTraceEvents?.({ traceId, limit }) ?? [];
+      return Array.isArray(rows) ? rows : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function listRawEventsByIds(eventIds, limit = 200) {
+    if (!Array.isArray(eventIds) || eventIds.length === 0) return [];
+    try {
+      const rows = reviewStore.listRawEventsByIds?.({ eventIds, limit }) ?? [];
+      return Array.isArray(rows) ? rows : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function traceTimelineHref(finding) {
+    if (!finding?.trace_id || !finding?.finding_id) return undefined;
+    return `${findingUrl(finding.finding_id)}#trace_timeline`;
+  }
+
+  function traceCellFor(finding) {
+    if (!finding?.trace_id) return '';
+    return {
+      text: finding.trace_id,
+      href: traceTimelineHref(finding),
+      mono: true,
+    };
+  }
+
+  function traceEventRows(events) {
+    return events.map((event) => ({
+      event_id: {
+        text: String(event.id ?? event.event_id ?? ''),
+        mono: true,
+      },
+      ts: {
+        text: formatTime(event.ts),
+        mono: true,
+      },
+      event: event.event ?? '',
+      status: {
+        text: labelOf(STATUS_LABELS, event.status),
+        tone: statusTone(event.status),
+      },
+      tool_name: event.tool_name ?? '',
+      span_id: {
+        text: event.span_id ?? '',
+        mono: true,
+      },
+      parent_span_id: {
+        text: event.parent_span_id ?? '',
+        mono: true,
+      },
+      duration_ms: {
+        text: isPresent(event.duration_ms) ? String(event.duration_ms) : '',
+        mono: true,
+      },
+      result_summary: event.result_summary ?? '',
+      error_message: event.error_message ?? '',
+    }));
+  }
+
+  function rawLogSnippets(events) {
+    return events
+      .filter((event) => isPresent(event?.raw_json))
+      .map((event) => ({
+        label: `日志 ID ${event.id}`,
+        body: event.raw_json,
+      }));
+  }
+
   function overviewPage() {
     const openBySev = countOpenFindingsBySeverity();
     const deadLetters = getDeadLetterCount();
@@ -312,6 +411,7 @@ export function createVisualization({ reviewStore, config }) {
       category_label: labelOf(CATEGORY_LABELS, finding.category),
       agent_name: finding.agent_name ?? finding.agent_id ?? '',
       tool_name: finding.tool_name ?? '',
+      trace_id: traceCellFor(finding),
       status: {
         text: labelOf(STATUS_LABELS, finding.status),
         tone: statusTone(finding.status),
@@ -454,7 +554,7 @@ export function createVisualization({ reviewStore, config }) {
         id: 'degraded_notice',
         title: '降级完成说明',
         type: 'callout',
-        body: '本轮审查以降级模式完成，结果可用于初步排查，但建议结合原始日志或后续批次复核。',
+        body: '本轮审查以降级模式完成，结果可用于初步排查，但建议结合证据日志或后续批次复核。',
       });
     }
     if (run?.error_code) {
@@ -484,6 +584,7 @@ export function createVisualization({ reviewStore, config }) {
           category_label: labelOf(CATEGORY_LABELS, finding.category),
           agent_name: finding.agent_name ?? finding.agent_id ?? '',
           tool_name: finding.tool_name ?? '',
+          trace_id: traceCellFor(finding),
           status: {
             text: labelOf(STATUS_LABELS, finding.status),
             tone: statusTone(finding.status),
@@ -579,12 +680,12 @@ export function createVisualization({ reviewStore, config }) {
     }
 
     const definitionItems = [
-      { label: 'Finding ID', value: finding.finding_id ?? '' },
+      { label: '风险发现 ID', value: finding.finding_id ?? '' },
       { label: '审查批次 ID', value: finding.review_id ?? '' },
       { label: 'Agent 名称', value: finding.agent_name ?? '' },
-      { label: 'Agent ID', value: finding.agent_id ?? '' },
+      { label: '智能体 ID', value: finding.agent_id ?? '' },
       { label: '工具', value: finding.tool_name ?? '' },
-      { label: 'Trace ID', value: finding.trace_id ?? '' },
+      { label: '链路 ID', value: finding.trace_id ?? '' },
       { label: '产品 ID', value: finding.product_id ?? '' },
       { label: '最近出现时间', value: formatTime(lastSeenAtOf(finding)) },
     ].filter((item) => isPresent(item.value));
@@ -614,6 +715,11 @@ export function createVisualization({ reviewStore, config }) {
             };
           })
       : [];
+
+    const traceEvents = listTraceEvents(finding.trace_id, 200);
+    const traceRows = traceEventRows(traceEvents);
+    const rawEvidenceEvents = listRawEventsByIds(evidenceEventIdsOf(finding), 200);
+    const rawEvidenceSnippets = rawLogSnippets(rawEvidenceEvents);
 
     const linkItems = [];
     if (reviewId) {
@@ -646,6 +752,22 @@ export function createVisualization({ reviewStore, config }) {
         items: definitionItems,
       });
     }
+    if (traceRows.length > 0) {
+      sections.push({
+        id: 'trace_timeline',
+        title: `工具调用链路（共 ${traceRows.length} 条）`,
+        type: 'table',
+        columns: TRACE_EVENT_COLUMNS,
+        rows: traceRows,
+      });
+    } else if (isPresent(finding.trace_id)) {
+      sections.push({
+        id: 'trace_timeline_empty',
+        title: '工具调用链路',
+        type: 'callout',
+        body: `未找到链路 ID ${finding.trace_id} 对应的完整工具调用事件，请结合下方证据日志继续排查。`,
+      });
+    }
     if (evidenceRows.length > 0) {
       sections.push({
         id: 'evidence_events',
@@ -653,6 +775,14 @@ export function createVisualization({ reviewStore, config }) {
         type: 'table',
         columns: EVIDENCE_COLUMNS,
         rows: evidenceRows,
+      });
+    }
+    if (rawEvidenceSnippets.length > 0) {
+      sections.push({
+        id: 'evidence_raw_logs',
+        title: rawEvidenceSnippets.length > 1 ? `原始日志片段（共 ${rawEvidenceSnippets.length} 条）` : '原始日志片段',
+        type: 'raw_log_list',
+        snippets: rawEvidenceSnippets,
       });
     }
     if (linkItems.length > 0) {

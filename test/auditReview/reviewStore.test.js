@@ -209,6 +209,104 @@ test('reviewStore: listFindings filters by severity/category/agent', () => {
   db.close();
 });
 
+test('reviewStore: listTraceEvents returns audit events for a trace in chronological order', () => {
+  const db = openDb();
+  db.exec(`
+    CREATE TABLE audit_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      trace_id TEXT NOT NULL,
+      span_id TEXT NOT NULL,
+      parent_span_id TEXT,
+      ts TEXT NOT NULL,
+      event TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      status TEXT NOT NULL,
+      result_summary TEXT,
+      duration_ms INTEGER,
+      error_message TEXT
+    );
+  `);
+  const insert = db.prepare(`
+    INSERT INTO audit_events
+      (trace_id, span_id, parent_span_id, ts, event, tool_name, status, result_summary, duration_ms, error_message)
+    VALUES
+      (@trace_id, @span_id, @parent_span_id, @ts, @event, @tool_name, @status, @result_summary, @duration_ms, @error_message)
+  `);
+  insert.run({
+    trace_id: 'trace_keep',
+    span_id: 'span_2',
+    parent_span_id: 'span_1',
+    ts: '2026-07-03T10:02:00.000Z',
+    event: 'tool.end',
+    tool_name: 'db.delete',
+    status: 'error',
+    result_summary: 'delete failed',
+    duration_ms: 420,
+    error_message: 'permission denied',
+  });
+  insert.run({
+    trace_id: 'trace_other',
+    span_id: 'span_other',
+    parent_span_id: null,
+    ts: '2026-07-03T10:00:30.000Z',
+    event: 'tool.end',
+    tool_name: 'search',
+    status: 'ok',
+    result_summary: 'ignored',
+    duration_ms: 25,
+    error_message: null,
+  });
+  insert.run({
+    trace_id: 'trace_keep',
+    span_id: 'span_1',
+    parent_span_id: null,
+    ts: '2026-07-03T10:01:00.000Z',
+    event: 'tool.start',
+    tool_name: 'db.delete',
+    status: 'ok',
+    result_summary: 'delete requested',
+    duration_ms: null,
+    error_message: null,
+  });
+
+  const store = createReviewStore(db);
+  const rows = store.listTraceEvents({ traceId: 'trace_keep', limit: 10 });
+
+  assert.deepEqual(rows.map((row) => row.span_id), ['span_1', 'span_2']);
+  assert.deepEqual(rows.map((row) => row.tool_name), ['db.delete', 'db.delete']);
+  assert.equal(rows[1].parent_span_id, 'span_1');
+  assert.equal(rows[1].error_message, 'permission denied');
+  assert.equal(store.listTraceEvents({ traceId: 'trace_keep', limit: 1 }).length, 1);
+  assert.deepEqual(store.listTraceEvents({ traceId: '' }), []);
+  db.close();
+});
+
+test('reviewStore: listRawEventsByIds returns raw_json snippets in evidence order', () => {
+  const db = openDb();
+  db.exec(`
+    CREATE TABLE audit_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      raw_json TEXT
+    );
+  `);
+  const insert = db.prepare(`INSERT INTO audit_events (id, raw_json) VALUES (?, ?)`);
+  insert.run(7, '{"event":"tool.error","message":"keep this exact string"}');
+  insert.run(3, '{"event":"tool.start","payload":{"b":2,"a":1}}');
+  insert.run(9, '{"event":"tool.end"}');
+
+  const store = createReviewStore(db);
+  const rows = store.listRawEventsByIds({ eventIds: [3, 7], limit: 10 });
+
+  assert.deepEqual(rows.map((row) => row.id), [3, 7]);
+  assert.deepEqual(rows.map((row) => row.raw_json), [
+    '{"event":"tool.start","payload":{"b":2,"a":1}}',
+    '{"event":"tool.error","message":"keep this exact string"}',
+  ]);
+  assert.deepEqual(store.listRawEventsByIds({ eventIds: [7, 3], limit: 1 }).map((row) => row.id), [7]);
+  assert.deepEqual(store.listRawEventsByIds({ eventIds: [] }), []);
+  db.close();
+});
+
 test('reviewStore: listDeadLetterCount queries outbox dead letters', () => {
   const db = openDb();
   // Ensure outbox table exists via runtime schema so the query can run.

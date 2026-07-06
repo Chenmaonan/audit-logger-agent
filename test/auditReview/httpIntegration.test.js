@@ -134,7 +134,9 @@ test('audit review HTTP integration smoke test', async () => {
     async createStructuredResponse({ input }) {
       const userMsg = input.find((m) => m.role === 'user');
       const payload = JSON.parse(userMsg.content);
-      const eventId = payload.candidates?.[0]?.event_id ?? 1;
+      const eventId = payload.candidates?.find((candidate) => candidate.tool_name === 'db.delete')?.event_id
+        ?? payload.candidates?.[0]?.event_id
+        ?? 1;
       return {
         type: 'audit_review',
         review_id: payload.review_id,
@@ -374,6 +376,8 @@ test('audit review HTTP integration smoke test', async () => {
       assert.equal(html.includes('Severity'), false, 'dashboard should not contain English Severity');
       assert.equal(html.includes('Confidence'), false, 'dashboard should not contain English Confidence');
       assert.equal(html.includes('Data source'), false, 'dashboard should not contain Data source');
+      assert.ok(html.includes('链路 ID'), 'dashboard should contain trace link column');
+      assert.ok(html.includes('#trace_timeline'), 'dashboard should link trace ids to the finding trace timeline');
     }
 
     // ------------------------------------------------------------------
@@ -385,6 +389,8 @@ test('audit review HTTP integration smoke test', async () => {
       assert.equal(res.headers.get('content-type'), 'text/html; charset=utf-8');
       const html = await res.text();
       assert.ok(html.includes('<html'), 'review detail html should contain <html');
+      assert.ok(html.includes('链路 ID'), 'review detail should contain trace link column');
+      assert.ok(html.includes('#trace_timeline'), 'review detail should link trace ids to the finding trace timeline');
     }
 
     // ------------------------------------------------------------------
@@ -399,6 +405,14 @@ test('audit review HTTP integration smoke test', async () => {
       assert.ok(html.includes('日志 ID'), 'finding detail should contain 日志 ID');
       assert.ok(html.includes('Agent 名称'), 'finding detail should contain Agent 名称');
       assert.ok(html.includes('日志摘要'), 'finding detail should contain 日志摘要');
+      assert.ok(html.includes('id="trace_timeline"'), 'finding detail should render trace timeline anchor');
+      assert.ok(html.includes('工具调用链路'), 'finding detail should contain trace timeline section');
+      assert.ok(html.includes('trace-del-1'), 'finding detail should contain the finding trace id');
+      assert.ok(html.includes('db.delete'), 'finding detail should contain the trace tool call');
+      assert.ok(html.includes('deleted 5 rows'), 'finding detail should contain the trace event summary');
+      assert.ok(html.includes('原始日志片段'), 'finding detail should contain raw evidence log snippets');
+      assert.ok(html.includes('raw-log-pre'), 'finding detail should render raw snippets in preformatted blocks');
+      assert.ok(html.includes('&quot;tool_name&quot;:&quot;db.delete&quot;'), 'raw snippet should preserve the original compact JSON field');
       assert.equal(html.includes('置信度'), false, 'finding detail should not contain 置信度');
     }
 

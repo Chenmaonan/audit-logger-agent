@@ -360,6 +360,11 @@ test('scheduler.recoverStaleRuns: marks stale running run as failed with review_
 
   // Insert an expired lock.
   lockStore.acquire({ ownerId: 'old-owner', leaseMinutes: 0 });
+  db.prepare(`
+    UPDATE audit_review_locks
+    SET lease_expires_at = ?, updated_at = ?
+    WHERE lock_name = ?
+  `).run('2026-07-03T10:00:00.000Z', '2026-07-03T10:00:00.000Z', 'audit_review_scheduler');
 
   const scheduler = createAuditReviewScheduler({ db, ...deps, now: () => new Date('2026-07-03T10:30:00.000Z') });
   scheduler.recoverStaleRuns();
