@@ -1,6 +1,0 @@
-{
-  "AUDIT_AGENT_LLM_API_KEY": "<your-api-key>",
-  "AUDIT_AGENT_LLM_BASE_URL": "https://api.openai.com/v1",
-  "AUDIT_AGENT_LLM_MODEL": "<your-model>",
-  "AUDIT_AGENT_LLM_TIMEOUT_MS": "30000"
-}

@@ -9,10 +9,23 @@ data/
 
 # Local configuration and generated process files
 .config
+.config.example
 record.json
 .server.log
 *.log
 Typora_Hook_Log.txt
+
+# Development-only files kept locally but not published
+.editorconfig
+SKILL.md
+TODOS.md
+docs/
+v1.5/
+test/
+scripts/run-tests.js
+.agents/
+.claude/
+tmp/
 
 # OS/editor noise
 .DS_Store

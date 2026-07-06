@@ -8,9 +8,7 @@
     "ingest": "node scripts/ingest.js",
     "query": "node scripts/query.js",
     "report": "node scripts/report.js",
-    "server": "node scripts/server.js",
-    "test": "node scripts/run-tests.js",
-    "test:agent": "npm test"
+    "server": "node scripts/server.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.7.0",

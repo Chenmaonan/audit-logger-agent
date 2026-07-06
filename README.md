@@ -166,13 +166,7 @@ npm install
 
 在项目根目录新建 `.config`，内容是 JSON，不是 `.env` 格式。
 
-可以直接复制模板：
-
-```bash
-cp .config.example .config
-```
-
-或手动创建：
+手动创建：
 
 ```json
 {
@@ -419,23 +413,6 @@ npm run report -- --type tools --from 2026-07-01 --to 2026-07-03
 npm run server -- --port 9320
 ```
 
-### 运行测试
-
-```bash
-npm test
-```
-
-自检脚本：
-
-```bash
-node test/self-test.js
-```
-
-说明：
-
-- 单元和集成测试默认可离线运行。
-- 依赖真实 LLM 的测试在没有配置 LLM 凭证时会自动跳过。
-
 ## HTTP API
 
 ### 基础查询接口
@@ -639,7 +616,7 @@ Dashboard 总览页和审查批次详情页会在风险发现表中展示“链�
 建议不要把真实敏感值提交进：
 
 - `config.json`
-- `.config.example`
+- `.config`
 
 ### 6. 源日志默认只读，SQLite 是唯一写入产物
 
@@ -709,11 +686,6 @@ scripts/
   report.js         命令行报表
   server.js         服务启动入口
   lib/              解析、扫描、数据库基础能力
-test/
-  auditReview/      审查系统测试
-  http/             HTTP API 测试
-  llm/              LLM 相关测试
-  runtime/          运行时测试
 ```
 
 ## 总结
