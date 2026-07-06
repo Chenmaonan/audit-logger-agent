@@ -55,6 +55,18 @@ function ruleMinimumSeverityForEvidenceIds(evidenceIds, candidateIndex) {
   return floor;
 }
 
+function sameNullable(a, b) {
+  return (a ?? null) === (b ?? null);
+}
+
+function findingMatchesCandidateIdentity(finding, candidate) {
+  return candidate.category === finding.category &&
+    sameNullable(candidate.agent_id, finding.agent_id) &&
+    sameNullable(candidate.tool_name, finding.tool_name) &&
+    sameNullable(candidate.trace_id, finding.trace_id) &&
+    sameNullable(candidate.product_id, finding.product_id);
+}
+
 /**
  * Find the window_to of the most recent successful (completed|completed_degraded) run.
  * Returns null if none exists.
@@ -487,7 +499,10 @@ export function createAuditReviewScheduler({
           const evidence = evidenceForEventIds(evidenceIds, evidenceIndex);
           const minSeverity = ruleMinimumSeverityForEvidenceIds(evidenceIds, candidateIndex);
           for (const id of evidenceIds) {
-            if (candidateIndex.get(id)?.min_severity) coveredRuleCandidateIds.add(id);
+            const candidate = candidateIndex.get(id);
+            if (candidate?.min_severity && findingMatchesCandidateIdentity(f, candidate)) {
+              coveredRuleCandidateIds.add(id);
+            }
           }
           if (f.category === 'high_risk_permission' && evidenceIds.length === 0) {
             return [];
