@@ -1,5 +1,79 @@
 # Audit Logger Agent
 
+## Long-running operations notes
+
+### Secrets and local files
+
+Prefer setting `AUDIT_AGENT_LLM_API_KEY` in the process environment managed by PM2, systemd, or the shell that starts the service. `.config` is supported for local development and private hosts, but it must remain local-only, must not be committed, and should be permission restricted on Unix-like hosts:
+
+```bash
+chmod 600 .config
+```
+
+The repository ignores `.config`, `data/`, and `.server.log`; keep SQLite databases, WAL files, local credentials, and process logs out of Git.
+
+### Process supervision
+
+PM2 example with restart policy and boot start:
+
+```bash
+pm2 start npm --name audit-logger-agent -- run server -- --port 9320
+pm2 save
+pm2 startup
+```
+
+For systemd, run the service from the repository root and let systemd restart it:
+
+```ini
+[Unit]
+Description=Audit Logger Agent
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/audit-logger-agent
+ExecStart=/usr/bin/node scripts/server.js --port 9320
+Environment=AUDIT_AGENT_LLM_API_KEY=replace-with-secret
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/audit-logger-agent/.server.log
+StandardError=append:/opt/audit-logger-agent/.server.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable boot start with:
+
+```bash
+systemctl enable --now audit-logger-agent
+```
+
+### Log rotation
+
+Rotate `.server.log` or the supervisor stdout/stderr target. A simple `logrotate` rule:
+
+```text
+/opt/audit-logger-agent/.server.log {
+  daily
+  rotate 14
+  compress
+  missingok
+  copytruncate
+}
+```
+
+If PM2 owns the logs, use the PM2 logrotate module or an equivalent host-level rotation policy.
+
+### SQLite backups
+
+Do not directly copy active SQLite database, `-wal`, or `-shm` files while the service is running. Use SQLite online backup so WAL-active databases are copied consistently:
+
+```bash
+sqlite3 data/audit.db ".backup 'backups/audit-$(date +%F).db'"
+```
+
+Keep backups outside `data/` if they need separate retention or off-host sync.
+
 `audit-logger-agent` 是一个 Agent 审计日志中台。它负责采集多个 Agent 输出的 NDJSON 审计日志，写入本地 SQLite，提供命令行查询、HTTP API、周期性 LLM 审查、风险发现 Dashboard 和回调通知。
 
 本文档面向部署和运维，说明如何配置、启动、关闭、采集日志、查询数据，以及上游 Agent 需要携带哪些日志字段。

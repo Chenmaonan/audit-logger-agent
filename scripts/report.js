@@ -1,7 +1,14 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { openDb, dailySummary, errorReport, toolUsageStats } from './lib/db.js';
+import {
+  openDb,
+  dailySummary,
+  errorReport,
+  toolUsageStats,
+  reportDateForNow,
+  reportTimezoneOffsetMinutes,
+} from './lib/db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const configPath = path.resolve(__dirname, '..', 'config.json');
@@ -39,12 +46,13 @@ function parseArgs() {
 }
 
 const opts = parseArgs();
+const timezoneOffsetMinutes = reportTimezoneOffsetMinutes(config);
 
 switch (opts.type) {
   case 'daily': {
-    const date = opts.date || new Date().toISOString().slice(0, 10);
+    const date = opts.date || reportDateForNow(new Date(), timezoneOffsetMinutes);
     console.log(`Daily Summary — ${date}${opts.agent_id ? ` (agent: ${opts.agent_id})` : ''}\n`);
-    const rows = dailySummary(db, date, opts.agent_id);
+    const rows = dailySummary(db, date, opts.agent_id, { timezoneOffsetMinutes });
 
     if (rows.length === 0) {
       console.log('No events for this date.');

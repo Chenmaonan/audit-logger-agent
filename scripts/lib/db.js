@@ -38,6 +38,7 @@ import crypto from 'crypto';
 
 const DEFAULT_QUERY_LIMIT = 100;
 const DEFAULT_MAX_QUERY_LIMIT = 1000;
+export const DEFAULT_REPORT_TIMEZONE_OFFSET_MINUTES = 480;
 
 function hashRow(rawJson) {
   return crypto.createHash('sha256').update(rawJson).digest('hex').slice(0, 16);
@@ -61,6 +62,28 @@ function configuredMaxQueryLimit(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_MAX_QUERY_LIMIT;
   return Math.floor(parsed);
+}
+
+export function reportTimezoneOffsetMinutes(value) {
+  const raw = typeof value === 'object' && value !== null
+    ? value.report?.timezoneOffsetMinutes ?? value.reportTimezoneOffsetMinutes
+    : value;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < -1440 || parsed > 1440) {
+    return DEFAULT_REPORT_TIMEZONE_OFFSET_MINUTES;
+  }
+  return Math.trunc(parsed);
+}
+
+export function reportDateForNow(now = new Date(), timezoneOffsetMinutes = DEFAULT_REPORT_TIMEZONE_OFFSET_MINUTES) {
+  const offset = reportTimezoneOffsetMinutes(timezoneOffsetMinutes);
+  return new Date(now.getTime() + offset * 60 * 1000).toISOString().slice(0, 10);
+}
+
+function sqliteTimezoneModifier(timezoneOffsetMinutes) {
+  const offset = reportTimezoneOffsetMinutes(timezoneOffsetMinutes);
+  const sign = offset >= 0 ? '+' : '-';
+  return `${sign}${Math.abs(offset)} minutes`;
 }
 
 export function openDb(dbPath) {
@@ -160,9 +183,10 @@ export function queryEvents(db, filters = {}, options = {}) {
   return db.prepare(sql).all(params);
 }
 
-export function dailySummary(db, date, agentId) {
-  const where = ['date(ts) = @date'];
-  const params = { date };
+export function dailySummary(db, date, agentId, options = {}) {
+  const timezoneOffsetMinutes = reportTimezoneOffsetMinutes(options.timezoneOffsetMinutes);
+  const where = ['date(ts, @timezoneModifier) = @date'];
+  const params = { date, timezoneModifier: sqliteTimezoneModifier(timezoneOffsetMinutes) };
   if (agentId) { where.push('agent_id = @agentId'); params.agentId = agentId; }
   return db.prepare(`
     SELECT agent_id, tool_name, status, COUNT(*) as count

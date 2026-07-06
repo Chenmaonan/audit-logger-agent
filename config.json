@@ -24,6 +24,9 @@
     "maxQueryLimit": 1000,
     "maxBodyBytes": 1048576
   },
+  "report": {
+    "timezoneOffsetMinutes": 480
+  },
   "retention": {
     "enabled": true,
     "runAtHour": 4,

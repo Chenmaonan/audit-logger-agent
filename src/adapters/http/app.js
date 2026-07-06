@@ -1,6 +1,14 @@
 // src/adapters/http/app.js
 import http from 'http';
-import { queryEvents, dailySummary, errorReport, toolUsageStats } from '../../../scripts/lib/db.js';
+import fs from 'fs';
+import {
+  queryEvents,
+  dailySummary,
+  errorReport,
+  toolUsageStats,
+  reportDateForNow,
+  reportTimezoneOffsetMinutes,
+} from '../../../scripts/lib/db.js';
 import { renderDashboard } from '../../auditReview/dashboardTemplate.js';
 import { handleIngestRoute, isHttpIngestEnabled } from './ingestRoute.js';
 
@@ -40,6 +48,76 @@ function paginationFromUrl(url, { defaultLimit, config }) {
   return {
     limit: clampLimit(url.searchParams.get('limit'), defaultLimit, maxQueryLimit(config)),
     offset: clampOffset(url.searchParams.get('offset')),
+  };
+}
+
+function dbWritableProbe(db) {
+  try {
+    db.exec('BEGIN IMMEDIATE; ROLLBACK;');
+    return { writable: true };
+  } catch (error) {
+    return { writable: false, error: error.message };
+  }
+}
+
+function isMissingTableError(error) {
+  return /no such table/i.test(error?.message ?? '');
+}
+
+function latestReview(db) {
+  try {
+    return db.prepare(`
+      SELECT review_id, status, started_at, finished_at
+      FROM audit_review_runs
+      ORDER BY COALESCE(finished_at, started_at) DESC
+      LIMIT 1
+    `).get() ?? null;
+  } catch (error) {
+    if (isMissingTableError(error)) return null;
+    return { error: error.message };
+  }
+}
+
+function outboxCounts(db) {
+  try {
+    const row = db.prepare(`
+      SELECT
+        SUM(CASE WHEN delivery_status = 'pending' THEN 1 ELSE 0 END) AS pending,
+        SUM(CASE WHEN delivery_status = 'dead_letter' THEN 1 ELSE 0 END) AS dead_letter
+      FROM agent_outbox_events
+    `).get();
+    return {
+      pending: row?.pending ?? 0,
+      dead_letter: row?.dead_letter ?? 0,
+    };
+  } catch (error) {
+    if (isMissingTableError(error)) return { pending: 0, dead_letter: 0 };
+    return { pending: null, dead_letter: null, error: error.message };
+  }
+}
+
+function safeFileSize(filePath) {
+  try {
+    return fs.statSync(filePath).size;
+  } catch (error) {
+    if (error.code === 'ENOENT') return 0;
+    return null;
+  }
+}
+
+function diskUsageEstimate(dbPath) {
+  const dbBytes = safeFileSize(dbPath);
+  const walBytes = safeFileSize(`${dbPath}-wal`);
+  const shmBytes = safeFileSize(`${dbPath}-shm`);
+  const sizes = [dbBytes, walBytes, shmBytes];
+  const total = sizes.every((size) => typeof size === 'number')
+    ? sizes.reduce((sum, size) => sum + size, 0)
+    : null;
+  return {
+    db_bytes: dbBytes,
+    wal_bytes: walBytes,
+    shm_bytes: shmBytes,
+    total_bytes: total,
   };
 }
 
@@ -172,7 +250,7 @@ function mapRuntimeError(error) {
   return { status: 500, body: { error_code: 'internal_error', error: 'Internal server error' } };
 }
 
-export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth } = {}) {
+export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth, now = () => new Date() } = {}) {
   // Helpers for audit-review routes. These are optional — if not provided
   // (e.g. in the existing runs-api test), the new routes return 503.
   const hasReviewDeps = !!(scheduler && reviewStore && visualization && dashboardAuth);
@@ -302,7 +380,17 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       // ===================== Existing Routes (unchanged) =====================
       if (req.method === 'GET' && url.pathname === '/health') {
-        json(res, 200, { status: 'ok', dbPath: config.dbPath });
+        const dbProbe = dbWritableProbe(db);
+        const status = dbProbe.writable ? 'ok' : 'error';
+        json(res, dbProbe.writable ? 200 : 503, {
+          status,
+          checked_at: now().toISOString(),
+          dbPath: config.dbPath,
+          db: dbProbe,
+          latest_review: latestReview(db),
+          outbox: outboxCounts(db),
+          disk: diskUsageEstimate(config.dbPath),
+        });
         return;
       }
 
@@ -322,8 +410,13 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
       }
 
       if (req.method === 'GET' && url.pathname === '/report/daily') {
-        const date = url.searchParams.get('date') ?? new Date().toISOString().slice(0, 10);
-        json(res, 200, { date, results: dailySummary(db, date) });
+        const timezoneOffsetMinutes = reportTimezoneOffsetMinutes(config);
+        const date = url.searchParams.get('date') ?? reportDateForNow(now(), timezoneOffsetMinutes);
+        json(res, 200, {
+          date,
+          timezone_offset_minutes: timezoneOffsetMinutes,
+          results: dailySummary(db, date, undefined, { timezoneOffsetMinutes }),
+        });
         return;
       }
 
