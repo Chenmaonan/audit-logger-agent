@@ -151,6 +151,29 @@ test('POST /v1/ingest rejects path-traversal agent_id and writes nothing outside
   });
 });
 
+test('POST /v1/ingest rejects path-special agent_id values without writing spool files', async () => {
+  const cases = ['', '.', '/', '\\', '..', '../evil'];
+
+  for (const agentId of cases) {
+    await withIngestServer(async ({ baseUrl, config, tmpDir }) => {
+      const response = await fetch(`${baseUrl}/v1/ingest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(makeEvent({ agent_id: agentId, trace_id: `invalid-${agentId}` })),
+      });
+
+      assert.equal(response.status, 202);
+      const body = await response.json();
+      assert.equal(body.accepted, 0);
+      assert.equal(body.rejected, 1);
+      assert.ok(body.errors.some((error) => /agent_id|required field "agent_id"/.test(error.error)));
+      assert.equal(fs.existsSync(path.join(config.ingest.spoolDir, 'audit-2026-07-06.jsonl')), false);
+      assert.equal(fs.existsSync(path.join(config.ingest.spoolDir, agentId, 'audit-2026-07-06.jsonl')), false);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'evil', 'audit-2026-07-06.jsonl')), false);
+    });
+  }
+});
+
 test('POST /v1/ingest returns 413 for oversized bodies', async () => {
   await withIngestServer(async ({ baseUrl, config }) => {
     const response = await fetch(`${baseUrl}/v1/ingest`, {

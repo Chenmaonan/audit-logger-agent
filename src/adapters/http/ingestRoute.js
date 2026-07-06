@@ -39,12 +39,14 @@ export function resolveSpoolDir(config = {}) {
 }
 
 function isSafeAgentId(agentId) {
-  return typeof agentId === 'string'
-    && agentId.length > 0
-    && !agentId.includes('..')
-    && !agentId.includes('/')
-    && !agentId.includes('\\')
-    && /^[A-Za-z0-9._-]+$/.test(agentId);
+  if (typeof agentId !== 'string') return false;
+  if (agentId.length === 0) return false;
+  if (!/^[A-Za-z0-9._-]+$/.test(agentId)) return false;
+  if (agentId === '.' || agentId === '..') return false;
+  if (agentId.includes('..')) return false;
+  if (path.posix.basename(agentId) !== agentId) return false;
+  if (path.win32.basename(agentId) !== agentId) return false;
+  return true;
 }
 
 function eventDate(event) {
