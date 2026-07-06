@@ -1,10 +1,18 @@
 node_modules/
+
+# Local runtime data and databases
 data/
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
-.DS_Store
-Typora_Hook_Log.txt
+
+# Local configuration and generated process files
 .config
 record.json
+.server.log
+*.log
+Typora_Hook_Log.txt
+
+# OS/editor noise
+.DS_Store
