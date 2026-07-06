@@ -18,6 +18,15 @@
     },
     "spoolDir": "data/incoming"
   },
+  "retention": {
+    "enabled": true,
+    "runAtHour": 4,
+    "eventsDays": 90,
+    "resolvedFindingsDays": 30,
+    "reviewRunsDays": 60,
+    "outboxDays": 14,
+    "vacuum": "incremental"
+  },
   "auditReview": {
     "enabled": true,
     "intervalMinutes": 30,

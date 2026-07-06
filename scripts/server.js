@@ -30,6 +30,7 @@ import { createReviewNotifier } from '../src/auditReview/notification.js';
 import { createVisualization } from '../src/auditReview/visualization.js';
 import { createDashboardAuth } from '../src/auditReview/dashboardAuth.js';
 import { createAuditReviewScheduler } from '../src/auditReview/scheduler.js';
+import { createRetentionScheduler, createRetentionService } from '../src/auditReview/retention.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -119,6 +120,17 @@ const scheduler = createAuditReviewScheduler({
   llmModel: openAIConfig.model,
   now: () => new Date(),
 });
+const retentionService = createRetentionService({ db, config: runtimeConfig, cursorStore, now: () => new Date() });
+const retentionScheduler = createRetentionScheduler({
+  retentionService,
+  config: runtimeConfig,
+  onRun: (result) => {
+    console.log(`Retention cleanup completed: ${JSON.stringify(result.deleted)}`);
+  },
+  onError: (error) => {
+    console.error(`Retention cleanup failed: ${error.message}`);
+  },
+});
 
 // v1.4: validate dashboard auth boot config (throws if non-loopback without token).
 dashboardAuth.validateBoot({ bindHost: config.auditReview?.http?.bindHost ?? '127.0.0.1' });
@@ -134,6 +146,11 @@ try {
 if (config.auditReview?.enabled !== false) {
   scheduler.start();
   console.log('Audit review scheduler started.');
+}
+
+if (runtimeConfig.retention?.enabled !== false) {
+  retentionScheduler.start();
+  console.log(`Retention scheduler started for hour ${runtimeConfig.retention?.runAtHour ?? 4}.`);
 }
 
 const app = createHttpApp({
@@ -164,6 +181,7 @@ app.listen(port, '127.0.0.1', () => {
 
 process.on('SIGINT', () => {
   scheduler.stop();
+  retentionScheduler.stop();
   clearInterval(flushInterval);
   db.close();
   process.exit(0);
