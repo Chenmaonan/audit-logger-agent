@@ -68,6 +68,9 @@ export function openDb(dbPath) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
+  db.pragma('busy_timeout = 5000');
+  db.pragma('synchronous = NORMAL');
+  db.pragma('cache_size = -8000');
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
   return db;

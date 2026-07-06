@@ -4,6 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import Database from 'better-sqlite3';
+import { Worker } from 'node:worker_threads';
 
 import { parseNdjson } from '../../scripts/lib/parser.js';
 import { insertEvents, openDb, queryEvents } from '../../scripts/lib/db.js';
@@ -75,6 +76,51 @@ function makeDb() {
   `);
   ensureReviewSchema(db);
   return db;
+}
+
+function runLockingWorker(dbPath, holdMs) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(`
+      const { parentPort, workerData } = require('node:worker_threads');
+      const Database = require('better-sqlite3');
+      const db = new Database(workerData.dbPath);
+      try {
+        db.pragma('journal_mode = WAL');
+        db.exec('BEGIN IMMEDIATE');
+        parentPort.postMessage({ status: 'locked' });
+        setTimeout(() => {
+          try {
+            db.exec('COMMIT');
+            db.close();
+            parentPort.postMessage({ status: 'released' });
+          } catch (error) {
+            parentPort.postMessage({ status: 'error', message: error.message });
+          }
+        }, workerData.holdMs);
+      } catch (error) {
+        parentPort.postMessage({ status: 'error', message: error.message });
+      }
+    `, { eval: true, workerData: { dbPath, holdMs } });
+
+    worker.once('error', reject);
+    worker.on('message', (message) => {
+      if (message.status === 'locked') {
+        resolve(worker);
+      } else if (message.status === 'error') {
+        reject(new Error(message.message));
+      }
+    });
+  });
+}
+
+function waitForWorkerExit(worker) {
+  return new Promise((resolve, reject) => {
+    worker.once('error', reject);
+    worker.once('exit', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`worker exited with code ${code}`));
+    });
+  });
 }
 
 test('parseNdjson rejects over-max lines without JSON.parse', () => {
@@ -253,6 +299,42 @@ test('queryEvents clamps requested limit to the default maximum', () => {
     assert.equal(results.length, 1000);
   } finally {
     db?.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('openDb applies SQLite long-running PRAGMA settings while preserving WAL', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-db-pragmas-'));
+  let db;
+  try {
+    db = openDb(path.join(tmpDir, 'audit.db'));
+
+    assert.equal(db.pragma('journal_mode', { simple: true }), 'wal');
+    assert.equal(db.pragma('busy_timeout', { simple: true }), 5000);
+    assert.equal(db.pragma('synchronous', { simple: true }), 1);
+    assert.equal(db.pragma('cache_size', { simple: true }), -8000);
+  } finally {
+    db?.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('openDb waits through transient SQLite write locks', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-db-locks-'));
+  let db;
+  let worker;
+  try {
+    const dbPath = path.join(tmpDir, 'audit.db');
+    db = openDb(dbPath);
+    worker = await runLockingWorker(dbPath, 150);
+
+    insertEvents(db, [normalizeForInsert(makeEvent(2001))]);
+
+    assert.equal(queryEvents(db, { trace_id: 'trace-2001' }).length, 1);
+    await waitForWorkerExit(worker);
+  } finally {
+    db?.close();
+    if (worker) await worker.terminate();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });

@@ -104,6 +104,8 @@ Windows PowerShell 下也可以使用同一命令。
 | `auditReview.visualization.baseUrl` | 通知中生成 Dashboard 链接的地址前缀。 |
 | `auditReview.visualization.dashboardPath` | Dashboard 路由前缀，默认 `/dashboard`。 |
 
+SQLite 适用于当前低并发内网部署；当 `audit_events` 超过约 2000 万行，或查询/写入 QPS 明显上升时，应重新评估迁移到 Postgres 或增加只读副本。
+
 ### `.config`
 
 `.config` 用于本地 LLM 凭证，必须手动创建，内容是 JSON，不是 `.env` 格式。
