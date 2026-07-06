@@ -484,6 +484,11 @@ test('scheduler retains rule-backed identity when LLM cites real evidence but al
   assert.ok(ruleBacked, 'real high-risk tool and trace should be retained');
   assert.equal(ruleBacked.severity, 'high');
   assert.deepEqual(ruleBacked.evidence_event_ids, [1]);
+  const forged = findings.find((f) =>
+    f.category === 'high_risk_permission' &&
+    f.tool_name === 'safe.read' &&
+    f.trace_id === 'trace-forged');
+  assert.equal(forged, undefined, 'identity-conflicting LLM high-risk finding should not be persisted');
 
   db.close();
 });

@@ -46,11 +46,16 @@ function filterEvidenceEventIds(eventIds, evidenceIndex) {
   return filtered;
 }
 
-function ruleMinimumSeverityForEvidenceIds(evidenceIds, candidateIndex) {
+function ruleCandidatesForEvidenceIds(evidenceIds, candidateIndex) {
+  return evidenceIds
+    .map((id) => candidateIndex.get(id))
+    .filter((candidate) => candidate?.min_severity);
+}
+
+function ruleMinimumSeverityForCandidates(candidates) {
   let floor = null;
-  for (const id of evidenceIds) {
-    const candidate = candidateIndex.get(id);
-    if (candidate?.min_severity) floor = maxSeverity(floor, candidate.min_severity);
+  for (const candidate of candidates) {
+    floor = maxSeverity(floor, candidate.min_severity);
   }
   return floor;
 }
@@ -497,14 +502,17 @@ export function createAuditReviewScheduler({
         findingsToPersist = llmResult.review.findings.flatMap((f) => {
           const evidenceIds = filterEvidenceEventIds(f.evidence_event_ids, evidenceIndex);
           const evidence = evidenceForEventIds(evidenceIds, evidenceIndex);
-          const minSeverity = ruleMinimumSeverityForEvidenceIds(evidenceIds, candidateIndex);
-          for (const id of evidenceIds) {
-            const candidate = candidateIndex.get(id);
-            if (candidate?.min_severity && findingMatchesCandidateIdentity(f, candidate)) {
-              coveredRuleCandidateIds.add(id);
-            }
+          const ruleCandidates = ruleCandidatesForEvidenceIds(evidenceIds, candidateIndex);
+          const matchedRuleCandidates = ruleCandidates.filter((candidate) =>
+            findingMatchesCandidateIdentity(f, candidate));
+          const minSeverity = ruleMinimumSeverityForCandidates(matchedRuleCandidates);
+          for (const candidate of matchedRuleCandidates) {
+            coveredRuleCandidateIds.add(candidate.event_id);
           }
-          if (f.category === 'high_risk_permission' && evidenceIds.length === 0) {
+          if (
+            f.category === 'high_risk_permission' &&
+            (evidenceIds.length === 0 || (ruleCandidates.length > 0 && matchedRuleCandidates.length === 0))
+          ) {
             return [];
           }
           return [{
