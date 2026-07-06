@@ -88,6 +88,29 @@ function splitCompleteAndPartial(chunk) {
   };
 }
 
+function skipUntilLineBoundary(filePath, offsetBytes, maxChunkBytes) {
+  const stat = fs.statSync(filePath);
+  const fd = fs.openSync(filePath, 'r');
+  let pos = Math.max(0, offsetBytes);
+  let consumedBytes = 0;
+  try {
+    while (pos < stat.size) {
+      const len = Math.min(stat.size - pos, maxChunkBytes);
+      const buf = Buffer.allocUnsafe(len);
+      fs.readSync(fd, buf, 0, len, pos);
+      const newlineIndex = buf.indexOf(0x0a);
+      if (newlineIndex !== -1) {
+        return { consumedBytes: consumedBytes + newlineIndex + 1, foundNewline: true };
+      }
+      pos += len;
+      consumedBytes += len;
+    }
+    return { consumedBytes, foundNewline: false };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function basename(p) {
   return path.basename(p);
 }
@@ -219,10 +242,12 @@ export function createAuditIngestService({ db, config, cursorStore, now = () => 
         scannedFiles++;
 
         const { chunk } = readIncrementalChunk(absPath, offsetBytes, { maxChunkBytes: limits.maxChunkBytes });
+        const chunkBytes = Buffer.byteLength(chunk, 'utf-8');
         const { completeText, partialBytes, consumedBytes } = splitCompleteAndPartial(chunk);
 
         let fileParseErrors = [];
         let fileInserted = 0;
+        let skippedBytes = 0;
         if (completeText.length > 0) {
           const { entries, errors } = parseNdjson(completeText, { maxLineBytes: limits.maxLineBytes });
           fileParseErrors = errors.map((e) => ({
@@ -237,11 +262,31 @@ export function createAuditIngestService({ db, config, cursorStore, now = () => 
           }
         }
 
+        const mustSkipOverlongPartial = partialBytes > limits.maxLineBytes
+          || (consumedBytes === 0 && chunkBytes >= limits.maxChunkBytes);
+        if (partialBytes > 0 && mustSkipOverlongPartial) {
+          const skip = skipUntilLineBoundary(
+            absPath,
+            offsetBytes + consumedBytes,
+            limits.maxChunkBytes
+          );
+          skippedBytes = skip.consumedBytes;
+          const limitName = partialBytes > limits.maxLineBytes ? 'maxLineBytes' : 'maxChunkBytes';
+          const limitValue = partialBytes > limits.maxLineBytes ? limits.maxLineBytes : limits.maxChunkBytes;
+          const terminator = skip.foundNewline ? 'overlong line' : 'unterminated line';
+          fileParseErrors.push({
+            agent_id: agentId,
+            file: basename(absPath),
+            line: '?',
+            error: `${terminator} exceeds ${limitName} (${limitValue})`,
+          });
+        }
+
         inserted += fileInserted;
         parseErrors.push(...fileParseErrors);
 
         // New offset: bytes consumed (complete lines) relative to start of file.
-        const newOffset = offsetBytes + consumedBytes;
+        const newOffset = offsetBytes + consumedBytes + skippedBytes;
         const lastError = fileParseErrors.length > 0
           ? `${fileParseErrors.length} parse error(s) in ${basename(absPath)}`
           : null;

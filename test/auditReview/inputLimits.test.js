@@ -191,6 +191,55 @@ test('ingestSince records overlong line errors without inserting the row', () =>
   }
 });
 
+test('ingestSince skips an overlong no-newline capped chunk without wedging the cursor', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-no-newline-overlong-'));
+  let db;
+  try {
+    const logDir = path.join(tmpDir, 'logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    const logFile = path.join(logDir, 'audit-2026-07-03.jsonl');
+    const overlongUnterminatedLine = '{"ts":"' + 'x'.repeat(128) + '"}';
+    fs.writeFileSync(logFile, overlongUnterminatedLine, 'utf-8');
+
+    const dbPath = path.join(tmpDir, 'audit.db');
+    db = makeDb();
+    const cursorStore = createIngestCursorStore(db);
+    const service = createAuditIngestService({
+      db,
+      cursorStore,
+      config: {
+        dbPath,
+        agents: {
+          'test-agent': {
+            logDir: path.relative(path.dirname(dbPath), logDir),
+            pattern: 'audit-*.jsonl',
+          },
+        },
+        limits: {
+          maxLineBytes: 64,
+          maxChunkBytes: 32,
+        },
+      },
+    });
+
+    const first = service.ingestSince({ sinceDate: '2026-07-03' });
+    const second = service.ingestSince({ sinceDate: '2026-07-03' });
+
+    assert.equal(first.inserted, 0);
+    assert.equal(first.parseErrors.length, 1);
+    assert.match(first.parseErrors[0].error, /unterminated line exceeds maxChunkBytes \(32\)/);
+
+    const cursor = cursorStore.get({ agentId: 'test-agent', filePath: logFile });
+    assert.equal(cursor.offset_bytes, Buffer.byteLength(overlongUnterminatedLine, 'utf-8'));
+    assert.equal(cursor.offset_bytes, cursor.file_size_bytes);
+    assert.equal(second.inserted, 0);
+    assert.equal(second.parseErrors.length, 0);
+  } finally {
+    db?.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('queryEvents clamps requested limit to the default maximum', () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-query-limit-'));
   let db;

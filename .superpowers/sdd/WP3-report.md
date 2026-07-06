@@ -55,3 +55,18 @@ Full required verification:
 
 - The working tree also contained unrelated WP4/WP6 changes in retention, scheduler, visualization, review schema, LLM, and server files. They were not part of WP3 and should not be included in the WP3 commit.
 - `config.json` also had an unrelated `auditReview.llmBudget` hunk from another worker; only the top-level `limits` hunk belongs to WP3.
+
+## Follow-up Fix: no-newline capped chunk
+
+- Fixed `src/auditReview/ingestService.js` so an overlong unterminated line that fills the capped read without any newline is reported as an ingest parse error and skipped to the next newline or EOF with bounded reads.
+- Preserved normal short partial-line behavior by only skipping partial tails that exceed `maxLineBytes`, or the zero-progress no-newline `maxChunkBytes` case.
+- Added regression coverage in `test/auditReview/inputLimits.test.js` for a no-newline `maxChunkBytes` edge that previously left the cursor at the same offset.
+
+Verification:
+
+- `node --test test/auditReview/inputLimits.test.js`
+  - Result: pass, 5/5 tests.
+- `node --test test/auditReview/inputLimits.test.js test/auditReview/ingestService.test.js`
+  - Result: pass, 10/10 tests.
+- `node --test test/auditReview/*.test.js test/http/*.test.js test/llm/openaiConfig.test.js test/runtime/*.test.js`
+  - Result: pass, 164/164 tests.
