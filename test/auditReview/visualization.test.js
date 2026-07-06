@@ -359,6 +359,19 @@ test('findingDetailPage adds an ordered visual trace sequence without the old ra
 
 test('findingDetailPageWithAnalysis calls LLM and adds chain purpose analysis', async () => {
   const calls = [];
+  const usageRecords = [];
+  const store = fakeStore();
+  store.getLlmUsage = function getLlmUsage(day) {
+    return { day, calls: 0, est_tokens: 0 };
+  };
+  store.recordLlmUsage = function recordLlmUsage(record) {
+    usageRecords.push(record);
+    return {
+      day: record.day,
+      calls: record.calls,
+      est_tokens: record.estTokens,
+    };
+  };
   const llmClient = {
     async createStructuredResponse(request) {
       calls.push(request);
@@ -371,9 +384,22 @@ test('findingDetailPageWithAnalysis calls LLM and adds chain purpose analysis', 
     },
   };
 
-  const page = await createViz({}, { llmClient, model: 'test-model' }).findingDetailPageWithAnalysis('f-critical');
+  const page = await createVisualization({
+    reviewStore: store,
+    llmClient,
+    model: 'test-model',
+    config: {
+      auditReview: {
+        visualization: { dashboardPath: '/dashboard' },
+        llmBudget: { maxCallsPerDay: 500, maxTokensPerDay: 2000000 },
+      },
+    },
+  }).findingDetailPageWithAnalysis('f-critical');
 
   assert.equal(calls.length, 1);
+  assert.equal(usageRecords.length, 1);
+  assert.equal(usageRecords[0].calls, 1);
+  assert.ok(usageRecords[0].estTokens > 0);
   assert.equal(calls[0].model, 'test-model');
   assert.ok(JSON.stringify(calls[0].input).includes('trace-critical-1'));
   const analysisSection = page.sections.find((section) => section.id === 'trace_llm_analysis');
@@ -427,6 +453,50 @@ test('findingDetailPageWithAnalysis reuses cached analysis without calling LLM',
   assert.equal(analysisSection.chain_summary, 'cached chain');
   assert.deepEqual(analysisSection.risk_points, ['cached risk']);
   assert.deepEqual(analysisSection.next_actions, ['cached action']);
+});
+
+test('findingDetailPageWithAnalysis skips LLM when daily detail-analysis budget is exhausted', async () => {
+  const calls = [];
+  const store = fakeStore();
+  store.getLlmUsage = function getLlmUsage(day) {
+    return { day, calls: 1, est_tokens: 100 };
+  };
+  store.recordLlmUsage = function recordLlmUsage() {
+    throw new Error('usage must not be recorded when call is skipped');
+  };
+  const llmClient = {
+    async createStructuredResponse(request) {
+      calls.push(request);
+      return {
+        purpose: 'fresh purpose',
+        chain_summary: 'fresh chain',
+        risk_points: [],
+        next_actions: [],
+      };
+    },
+  };
+
+  const page = await createVisualization({
+    reviewStore: store,
+    llmClient,
+    model: 'test-model',
+    config: {
+      auditReview: {
+        llmBudget: {
+          maxCallsPerDay: 1,
+          maxTokensPerDay: 2000000,
+          cacheDetailAnalysis: true,
+        },
+        visualization: { dashboardPath: '/dashboard' },
+      },
+    },
+  }).findingDetailPageWithAnalysis('f-critical');
+
+  assert.equal(calls.length, 0);
+  const analysisSection = page.sections.find((section) => section.id === 'trace_llm_analysis');
+  assert.ok(analysisSection);
+  assert.equal(analysisSection.type, 'callout');
+  assert.ok(analysisSection.body.includes('llm_budget_exceeded'));
 });
 
 test('findingDetailPageWithAnalysis degrades when LLM analysis fails', async () => {

@@ -48,6 +48,23 @@ Enable boot start with:
 systemctl enable --now audit-logger-agent
 ```
 
+### Intranet bind host
+
+By default the HTTP server binds to `127.0.0.1`. For intranet collection from other machines, set `auditReview.http.bindHost` in `config.json` to a reachable interface such as `0.0.0.0` or the server's intranet IP address:
+
+```json
+{
+  "auditReview": {
+    "http": {
+      "bindHost": "0.0.0.0",
+      "requireDashboardToken": true
+    }
+  }
+}
+```
+
+When `bindHost` is non-loopback, set `AUDIT_AGENT_DASHBOARD_TOKEN` in the service environment before starting the server. The server refuses to boot with a non-loopback bind and no token.
+
 ### Log rotation
 
 Rotate `.server.log` or the supervisor stdout/stderr target. A simple `logrotate` rule:

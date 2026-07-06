@@ -31,6 +31,7 @@ import { createVisualization } from '../src/auditReview/visualization.js';
 import { createDashboardAuth } from '../src/auditReview/dashboardAuth.js';
 import { createAuditReviewScheduler } from '../src/auditReview/scheduler.js';
 import { createRetentionScheduler, createRetentionService } from '../src/auditReview/retention.js';
+import { listenHttpServer, resolveServerBindHost } from '../src/adapters/http/serverListen.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -134,7 +135,8 @@ const retentionScheduler = createRetentionScheduler({
 });
 
 // v1.4: validate dashboard auth boot config (throws if non-loopback without token).
-dashboardAuth.validateBoot({ bindHost: config.auditReview?.http?.bindHost ?? '127.0.0.1' });
+const bindHost = resolveServerBindHost(config);
+dashboardAuth.validateBoot({ bindHost });
 
 // v1.4: recover stale review runs on startup.
 try {
@@ -176,8 +178,12 @@ const flushInterval = setInterval(async () => {
   }
 }, 1000);
 
-app.listen(port, '127.0.0.1', () => {
-  console.log(`Agent API on http://127.0.0.1:${port}`);
+listenHttpServer(app, {
+  port,
+  bindHost,
+  onListening: (url) => {
+    console.log(`Agent API on ${url}`);
+  },
 });
 
 process.on('SIGINT', () => {

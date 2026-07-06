@@ -1,3 +1,10 @@
+import {
+  estimateTokensForPayload,
+  llmBudgetFromConfig,
+  llmUsageDayKey,
+  usageWouldExceedBudget,
+} from './llmBudget.js';
+
 // src/auditReview/visualization.js
 // Build direct-data view models for the dashboard pages.
 // The template receives fully-populated sections (rows/items/links) — no browser-side fetch.
@@ -335,6 +342,15 @@ function traceAnalysisSection({ analysis, model }) {
   };
 }
 
+function traceAnalysisUnavailableSection(message) {
+  return {
+    id: 'trace_llm_analysis',
+    title: 'LLM analysis unavailable',
+    type: 'callout',
+    body: message,
+  };
+}
+
 function insertSectionAfter(sections, anchorId, section) {
   const anchorIndex = sections.findIndex((item) => item?.id === anchorId);
   const insertIndex = anchorIndex >= 0 ? anchorIndex + 1 : sections.length;
@@ -347,6 +363,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
   const dashboardPath = vizConfig.dashboardPath ?? '/dashboard';
   const traceAnalysisModel = model ?? config?.auditReview?.llmReview?.model ?? config?.planner?.model ?? null;
   const cacheDetailAnalysis = config?.auditReview?.llmBudget?.cacheDetailAnalysis !== false;
+  const llmBudget = llmBudgetFromConfig(config);
 
   function dashboardUrlFor(reviewId) {
     return `${baseUrl}${dashboardPath}/audit-reviews/${encodeURIComponent(reviewId)}`;
@@ -913,11 +930,36 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     }
 
     try {
-      const raw = await llmClient.createStructuredResponse({
-        model: traceAnalysisModel,
-        input: buildTraceAnalysisInput({ finding, traceEvents }),
-        schema: traceAnalysisJsonSchema(),
-      });
+      const input = buildTraceAnalysisInput({ finding, traceEvents });
+      const schema = traceAnalysisJsonSchema();
+      const estimatedTokens = estimateTokensForPayload({ model: traceAnalysisModel, input, schema });
+      const usageDay = llmUsageDayKey();
+      const usage = reviewStore.getLlmUsage?.(usageDay) ?? { day: usageDay, calls: 0, est_tokens: 0 };
+      if (usageWouldExceedBudget(usage, llmBudget, estimatedTokens)) {
+        insertSectionAfter(page.sections, 'trace_sequence', traceAnalysisUnavailableSection(
+          'Cannot generate trace analysis: llm_budget_exceeded',
+        ));
+        return page;
+      }
+
+      let raw;
+      let llmError = null;
+      try {
+        raw = await llmClient.createStructuredResponse({
+          model: traceAnalysisModel,
+          input,
+          schema,
+        });
+      } catch (error) {
+        llmError = error;
+      } finally {
+        try {
+          reviewStore.recordLlmUsage?.({ day: usageDay, calls: 1, estTokens: estimatedTokens });
+        } catch {
+          // Usage accounting failures must not break the detail page.
+        }
+      }
+      if (llmError) throw llmError;
       const analysis = normalizeTraceAnalysis(raw, traceEvents);
       if (cacheDetailAnalysis) {
         try {

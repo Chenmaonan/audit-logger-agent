@@ -12,43 +12,17 @@
 
 import crypto from 'crypto';
 import { agentDisplayName, buildEvidenceDetail, buildEvidenceIndex, evidenceForEventIds } from './evidence.js';
+import { estimateTokensForPayload, llmBudgetFromConfig, usageWouldExceedBudget } from './llmBudget.js';
 
 const LOCK_NAME = 'audit_review_scheduler';
 const LEASE_MINUTES = 10;
-const DEFAULT_LLM_BUDGET = {
-  maxCallsPerDay: 500,
-  maxTokensPerDay: 2000000,
-  maxConcurrency: 2,
-  cacheDetailAnalysis: true,
-};
 
 function nowIso() {
   return new Date().toISOString();
 }
 
-function positiveInteger(value, fallback) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
-}
-
-function llmBudgetFromConfig(config) {
-  const raw = config?.auditReview?.llmBudget ?? {};
-  return {
-    maxCallsPerDay: positiveInteger(raw.maxCallsPerDay, DEFAULT_LLM_BUDGET.maxCallsPerDay),
-    maxTokensPerDay: positiveInteger(raw.maxTokensPerDay, DEFAULT_LLM_BUDGET.maxTokensPerDay),
-    maxConcurrency: positiveInteger(raw.maxConcurrency, DEFAULT_LLM_BUDGET.maxConcurrency),
-    cacheDetailAnalysis: raw.cacheDetailAnalysis !== false,
-  };
-}
-
 function estimateTokensForReview({ reviewId, window, candidates }) {
-  const payload = JSON.stringify({ review_id: reviewId, window, candidates: candidates ?? [] });
-  return Math.max(1, Math.ceil(payload.length / 4));
-}
-
-function usageWouldExceedBudget(usage, budget, estimatedTokens) {
-  return (usage.calls + 1) > budget.maxCallsPerDay ||
-    (usage.est_tokens + estimatedTokens) > budget.maxTokensPerDay;
+  return estimateTokensForPayload({ review_id: reviewId, window, candidates: candidates ?? [] });
 }
 
 function reviewIdFor(now) {
