@@ -44,7 +44,7 @@ function toEpochMs(ts) {
   return Number.isNaN(n) ? null : n;
 }
 
-function makeCandidate(row, category, reason) {
+function makeCandidate(row, category, reason, extras = {}) {
   return {
     event_id: row.id,
     ts: row.ts,
@@ -61,6 +61,7 @@ function makeCandidate(row, category, reason) {
     result_summary: row.result_summary,
     category,
     reason,
+    ...extras,
   };
 }
 
@@ -152,7 +153,7 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
       const highRisk = isHighRisk(row.tool_name, highRiskToolPatterns);
       if (highRisk) {
         candidates.push(
-          makeCandidate(row, 'high_risk_permission', `tool_name matches high-risk pattern`),
+          makeCandidate(row, 'high_risk_permission', `tool_name matches high-risk pattern`, { min_severity: 'high' }),
         );
         // 5. abnormal channel for high-risk tool
         if (trustedChannels.length > 0 && row.channel != null && !trustedChannels.includes(row.channel)) {

@@ -25,6 +25,52 @@ function reviewIdFor(now) {
   return `review_${ts}_${crypto.randomUUID().slice(0, 8)}`;
 }
 
+const SEVERITY_RANK = { low: 1, medium: 2, high: 3, critical: 4 };
+
+function maxSeverity(...severities) {
+  return severities
+    .filter(Boolean)
+    .reduce((max, severity) =>
+      (SEVERITY_RANK[severity] ?? 0) > (SEVERITY_RANK[max] ?? 0) ? severity : max,
+    'low');
+}
+
+function filterEvidenceEventIds(eventIds, evidenceIndex) {
+  const seen = new Set();
+  const filtered = [];
+  for (const id of Array.isArray(eventIds) ? eventIds : []) {
+    if (!Number.isInteger(id) || !evidenceIndex.has(id) || seen.has(id)) continue;
+    seen.add(id);
+    filtered.push(id);
+  }
+  return filtered;
+}
+
+function sameNullable(a, b) {
+  return (a ?? null) === (b ?? null);
+}
+
+function ruleMinimumSeverityForFinding(finding, evidenceIds, candidateIndex, candidates) {
+  const floors = [];
+  for (const id of evidenceIds) {
+    const candidate = candidateIndex.get(id);
+    if (candidate?.min_severity) floors.push(candidate.min_severity);
+  }
+  for (const candidate of candidates) {
+    if (
+      candidate.min_severity &&
+      candidate.category === finding.category &&
+      sameNullable(candidate.agent_id, finding.agent_id) &&
+      sameNullable(candidate.tool_name, finding.tool_name) &&
+      sameNullable(candidate.trace_id, finding.trace_id) &&
+      sameNullable(candidate.product_id, finding.product_id)
+    ) {
+      floors.push(candidate.min_severity);
+    }
+  }
+  return floors.reduce((max, severity) => maxSeverity(max, severity), null);
+}
+
 /**
  * Find the window_to of the most recent successful (completed|completed_degraded) run.
  * Returns null if none exists.
@@ -48,7 +94,7 @@ function findingFromCandidate(candidate, reviewId, riskPolicyVersion, promptVers
     finding_id: `finding_${crypto.randomUUID()}`,
     review_id: reviewId,
     category: candidate.category,
-    severity: 'medium',
+    severity: maxSeverity('medium', candidate.min_severity),
     agent_id: candidate.agent_id,
     tool_name: candidate.tool_name,
     trace_id: candidate.trace_id,
@@ -74,7 +120,7 @@ function findingFromCandidate(candidate, reviewId, riskPolicyVersion, promptVers
 function degradedReview({ reviewId, window, candidates }) {
   const severityCounts = { critical: 0, high: 0, medium: 0, low: 0 };
   for (const c of candidates) {
-    const sev = 'medium';
+    const sev = maxSeverity('medium', c.min_severity);
     severityCounts[sev] = (severityCounts[sev] || 0) + 1;
   }
   return {
@@ -88,7 +134,7 @@ function degradedReview({ reviewId, window, candidates }) {
     },
     findings: candidates.map((c) => ({
       category: c.category,
-      severity: 'medium',
+      severity: maxSeverity('medium', c.min_severity),
       agent_id: c.agent_id,
       tool_name: c.tool_name,
       trace_id: c.trace_id,
@@ -398,6 +444,7 @@ export function createAuditReviewScheduler({
 
       // 6a. Build a structured evidence index keyed by event_id for LLM findings.
       const evidenceIndex = buildEvidenceIndex(candidates.candidates, agentsConfig);
+      const candidateIndex = new Map(candidates.candidates.map((candidate) => [candidate.event_id, candidate]));
 
       // 6b. Persist parse-error findings.
       const parseFindings = parseErrorFindings(
@@ -451,13 +498,14 @@ export function createAuditReviewScheduler({
       let findingsToPersist = [];
       if (llmResult.ok && llmResult.review && Array.isArray(llmResult.review.findings)) {
         findingsToPersist = llmResult.review.findings.map((f) => {
-          const evidenceIds = Array.isArray(f.evidence_event_ids) ? f.evidence_event_ids : [];
+          const evidenceIds = filterEvidenceEventIds(f.evidence_event_ids, evidenceIndex);
           const evidence = evidenceForEventIds(evidenceIds, evidenceIndex);
+          const minSeverity = ruleMinimumSeverityForFinding(f, evidenceIds, candidateIndex, candidates.candidates);
           return {
             finding_id: `finding_${crypto.randomUUID()}`,
             review_id: reviewId,
             category: f.category,
-            severity: f.severity,
+            severity: maxSeverity(f.severity, minSeverity),
             agent_id: f.agent_id,
             tool_name: f.tool_name,
             trace_id: f.trace_id,
