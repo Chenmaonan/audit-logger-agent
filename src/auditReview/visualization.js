@@ -454,6 +454,34 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     }
   }
 
+  function reserveDetailAnalysisBudget({ day, estimatedTokens }) {
+    if (typeof reviewStore.reserveLlmUsage === 'function') {
+      try {
+        const reservation = reviewStore.reserveLlmUsage({
+          day,
+          calls: 1,
+          estTokens: estimatedTokens,
+          maxCallsPerDay: llmBudget.maxCallsPerDay,
+          maxTokensPerDay: llmBudget.maxTokensPerDay,
+        });
+        return reservation?.reserved === true;
+      } catch {
+        return false;
+      }
+    }
+
+    const usage = reviewStore.getLlmUsage?.(day) ?? { day, calls: 0, est_tokens: 0 };
+    if (usageWouldExceedBudget(usage, llmBudget, estimatedTokens)) return false;
+    if (typeof reviewStore.recordLlmUsage === 'function') {
+      try {
+        reviewStore.recordLlmUsage({ day, calls: 1, estTokens: estimatedTokens });
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
+
   function traceTimelineHref(finding) {
     if (!finding?.trace_id || !finding?.finding_id) return undefined;
     return `${findingUrl(finding.finding_id)}#trace_sequence`;
@@ -934,8 +962,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       const schema = traceAnalysisJsonSchema();
       const estimatedTokens = estimateTokensForPayload({ model: traceAnalysisModel, input, schema });
       const usageDay = llmUsageDayKey();
-      const usage = reviewStore.getLlmUsage?.(usageDay) ?? { day: usageDay, calls: 0, est_tokens: 0 };
-      if (usageWouldExceedBudget(usage, llmBudget, estimatedTokens)) {
+      if (!reserveDetailAnalysisBudget({ day: usageDay, estimatedTokens })) {
         insertSectionAfter(page.sections, 'trace_sequence', traceAnalysisUnavailableSection(
           'Cannot generate trace analysis: llm_budget_exceeded',
         ));
@@ -952,12 +979,6 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
         });
       } catch (error) {
         llmError = error;
-      } finally {
-        try {
-          reviewStore.recordLlmUsage?.({ day: usageDay, calls: 1, estTokens: estimatedTokens });
-        } catch {
-          // Usage accounting failures must not break the detail page.
-        }
       }
       if (llmError) throw llmError;
       const analysis = normalizeTraceAnalysis(raw, traceEvents);

@@ -240,6 +240,47 @@ test('reviewStore: tracks daily LLM usage counters', () => {
   db.close();
 });
 
+test('reviewStore: atomically reserves LLM usage within daily limits', () => {
+  const db = openDb();
+  const store = createReviewStore(db);
+
+  const first = store.reserveLlmUsage({
+    day: '2026-07-03',
+    calls: 1,
+    estTokens: 120,
+    maxCallsPerDay: 1,
+    maxTokensPerDay: 200,
+  });
+  const second = store.reserveLlmUsage({
+    day: '2026-07-03',
+    calls: 1,
+    estTokens: 20,
+    maxCallsPerDay: 1,
+    maxTokensPerDay: 200,
+  });
+  const tokenLimited = store.reserveLlmUsage({
+    day: '2026-07-04',
+    calls: 1,
+    estTokens: 220,
+    maxCallsPerDay: 2,
+    maxTokensPerDay: 200,
+  });
+
+  assert.equal(first.reserved, true);
+  assert.deepEqual(
+    { day: first.day, calls: first.calls, est_tokens: first.est_tokens },
+    { day: '2026-07-03', calls: 1, est_tokens: 120 },
+  );
+  assert.equal(second.reserved, false);
+  assert.deepEqual(
+    { day: second.day, calls: second.calls, est_tokens: second.est_tokens },
+    { day: '2026-07-03', calls: 1, est_tokens: 120 },
+  );
+  assert.equal(tokenLimited.reserved, false);
+  assert.deepEqual(store.getLlmUsage('2026-07-04'), { day: '2026-07-04', calls: 0, est_tokens: 0 });
+  db.close();
+});
+
 test('reviewStore: computeFindingHash is stable and ignores severity', () => {
   const h1 = computeFindingHash({
     category: 'failed_call', agentId: 'a', toolName: 't',

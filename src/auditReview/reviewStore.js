@@ -161,6 +161,18 @@ export function createReviewStore(db) {
       est_tokens = est_tokens + excluded.est_tokens,
       updated_at = excluded.updated_at
   `);
+  const reserveLlmUsageStmt = db.prepare(`
+    INSERT INTO audit_llm_usage (day, calls, est_tokens, updated_at)
+    SELECT @day, @calls, @est_tokens, @updated_at
+    WHERE @calls <= @max_calls_per_day
+      AND @est_tokens <= @max_tokens_per_day
+    ON CONFLICT(day) DO UPDATE SET
+      calls = calls + excluded.calls,
+      est_tokens = est_tokens + excluded.est_tokens,
+      updated_at = excluded.updated_at
+    WHERE audit_llm_usage.calls + excluded.calls <= @max_calls_per_day
+      AND audit_llm_usage.est_tokens + excluded.est_tokens <= @max_tokens_per_day
+  `);
 
   let deadLetterCountStmt = null;
   let traceEventsStmt = null;
@@ -406,6 +418,30 @@ export function createReviewStore(db) {
         updated_at: nowIso(),
       });
       return this.getLlmUsage(key);
+    },
+
+    reserveLlmUsage({ day, calls = 1, estTokens = 0, maxCallsPerDay, maxTokensPerDay } = {}) {
+      const key = String(day);
+      const safeCalls = Number.isFinite(Number(calls)) ? Math.max(0, Math.floor(Number(calls))) : 0;
+      const safeTokens = Number.isFinite(Number(estTokens)) ? Math.max(0, Math.floor(Number(estTokens))) : 0;
+      const safeMaxCalls = Number.isFinite(Number(maxCallsPerDay))
+        ? Math.max(0, Math.floor(Number(maxCallsPerDay)))
+        : 0;
+      const safeMaxTokens = Number.isFinite(Number(maxTokensPerDay))
+        ? Math.max(0, Math.floor(Number(maxTokensPerDay)))
+        : 0;
+      const result = reserveLlmUsageStmt.run({
+        day: key,
+        calls: safeCalls,
+        est_tokens: safeTokens,
+        max_calls_per_day: safeMaxCalls,
+        max_tokens_per_day: safeMaxTokens,
+        updated_at: nowIso(),
+      });
+      return {
+        reserved: result.changes > 0,
+        ...this.getLlmUsage(key),
+      };
     },
   };
 }

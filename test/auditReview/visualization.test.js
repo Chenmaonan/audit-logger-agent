@@ -359,18 +359,22 @@ test('findingDetailPage adds an ordered visual trace sequence without the old ra
 
 test('findingDetailPageWithAnalysis calls LLM and adds chain purpose analysis', async () => {
   const calls = [];
-  const usageRecords = [];
+  const usageReservations = [];
   const store = fakeStore();
   store.getLlmUsage = function getLlmUsage(day) {
     return { day, calls: 0, est_tokens: 0 };
   };
-  store.recordLlmUsage = function recordLlmUsage(record) {
-    usageRecords.push(record);
+  store.reserveLlmUsage = function reserveLlmUsage(record) {
+    usageReservations.push(record);
     return {
+      reserved: true,
       day: record.day,
       calls: record.calls,
       est_tokens: record.estTokens,
     };
+  };
+  store.recordLlmUsage = function recordLlmUsage() {
+    throw new Error('usage must not be double-counted after reservation');
   };
   const llmClient = {
     async createStructuredResponse(request) {
@@ -397,9 +401,9 @@ test('findingDetailPageWithAnalysis calls LLM and adds chain purpose analysis', 
   }).findingDetailPageWithAnalysis('f-critical');
 
   assert.equal(calls.length, 1);
-  assert.equal(usageRecords.length, 1);
-  assert.equal(usageRecords[0].calls, 1);
-  assert.ok(usageRecords[0].estTokens > 0);
+  assert.equal(usageReservations.length, 1);
+  assert.equal(usageReservations[0].calls, 1);
+  assert.ok(usageReservations[0].estTokens > 0);
   assert.equal(calls[0].model, 'test-model');
   assert.ok(JSON.stringify(calls[0].input).includes('trace-critical-1'));
   const analysisSection = page.sections.find((section) => section.id === 'trace_llm_analysis');
@@ -461,6 +465,9 @@ test('findingDetailPageWithAnalysis skips LLM when daily detail-analysis budget 
   store.getLlmUsage = function getLlmUsage(day) {
     return { day, calls: 1, est_tokens: 100 };
   };
+  store.reserveLlmUsage = function reserveLlmUsage() {
+    return { reserved: false, day: '2026-07-03', calls: 1, est_tokens: 100 };
+  };
   store.recordLlmUsage = function recordLlmUsage() {
     throw new Error('usage must not be recorded when call is skipped');
   };
@@ -497,6 +504,76 @@ test('findingDetailPageWithAnalysis skips LLM when daily detail-analysis budget 
   assert.ok(analysisSection);
   assert.equal(analysisSection.type, 'callout');
   assert.ok(analysisSection.body.includes('llm_budget_exceeded'));
+});
+
+test('findingDetailPageWithAnalysis atomically reserves budget across concurrent cache misses', async () => {
+  const store = fakeStore();
+  let usage = { day: null, calls: 0, est_tokens: 0 };
+  const reservations = [];
+  store.getLlmUsage = function getLlmUsage(day) {
+    return { day, calls: usage.calls, est_tokens: usage.est_tokens };
+  };
+  store.reserveLlmUsage = function reserveLlmUsage({ day, calls = 1, estTokens = 0 }) {
+    if (usage.calls + calls > 1) {
+      return { reserved: false, day, calls: usage.calls, est_tokens: usage.est_tokens };
+    }
+    usage = { day, calls: usage.calls + calls, est_tokens: usage.est_tokens + estTokens };
+    const reservation = { day, calls, estTokens };
+    reservations.push(reservation);
+    return { reserved: true, day, calls: usage.calls, est_tokens: usage.est_tokens };
+  };
+  store.recordLlmUsage = function recordLlmUsage() {
+    throw new Error('usage must not be double-counted after reservation');
+  };
+
+  let llmCalls = 0;
+  let releaseLlm;
+  const llmStarted = [];
+  const llmGate = new Promise((resolve) => { releaseLlm = resolve; });
+  const llmClient = {
+    async createStructuredResponse() {
+      llmCalls += 1;
+      llmStarted.push(llmCalls);
+      await llmGate;
+      return {
+        purpose: 'fresh purpose',
+        chain_summary: 'fresh chain',
+        risk_points: [],
+        next_actions: [],
+      };
+    },
+  };
+
+  const viz = createVisualization({
+    reviewStore: store,
+    llmClient,
+    model: 'test-model',
+    config: {
+      auditReview: {
+        llmBudget: {
+          maxCallsPerDay: 1,
+          maxTokensPerDay: 2000000,
+          cacheDetailAnalysis: false,
+        },
+        visualization: { dashboardPath: '/dashboard' },
+      },
+    },
+  });
+  const first = viz.findingDetailPageWithAnalysis('f-critical');
+  const second = viz.findingDetailPageWithAnalysis('f-critical');
+  await Promise.resolve();
+  releaseLlm();
+  const pages = await Promise.all([first, second]);
+
+  assert.equal(llmCalls, 1);
+  assert.equal(reservations.length, 1);
+  assert.equal(usage.calls, 1);
+  assert.equal(llmStarted.length, 1);
+  assert.ok(usage.est_tokens > 0);
+  assert.equal(pages.filter((page) =>
+    page.sections.find((section) => section.id === 'trace_llm_analysis')?.type === 'trace_analysis').length, 1);
+  assert.equal(pages.filter((page) =>
+    page.sections.find((section) => section.id === 'trace_llm_analysis')?.body?.includes('llm_budget_exceeded')).length, 1);
 });
 
 test('findingDetailPageWithAnalysis degrades when LLM analysis fails', async () => {
