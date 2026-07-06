@@ -493,6 +493,71 @@ test('scheduler retains rule-backed identity when LLM cites real evidence but al
   db.close();
 });
 
+test('scheduler checks all same-event rule candidates when LLM alters fields', async () => {
+  const db = makeDb();
+  const deps = buildRealDeps(db, { llmClient: makeFakeRealEvidenceAlteredFieldsLlmClient() });
+  deps.detector = {
+    detect() {
+      const base = {
+        event_id: 1,
+        ts: '2026-07-03T10:00:01.000Z',
+        agent_id: 'mt-agent',
+        event: 'tool.end',
+        status: 'ok',
+        duration_ms: 10,
+        span_id: 'span-1',
+        error_code: null,
+        error_message: null,
+        result_summary: 'Same event has both high-risk and non-min candidates.',
+      };
+      return {
+        totalEvents: 1,
+        trimmed: false,
+        candidates: [
+          {
+            ...base,
+            tool_name: 'db.deleteTable',
+            trace_id: 'trace-real',
+            product_id: 'prod-real',
+            category: 'high_risk_permission',
+            reason: 'tool_name matches high-risk pattern',
+            min_severity: 'high',
+          },
+          {
+            ...base,
+            tool_name: 'db.deleteTable',
+            trace_id: 'trace-real',
+            product_id: 'prod-real',
+            category: 'anomalous_call',
+            reason: 'same event also has a non-min rule candidate',
+          },
+        ],
+      };
+    },
+  };
+  const scheduler = createAuditReviewScheduler({ db, ...deps, now: () => new Date('2026-07-03T10:30:00.000Z') });
+
+  const result = await scheduler.runOnce({ triggerType: 'scheduled' });
+
+  assert.equal(result.status, 'completed');
+  const findings = deps.reviewStore.listFindings({ limit: 100 });
+  const ruleBacked = findings.find((f) =>
+    f.category === 'high_risk_permission' &&
+    f.tool_name === 'db.deleteTable' &&
+    f.trace_id === 'trace-real' &&
+    f.product_id === 'prod-real');
+  assert.ok(ruleBacked, 'trusted same-event high-risk candidate should be retained');
+  assert.equal(ruleBacked.severity, 'high');
+  assert.deepEqual(ruleBacked.evidence_event_ids, [1]);
+  const forged = findings.find((f) =>
+    f.category === 'high_risk_permission' &&
+    f.tool_name === 'safe.read' &&
+    f.trace_id === 'trace-forged');
+  assert.equal(forged, undefined, 'same-event non-min candidate must not hide the rule-candidate mismatch');
+
+  db.close();
+});
+
 test('scheduler concurrency: when lock is held, runOnce returns skipped and creates a skipped run', async () => {
   const db = makeDb();
   insertEvent(db, 1, {

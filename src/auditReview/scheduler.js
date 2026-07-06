@@ -46,9 +46,30 @@ function filterEvidenceEventIds(eventIds, evidenceIndex) {
   return filtered;
 }
 
-function ruleCandidatesForEvidenceIds(evidenceIds, candidateIndex) {
+function buildCandidatesByEventId(candidates) {
+  const byEventId = new Map();
+  for (const candidate of candidates) {
+    const bucket = byEventId.get(candidate.event_id) ?? [];
+    bucket.push(candidate);
+    byEventId.set(candidate.event_id, bucket);
+  }
+  return byEventId;
+}
+
+function ruleCandidateKey(candidate) {
+  return [
+    candidate.event_id,
+    candidate.category ?? '',
+    candidate.agent_id ?? '',
+    candidate.tool_name ?? '',
+    candidate.trace_id ?? '',
+    candidate.product_id ?? '',
+  ].join('|');
+}
+
+function ruleCandidatesForEvidenceIds(evidenceIds, candidatesByEventId) {
   return evidenceIds
-    .map((id) => candidateIndex.get(id))
+    .flatMap((id) => candidatesByEventId.get(id) ?? [])
     .filter((candidate) => candidate?.min_severity);
 }
 
@@ -445,7 +466,7 @@ export function createAuditReviewScheduler({
 
       // 6a. Build a structured evidence index keyed by event_id for LLM findings.
       const evidenceIndex = buildEvidenceIndex(candidates.candidates, agentsConfig);
-      const candidateIndex = new Map(candidates.candidates.map((candidate) => [candidate.event_id, candidate]));
+      const candidatesByEventId = buildCandidatesByEventId(candidates.candidates);
 
       // 6b. Persist parse-error findings.
       const parseFindings = parseErrorFindings(
@@ -498,16 +519,16 @@ export function createAuditReviewScheduler({
       // 8. Persist findings.
       let findingsToPersist = [];
       if (llmResult.ok && llmResult.review && Array.isArray(llmResult.review.findings)) {
-        const coveredRuleCandidateIds = new Set();
+        const coveredRuleCandidateKeys = new Set();
         findingsToPersist = llmResult.review.findings.flatMap((f) => {
           const evidenceIds = filterEvidenceEventIds(f.evidence_event_ids, evidenceIndex);
           const evidence = evidenceForEventIds(evidenceIds, evidenceIndex);
-          const ruleCandidates = ruleCandidatesForEvidenceIds(evidenceIds, candidateIndex);
+          const ruleCandidates = ruleCandidatesForEvidenceIds(evidenceIds, candidatesByEventId);
           const matchedRuleCandidates = ruleCandidates.filter((candidate) =>
             findingMatchesCandidateIdentity(f, candidate));
           const minSeverity = ruleMinimumSeverityForCandidates(matchedRuleCandidates);
           for (const candidate of matchedRuleCandidates) {
-            coveredRuleCandidateIds.add(candidate.event_id);
+            coveredRuleCandidateKeys.add(ruleCandidateKey(candidate));
           }
           if (
             f.category === 'high_risk_permission' &&
@@ -538,7 +559,7 @@ export function createAuditReviewScheduler({
           }];
         });
         const uncoveredRuleFindings = candidates.candidates
-          .filter((c) => c.min_severity && !coveredRuleCandidateIds.has(c.event_id))
+          .filter((c) => c.min_severity && !coveredRuleCandidateKeys.has(ruleCandidateKey(c)))
           .map((c) => findingFromCandidate(c, reviewId, riskPolicyVersion, promptVersion, reviewerVersion, agentsConfig));
         findingsToPersist.push(...uncoveredRuleFindings);
       } else {
