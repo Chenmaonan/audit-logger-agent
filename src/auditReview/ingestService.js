@@ -73,6 +73,23 @@ function basename(p) {
   return path.basename(p);
 }
 
+function isSafeSpoolAgentDir(name) {
+  return typeof name === 'string'
+    && name.length > 0
+    && !name.includes('..')
+    && !name.includes('/')
+    && !name.includes('\\')
+    && /^[A-Za-z0-9._-]+$/.test(name);
+}
+
+function resolveSpoolDir(config) {
+  const spoolDir = config.ingest?.spoolDir;
+  if (!spoolDir) return null;
+  if (path.isAbsolute(spoolDir)) return spoolDir;
+  const baseDir = config.rootDir ?? process.cwd();
+  return path.resolve(baseDir, spoolDir);
+}
+
 /**
  * Create the audit ingest service.
  *
@@ -89,6 +106,32 @@ export function createAuditIngestService({ db, config, cursorStore, now = () => 
 
   const dbDir = path.dirname(config.dbPath);
 
+  function ingestSources() {
+    const sources = [];
+    const agents = config.agents || {};
+    for (const [agentId, agentConfig] of Object.entries(agents)) {
+      if (!agentConfig) continue;
+      sources.push({
+        agentId,
+        logDir: path.resolve(dbDir, agentConfig.logDir),
+        pattern: agentConfig.pattern,
+      });
+    }
+
+    const spoolDir = resolveSpoolDir(config);
+    if (spoolDir && fs.existsSync(spoolDir)) {
+      for (const dirent of fs.readdirSync(spoolDir, { withFileTypes: true })) {
+        if (!dirent.isDirectory() || !isSafeSpoolAgentDir(dirent.name)) continue;
+        sources.push({
+          agentId: dirent.name,
+          logDir: path.join(spoolDir, dirent.name),
+          pattern: 'audit-*.jsonl',
+        });
+      }
+    }
+    return sources;
+  }
+
   /**
    * Ingest new audit-log lines for every configured agent.
    *
@@ -103,11 +146,8 @@ export function createAuditIngestService({ db, config, cursorStore, now = () => 
     let cursorUpdates = 0;
     const parseErrors = [];
 
-    const agents = config.agents || {};
-
-    for (const [agentId, agentConfig] of Object.entries(agents)) {
-      if (!agentConfig) continue;
-      const logDir = path.resolve(dbDir, agentConfig.logDir);
+    for (const source of ingestSources()) {
+      const { agentId, logDir, pattern } = source;
       if (!fs.existsSync(logDir)) {
         // Gracefully skip — missing log directory is not a fatal error.
         continue;
@@ -115,7 +155,7 @@ export function createAuditIngestService({ db, config, cursorStore, now = () => 
 
       let files;
       try {
-        files = scanLogFiles(logDir, agentConfig.pattern, sinceDate);
+        files = scanLogFiles(logDir, pattern, sinceDate);
       } catch {
         // scanLogFiles already guards existsSync but be defensive.
         continue;

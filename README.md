@@ -444,6 +444,7 @@ curl -X POST http://127.0.0.1:9320/v1/audit-reviews/run \
 | `GET` | `/report/daily` | 每日报表。 |
 | `GET` | `/report/errors` | 错误报表。 |
 | `GET` | `/report/tools` | 工具使用统计。 |
+| `POST` | `/v1/ingest` | 上游 Agent 主动推送审计日志。 |
 
 `/query` 支持的查询参数与 CLI `query` 基本一致：
 
@@ -456,6 +457,57 @@ agent_id, tool_name, status, event, from, to, trace_id, product_id, channel, lim
 ```text
 http://127.0.0.1:9320/query?status=error&limit=20
 ```
+
+### 上游推送采集
+
+远端 Agent 无法共享本地日志目录时，可以把审计事件推送到服务端：
+
+```bash
+curl -X POST http://127.0.0.1:9320/v1/ingest \
+  -H "Content-Type: application/x-ndjson" \
+  --data-binary @audit-2026-07-06.jsonl
+```
+
+`POST /v1/ingest` 支持两种请求体：
+
+- `Content-Type: application/x-ndjson`：每行一个 JSON 事件。
+- `Content-Type: application/json`：单个事件对象，或 `{ "events": [...] }` 批量事件。
+
+JSON 批量示例：
+
+```json
+{
+  "events": [
+    {
+      "ts": "2026-07-06T07:33:08.200Z",
+      "agent_id": "mt-agent",
+      "trace_id": "trace-001",
+      "span_id": "span-tool-001",
+      "event": "tool.end",
+      "tool_name": "publicTraffic.reportQuery",
+      "status": "ok",
+      "result_summary": "Read public traffic summary"
+    }
+  ]
+}
+```
+
+成功接收后返回 `202`：
+
+```json
+{
+  "accepted": 1,
+  "rejected": 0,
+  "errors": []
+}
+```
+
+已接收的行会追加写入 `data/incoming/<agent_id>/audit-YYYY-MM-DD.jsonl`，
+随后由现有增量采集流程入库，并继续复用 `row_hash` 去重。`agent_id` 只允许
+字母、数字、`.`、`_`、`-`，空值、`..`、`/`、`\` 会被拒绝。请求体大小由
+`ingest.http.maxBodyBytes` 控制，单行或单事件大小由 `ingest.http.maxLineBytes`
+控制。设置 `ingest.http.enabled=false` 可以关闭该 HTTP 推送端点，且不影响本地
+文件扫描。
 
 ### LLM Runtime 接口
 

@@ -35,6 +35,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
 const config = loadAppConfig(rootDir);
 const dbPath = path.resolve(rootDir, config.dbPath);
+const runtimeConfig = { ...config, dbPath, rootDir };
 const db = openDb(dbPath);
 ensureRuntimeSchema(db);
 ensureReviewSchema(db);
@@ -92,7 +93,7 @@ try {
 const reviewStore = createReviewStore(db);
 const lockStore = createLockStore(db);
 const cursorStore = createIngestCursorStore(db);
-const ingestService = createAuditIngestService({ db, config, cursorStore, now: () => new Date() });
+const ingestService = createAuditIngestService({ db, config: runtimeConfig, cursorStore, now: () => new Date() });
 const detector = createCandidateDetector({ db, riskPolicy: config.auditReview?.riskPolicy ?? {} });
 const llmReviewer = createLlmReviewer({
   llmClient,
@@ -137,7 +138,7 @@ if (config.auditReview?.enabled !== false) {
 
 const app = createHttpApp({
   db,
-  config: { ...config, dbPath },
+  config: runtimeConfig,
   runStore,
   runtime,
   scheduler,

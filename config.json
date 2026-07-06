@@ -10,6 +10,14 @@
       "pattern": "audit-*.jsonl"
     }
   },
+  "ingest": {
+    "http": {
+      "enabled": true,
+      "maxBodyBytes": 1048576,
+      "maxLineBytes": 65536
+    },
+    "spoolDir": "data/incoming"
+  },
   "auditReview": {
     "enabled": true,
     "intervalMinutes": 30,

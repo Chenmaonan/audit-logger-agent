@@ -2,6 +2,7 @@
 import http from 'http';
 import { queryEvents, dailySummary, errorReport, toolUsageStats } from '../../../scripts/lib/db.js';
 import { renderDashboard } from '../../auditReview/dashboardTemplate.js';
+import { handleIngestRoute, isHttpIngestEnabled } from './ingestRoute.js';
 
 function json(res, status, data) {
   res.writeHead(status, {
@@ -248,6 +249,11 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
       // ===================== Existing Routes (unchanged) =====================
       if (req.method === 'GET' && url.pathname === '/health') {
         json(res, 200, { status: 'ok', dbPath: config.dbPath });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/v1/ingest' && isHttpIngestEnabled(config)) {
+        await handleIngestRoute(req, res, { config });
         return;
       }
 
