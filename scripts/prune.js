@@ -17,7 +17,13 @@ function parseArgs(argv) {
         opts.dryRun = true;
         break;
       case '--batch-size':
+        if (i + 1 >= argv.length || argv[i + 1].startsWith('-')) {
+          throw new Error('--batch-size requires a positive integer');
+        }
         opts.batchSize = Number(argv[++i]);
+        if (!Number.isInteger(opts.batchSize) || opts.batchSize < 1) {
+          throw new Error('--batch-size requires a positive integer');
+        }
         break;
       default:
         throw new Error(`Unknown argument: ${argv[i]}`);

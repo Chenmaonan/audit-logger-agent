@@ -74,18 +74,6 @@ function isAuditSpoolFile(name) {
   return /^audit-.*\.jsonl$/i.test(name);
 }
 
-function fileEndsWithNewline(filePath, size) {
-  if (size === 0) return true;
-  const fd = fs.openSync(filePath, 'r');
-  try {
-    const buf = Buffer.allocUnsafe(1);
-    fs.readSync(fd, buf, 0, 1, size - 1);
-    return buf[0] === 0x0a;
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
 function cursorByPath(db) {
   const rows = db.prepare(`SELECT agent_id, file_path, file_size_bytes, offset_bytes FROM audit_ingest_cursors`).all();
   const byPath = new Map();
@@ -111,9 +99,10 @@ function listSafeExpiredSpoolFiles({ db, config, cutoffMs }) {
       if (stat.mtimeMs >= cutoffMs) continue;
 
       const cursor = cursors.get(filePath);
-      const cursorComplete = cursor && cursor.offset_bytes >= cursor.file_size_bytes;
-      const newlineComplete = fileEndsWithNewline(filePath, stat.size);
-      if (cursorComplete || newlineComplete) {
+      const cursorComplete = cursor
+        && cursor.file_size_bytes === stat.size
+        && cursor.offset_bytes >= stat.size;
+      if (cursorComplete) {
         files.push(filePath);
       }
     }

@@ -47,6 +47,17 @@ function makeDb() {
   return db;
 }
 
+function makeFileDb(rootDir) {
+  const dbPath = path.join(rootDir, 'data', 'audit.db');
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = OFF');
+  db.exec(AUDIT_EVENTS_SCHEMA);
+  ensureRuntimeSchema(db);
+  ensureReviewSchema(db);
+  return db;
+}
+
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'audit-retention-'));
 }
@@ -297,6 +308,33 @@ test('retention removes safe expired spool files and orphan cursors', () => {
   fs.rmSync(rootDir, { recursive: true, force: true });
 });
 
+test('retention keeps expired newline-complete spool files without completed cursor proof', () => {
+  const rootDir = tmpDir();
+  const spoolAgentDir = path.join(rootDir, 'data', 'incoming', 'agent-a');
+  fs.mkdirSync(spoolAgentDir, { recursive: true });
+  const oldCompleteWithoutCursor = path.join(spoolAgentDir, 'audit-2026-03-01.jsonl');
+  fs.writeFileSync(oldCompleteWithoutCursor, '{"accepted":true}\n');
+  const oldTime = new Date('2026-03-01T00:00:00.000Z');
+  fs.utimesSync(oldCompleteWithoutCursor, oldTime, oldTime);
+
+  const db = makeDb();
+  const cursorStore = createIngestCursorStore(db);
+  const service = createRetentionService({
+    db,
+    config: makeConfig(rootDir),
+    cursorStore,
+    now: () => new Date('2026-07-06T12:00:00.000Z'),
+  });
+
+  const result = service.run();
+
+  assert.equal(result.deleted.spoolFiles, 0);
+  assert.equal(fs.existsSync(oldCompleteWithoutCursor), true);
+
+  db.close();
+  fs.rmSync(rootDir, { recursive: true, force: true });
+});
+
 test('retention dry-run counts cursors that would become orphaned by spool cleanup', () => {
   const rootDir = tmpDir();
   const spoolAgentDir = path.join(rootDir, 'data', 'incoming', 'agent-a');
@@ -347,6 +385,54 @@ test('prune CLI supports dry-run', () => {
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /"dryRun": true/);
   assert.match(result.stdout, /"auditEvents": 0/);
+
+  fs.rmSync(rootDir, { recursive: true, force: true });
+});
+
+test('prune CLI rejects missing batch size before cleanup', () => {
+  const rootDir = tmpDir();
+  fs.writeFileSync(path.join(rootDir, 'config.json'), JSON.stringify(makeConfig(rootDir), null, 2));
+
+  const db = makeFileDb(rootDir);
+  insertEvent(db, 1, '2026-03-01T00:00:00.000Z');
+  db.close();
+
+  const result = spawnSync(process.execPath, ['scripts/prune.js', '--batch-size', '--dry-run'], {
+    cwd: repoRoot,
+    env: { ...process.env, AUDIT_LOGGER_ROOT: rootDir },
+    encoding: 'utf-8',
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--batch-size requires a positive integer/i);
+
+  const verifyDb = new Database(path.join(rootDir, 'data', 'audit.db'));
+  assert.equal(count(verifyDb, 'audit_events'), 1);
+  verifyDb.close();
+
+  fs.rmSync(rootDir, { recursive: true, force: true });
+});
+
+test('prune CLI rejects invalid batch size before cleanup', () => {
+  const rootDir = tmpDir();
+  fs.writeFileSync(path.join(rootDir, 'config.json'), JSON.stringify(makeConfig(rootDir), null, 2));
+
+  const db = makeFileDb(rootDir);
+  insertEvent(db, 1, '2026-03-01T00:00:00.000Z');
+  db.close();
+
+  const result = spawnSync(process.execPath, ['scripts/prune.js', '--batch-size', 'nope', '--dry-run'], {
+    cwd: repoRoot,
+    env: { ...process.env, AUDIT_LOGGER_ROOT: rootDir },
+    encoding: 'utf-8',
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--batch-size requires a positive integer/i);
+
+  const verifyDb = new Database(path.join(rootDir, 'data', 'audit.db'));
+  assert.equal(count(verifyDb, 'audit_events'), 1);
+  verifyDb.close();
 
   fs.rmSync(rootDir, { recursive: true, force: true });
 });
