@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 const DEFAULT_TIMEOUT_MS = 30000;
+const DEFAULT_MAX_CONCURRENCY = 2;
 
 const ENV_API_KEY = 'AUDIT_AGENT_LLM_API_KEY';
 const ENV_BASE_URL = 'AUDIT_AGENT_LLM_BASE_URL';
@@ -45,15 +46,26 @@ function parseTimeout(value) {
   return parsed;
 }
 
+function parseMaxConcurrency(value) {
+  if (value == null || value === '') return DEFAULT_MAX_CONCURRENCY;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`auditReview.llmBudget.maxConcurrency must be a positive number, got ${value}`);
+  }
+  return Math.floor(parsed);
+}
+
 export function loadOpenAIConfig({ env = process.env, appConfig = {}, projectRoot } = {}) {
   const rootDir = projectRoot ?? defaultProjectRoot();
   const projectConfig = readProjectConfig(rootDir);
   const plannerConfig = appConfig.planner ?? {};
+  const llmBudgetConfig = appConfig.auditReview?.llmBudget ?? {};
 
   const apiKey = pick(ENV_API_KEY, [env, projectConfig]);
   const model = pick(ENV_MODEL, [env, projectConfig, plannerConfig]) ?? plannerConfig.model;
   const baseURL = pick(ENV_BASE_URL, [env, projectConfig, plannerConfig]) ?? plannerConfig.baseURL ?? DEFAULT_BASE_URL;
   const timeoutRaw = pick(ENV_TIMEOUT_MS, [env, projectConfig, plannerConfig]) ?? plannerConfig.timeoutMs;
+  const maxConcurrencyRaw = llmBudgetConfig.maxConcurrency;
 
   if (!apiKey) throw new Error(`${ENV_API_KEY} is required (set it in .config or the process environment)`);
   if (!model) throw new Error(`${ENV_MODEL} is required (set it in .config or the process environment)`);
@@ -63,5 +75,6 @@ export function loadOpenAIConfig({ env = process.env, appConfig = {}, projectRoo
     baseURL,
     model,
     timeoutMs: parseTimeout(timeoutRaw),
+    maxConcurrency: parseMaxConcurrency(maxConcurrencyRaw),
   };
 }

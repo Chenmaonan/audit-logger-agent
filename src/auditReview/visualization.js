@@ -314,6 +314,27 @@ function normalizeTraceAnalysis(raw, traceEvents = []) {
   return analysis;
 }
 
+function isFreshAnalysisCache(finding) {
+  if (!finding?.llm_analysis || typeof finding.llm_analysis !== 'object') return false;
+  if (!isPresent(finding.analysis_generated_at)) return false;
+  if (!isPresent(finding.last_seen_at)) return true;
+  const generatedAt = Date.parse(finding.analysis_generated_at);
+  const lastSeenAt = Date.parse(finding.last_seen_at);
+  if (!Number.isFinite(generatedAt)) return false;
+  if (!Number.isFinite(lastSeenAt)) return true;
+  return generatedAt >= lastSeenAt;
+}
+
+function traceAnalysisSection({ analysis, model }) {
+  return {
+    id: 'trace_llm_analysis',
+    title: 'LLM 閾捐矾鍒嗘瀽',
+    type: 'trace_analysis',
+    model,
+    ...analysis,
+  };
+}
+
 function insertSectionAfter(sections, anchorId, section) {
   const anchorIndex = sections.findIndex((item) => item?.id === anchorId);
   const insertIndex = anchorIndex >= 0 ? anchorIndex + 1 : sections.length;
@@ -325,6 +346,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
   const baseUrl = vizConfig.baseUrl ?? 'http://127.0.0.1:9320';
   const dashboardPath = vizConfig.dashboardPath ?? '/dashboard';
   const traceAnalysisModel = model ?? config?.auditReview?.llmReview?.model ?? config?.planner?.model ?? null;
+  const cacheDetailAnalysis = config?.auditReview?.llmBudget?.cacheDetailAnalysis !== false;
 
   function dashboardUrlFor(reviewId) {
     return `${baseUrl}${dashboardPath}/audit-reviews/${encodeURIComponent(reviewId)}`;
@@ -882,6 +904,14 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     const traceEvents = orderedTraceEvents(listTraceEvents(finding.trace_id, 200));
     if (traceEvents.length === 0) return page;
 
+    if (cacheDetailAnalysis && isFreshAnalysisCache(finding)) {
+      insertSectionAfter(page.sections, 'trace_sequence', traceAnalysisSection({
+        analysis: finding.llm_analysis,
+        model: traceAnalysisModel,
+      }));
+      return page;
+    }
+
     try {
       const raw = await llmClient.createStructuredResponse({
         model: traceAnalysisModel,
@@ -889,6 +919,13 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
         schema: traceAnalysisJsonSchema(),
       });
       const analysis = normalizeTraceAnalysis(raw, traceEvents);
+      if (cacheDetailAnalysis) {
+        try {
+          reviewStore.saveFindingAnalysis?.(finding.finding_id, { analysis, generatedAt: nowIso() });
+        } catch {
+          // Cache write failures must not break the detail page.
+        }
+      }
       insertSectionAfter(page.sections, 'trace_sequence', {
         id: 'trace_llm_analysis',
         title: 'LLM 链路分析',

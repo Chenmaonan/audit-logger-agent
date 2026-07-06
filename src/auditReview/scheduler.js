@@ -15,9 +15,40 @@ import { agentDisplayName, buildEvidenceDetail, buildEvidenceIndex, evidenceForE
 
 const LOCK_NAME = 'audit_review_scheduler';
 const LEASE_MINUTES = 10;
+const DEFAULT_LLM_BUDGET = {
+  maxCallsPerDay: 500,
+  maxTokensPerDay: 2000000,
+  maxConcurrency: 2,
+  cacheDetailAnalysis: true,
+};
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function positiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function llmBudgetFromConfig(config) {
+  const raw = config?.auditReview?.llmBudget ?? {};
+  return {
+    maxCallsPerDay: positiveInteger(raw.maxCallsPerDay, DEFAULT_LLM_BUDGET.maxCallsPerDay),
+    maxTokensPerDay: positiveInteger(raw.maxTokensPerDay, DEFAULT_LLM_BUDGET.maxTokensPerDay),
+    maxConcurrency: positiveInteger(raw.maxConcurrency, DEFAULT_LLM_BUDGET.maxConcurrency),
+    cacheDetailAnalysis: raw.cacheDetailAnalysis !== false,
+  };
+}
+
+function estimateTokensForReview({ reviewId, window, candidates }) {
+  const payload = JSON.stringify({ review_id: reviewId, window, candidates: candidates ?? [] });
+  return Math.max(1, Math.ceil(payload.length / 4));
+}
+
+function usageWouldExceedBudget(usage, budget, estimatedTokens) {
+  return (usage.calls + 1) > budget.maxCallsPerDay ||
+    (usage.est_tokens + estimatedTokens) > budget.maxTokensPerDay;
 }
 
 function reviewIdFor(now) {
@@ -264,6 +295,7 @@ export function createAuditReviewScheduler({
   const promptVersion = auditConfig.llmReview?.promptVersion ?? 'audit-review-prompt-v1';
   const reviewerVersion = auditConfig.llmReview?.reviewerVersion ?? 'audit-reviewer-v1';
   const llmModel = llmModelOpt ?? config.planner?.model ?? config.auditReview?.llmReview?.model ?? null;
+  const llmBudget = llmBudgetFromConfig(config);
 
   let intervalTimer = null;
   let refreshTimer = null;
@@ -486,34 +518,53 @@ export function createAuditReviewScheduler({
       }
 
       // 7. LLM review.
-      try {
-        llmResult = await llmReviewer.review({
-          reviewId,
-          window: { from: windowFrom, to: windowTo },
-          candidates: candidates.candidates,
-          reviewStore,
-        });
+      const llmDay = windowTo.slice(0, 10);
+      const estimatedTokens = estimateTokensForReview({
+        reviewId,
+        window: { from: windowFrom, to: windowTo },
+        candidates: candidates.candidates,
+      });
+      const llmUsage = reviewStore.getLlmUsage?.(llmDay) ?? { day: llmDay, calls: 0, est_tokens: 0 };
+      if (usageWouldExceedBudget(llmUsage, llmBudget, estimatedTokens)) {
+        llmResult = { ok: false, degraded: true, error: 'llm_budget_exceeded' };
         logAudit(
-          'review.llm.completed',
-          llmResult.ok ? 'ok' : 'error',
-          llmResult.ok
-            ? `LLM review ok, model=${llmModel}, prompt=${promptVersion}`
-            : `LLM review degraded: ${llmResult.error ?? 'unknown error'}`,
-          'audit.llm',
-        );
-      } catch (err) {
-        llmResult = { ok: false, degraded: true, error: err.message };
-        logAudit(
-          'review.llm.completed',
+          'review.llm.budget_exceeded',
           'error',
-          `LLM review threw: ${err.message}`,
+          `Skipped LLM review: usage calls=${llmUsage.calls}/${llmBudget.maxCallsPerDay}, est_tokens=${llmUsage.est_tokens}/${llmBudget.maxTokensPerDay}, next_est_tokens=${estimatedTokens}.`,
           'audit.llm',
         );
+      } else {
+        try {
+          llmResult = await llmReviewer.review({
+            reviewId,
+            window: { from: windowFrom, to: windowTo },
+            candidates: candidates.candidates,
+            reviewStore,
+          });
+          reviewStore.recordLlmUsage?.({ day: llmDay, calls: 1, estTokens: estimatedTokens });
+          logAudit(
+            'review.llm.completed',
+            llmResult.ok ? 'ok' : 'error',
+            llmResult.ok
+              ? `LLM review ok, model=${llmModel}, prompt=${promptVersion}`
+              : `LLM review degraded: ${llmResult.error ?? 'unknown error'}`,
+            'audit.llm',
+          );
+        } catch (err) {
+          reviewStore.recordLlmUsage?.({ day: llmDay, calls: 1, estTokens: estimatedTokens });
+          llmResult = { ok: false, degraded: true, error: err.message };
+          logAudit(
+            'review.llm.completed',
+            'error',
+            `LLM review threw: ${err.message}`,
+            'audit.llm',
+          );
+        }
       }
 
       if (!llmResult.ok) {
         status = 'completed_degraded';
-        errorCode = 'llm_error';
+        errorCode = llmResult.error === 'llm_budget_exceeded' ? 'llm_budget_exceeded' : 'llm_error';
       }
 
       // 8. Persist findings.

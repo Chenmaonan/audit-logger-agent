@@ -285,8 +285,8 @@ function makeFakeRealEvidenceAlteredFieldsLlmClient() {
 // Inline real outbox store to keep tests self-contained.
 import { createOutboxStore } from '../../src/agent/outboxStore.js';
 
-function buildRealDeps(db, { llmClient } = {}) {
-  const config = makeConfig();
+function buildRealDeps(db, { llmClient, configOverrides } = {}) {
+  const config = makeConfig(configOverrides);
   const reviewStore = createReviewStore(db);
   const lockStore = createLockStore(db);
   const cursorStore = createIngestCursorStore(db);
@@ -391,6 +391,53 @@ test('scheduler.runOnce with LLM failing: status completed_degraded, still inser
   const auditRows = db.prepare(`SELECT * FROM audit_events WHERE agent_id = 'audit-logger-agent' AND event = 'review.llm.completed'`).all();
   assert.ok(auditRows.length > 0, 'should log review.llm.completed');
   assert.equal(auditRows[0].status, 'error');
+
+  db.close();
+});
+
+test('scheduler skips LLM and runs degraded when daily call budget is exhausted', async () => {
+  const db = makeDb();
+  insertEvent(db, 1, {
+    ts: '2026-07-03T10:00:01.000Z',
+    tool_name: 'some.query',
+    status: 'error',
+    error_code: 'boom',
+    event: 'tool.end',
+  });
+
+  let llmCalls = 0;
+  const deps = buildRealDeps(db, {
+    configOverrides: {
+      llmBudget: {
+        maxCallsPerDay: 1,
+        maxTokensPerDay: 2000000,
+        maxConcurrency: 2,
+        cacheDetailAnalysis: true,
+      },
+    },
+    llmClient: {
+      async createStructuredResponse() {
+        llmCalls += 1;
+        return makeFakeLlmClient().createStructuredResponse();
+      },
+    },
+  });
+  deps.reviewStore.recordLlmUsage({ day: '2026-07-03', calls: 1, estTokens: 100 });
+  const scheduler = createAuditReviewScheduler({ db, ...deps, now: () => new Date('2026-07-03T10:30:00.000Z') });
+
+  const result = await scheduler.runOnce({ triggerType: 'scheduled' });
+
+  assert.equal(result.status, 'completed_degraded');
+  assert.equal(llmCalls, 0);
+  const run = deps.reviewStore.getRun(result.reviewId);
+  assert.equal(run.error_code, 'llm_budget_exceeded');
+  const usage = deps.reviewStore.getLlmUsage('2026-07-03');
+  assert.deepEqual(usage, { day: '2026-07-03', calls: 1, est_tokens: 100 });
+  const auditRows = db.prepare(`
+    SELECT * FROM audit_events
+    WHERE agent_id = 'audit-logger-agent' AND event = 'review.llm.budget_exceeded'
+  `).all();
+  assert.equal(auditRows.length, 1);
 
   db.close();
 });

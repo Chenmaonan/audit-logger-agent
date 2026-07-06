@@ -53,6 +53,7 @@ const llmClient = createOpenAIResponsesClient({
   apiKey: openAIConfig.apiKey,
   baseURL: openAIConfig.baseURL,
   timeoutMs: openAIConfig.timeoutMs,
+  maxConcurrency: openAIConfig.maxConcurrency,
 });
 
 const planner = createPlanner({

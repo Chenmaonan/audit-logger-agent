@@ -68,6 +68,12 @@
       "promptVersion": "audit-review-prompt-v1",
       "reviewerVersion": "audit-reviewer-v1"
     },
+    "llmBudget": {
+      "maxCallsPerDay": 500,
+      "maxTokensPerDay": 2000000,
+      "maxConcurrency": 2,
+      "cacheDetailAnalysis": true
+    },
     "visualization": {
       "enabled": true,
       "baseUrl": "http://127.0.0.1:9320",

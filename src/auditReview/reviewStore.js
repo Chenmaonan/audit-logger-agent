@@ -39,12 +39,13 @@ function parseJson(value, fallback) {
  */
 function hydrateFinding(row) {
   if (!row) return null;
-  const { confidence, evidence_event_ids_json, evidence_json, ...rest } = row;
+  const { confidence, evidence_event_ids_json, evidence_json, llm_analysis_json, ...rest } = row;
   void confidence;
   return {
     ...rest,
     evidence_event_ids: parseJson(evidence_event_ids_json, []),
     evidence: parseJson(evidence_json, []),
+    llm_analysis: parseJson(llm_analysis_json, null),
   };
 }
 
@@ -105,6 +106,7 @@ export function createReviewStore(db) {
       status, occurrence_count, created_at, last_seen_at,
       last_notified_at, resolved_at, snoozed_until,
       acknowledged_at, acknowledged_by,
+      llm_analysis_json, analysis_generated_at,
       risk_policy_version, prompt_version, reviewer_version
     ) VALUES (
       @finding_id, @review_id, @finding_hash, @category, @severity,
@@ -114,6 +116,7 @@ export function createReviewStore(db) {
       @status, @occurrence_count, @created_at, @last_seen_at,
       @last_notified_at, @resolved_at, @snoozed_until,
       @acknowledged_at, @acknowledged_by,
+      NULL, NULL,
       @risk_policy_version, @prompt_version, @reviewer_version
     )
   `);
@@ -123,11 +126,20 @@ export function createReviewStore(db) {
     SET severity = @severity,
         occurrence_count = occurrence_count + 1,
         last_seen_at = @last_seen_at,
-        last_notified_at = CASE WHEN @clear_notified = 1 THEN NULL ELSE last_notified_at END
+        last_notified_at = CASE WHEN @clear_notified = 1 THEN NULL ELSE last_notified_at END,
+        llm_analysis_json = NULL,
+        analysis_generated_at = NULL
     WHERE finding_hash = @finding_hash
   `);
 
   const getFindingStmt = db.prepare(`SELECT * FROM audit_review_findings WHERE finding_id = ?`);
+
+  const saveFindingAnalysisStmt = db.prepare(`
+    UPDATE audit_review_findings
+    SET llm_analysis_json = @llm_analysis_json,
+        analysis_generated_at = @analysis_generated_at
+    WHERE finding_id = @finding_id
+  `);
 
   const updateFindingStmt = db.prepare(`
     UPDATE audit_review_findings SET
@@ -138,6 +150,16 @@ export function createReviewStore(db) {
       resolved_at = COALESCE(@resolved_at, resolved_at),
       last_notified_at = COALESCE(@last_notified_at, last_notified_at)
     WHERE finding_id = @finding_id
+  `);
+
+  const getLlmUsageStmt = db.prepare(`SELECT day, calls, est_tokens FROM audit_llm_usage WHERE day = ?`);
+  const recordLlmUsageStmt = db.prepare(`
+    INSERT INTO audit_llm_usage (day, calls, est_tokens, updated_at)
+    VALUES (@day, @calls, @est_tokens, @updated_at)
+    ON CONFLICT(day) DO UPDATE SET
+      calls = calls + excluded.calls,
+      est_tokens = est_tokens + excluded.est_tokens,
+      updated_at = excluded.updated_at
   `);
 
   let deadLetterCountStmt = null;
@@ -301,6 +323,15 @@ export function createReviewStore(db) {
       return hydrateFinding(getFindingStmt.get(findingId) ?? null);
     },
 
+    saveFindingAnalysis(findingId, { analysis, generatedAt = nowIso() } = {}) {
+      saveFindingAnalysisStmt.run({
+        finding_id: findingId,
+        llm_analysis_json: JSON.stringify(analysis ?? null),
+        analysis_generated_at: generatedAt,
+      });
+      return hydrateFinding(getFindingStmt.get(findingId) ?? null);
+    },
+
     listFindings({ limit = 100, offset = 0, severity, category, agentId, toolName, status, reviewId } = {}) {
       const conditions = [];
       const params = { limit, offset };
@@ -357,6 +388,24 @@ export function createReviewStore(db) {
     listDeadLetterCount() {
       const row = getDeadLetterCountStmt().get();
       return row ? row.count : 0;
+    },
+
+    getLlmUsage(day) {
+      const key = String(day);
+      return getLlmUsageStmt.get(key) ?? { day: key, calls: 0, est_tokens: 0 };
+    },
+
+    recordLlmUsage({ day, calls = 1, estTokens = 0 } = {}) {
+      const key = String(day);
+      const safeCalls = Number.isFinite(Number(calls)) ? Math.max(0, Math.floor(Number(calls))) : 0;
+      const safeTokens = Number.isFinite(Number(estTokens)) ? Math.max(0, Math.floor(Number(estTokens))) : 0;
+      recordLlmUsageStmt.run({
+        day: key,
+        calls: safeCalls,
+        est_tokens: safeTokens,
+        updated_at: nowIso(),
+      });
+      return this.getLlmUsage(key);
     },
   };
 }
