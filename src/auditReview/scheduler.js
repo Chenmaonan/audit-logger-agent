@@ -46,29 +46,13 @@ function filterEvidenceEventIds(eventIds, evidenceIndex) {
   return filtered;
 }
 
-function sameNullable(a, b) {
-  return (a ?? null) === (b ?? null);
-}
-
-function ruleMinimumSeverityForFinding(finding, evidenceIds, candidateIndex, candidates) {
-  const floors = [];
+function ruleMinimumSeverityForEvidenceIds(evidenceIds, candidateIndex) {
+  let floor = null;
   for (const id of evidenceIds) {
     const candidate = candidateIndex.get(id);
-    if (candidate?.min_severity) floors.push(candidate.min_severity);
+    if (candidate?.min_severity) floor = maxSeverity(floor, candidate.min_severity);
   }
-  for (const candidate of candidates) {
-    if (
-      candidate.min_severity &&
-      candidate.category === finding.category &&
-      sameNullable(candidate.agent_id, finding.agent_id) &&
-      sameNullable(candidate.tool_name, finding.tool_name) &&
-      sameNullable(candidate.trace_id, finding.trace_id) &&
-      sameNullable(candidate.product_id, finding.product_id)
-    ) {
-      floors.push(candidate.min_severity);
-    }
-  }
-  return floors.reduce((max, severity) => maxSeverity(max, severity), null);
+  return floor;
 }
 
 /**
@@ -497,11 +481,18 @@ export function createAuditReviewScheduler({
       // 8. Persist findings.
       let findingsToPersist = [];
       if (llmResult.ok && llmResult.review && Array.isArray(llmResult.review.findings)) {
-        findingsToPersist = llmResult.review.findings.map((f) => {
+        const coveredRuleCandidateIds = new Set();
+        findingsToPersist = llmResult.review.findings.flatMap((f) => {
           const evidenceIds = filterEvidenceEventIds(f.evidence_event_ids, evidenceIndex);
           const evidence = evidenceForEventIds(evidenceIds, evidenceIndex);
-          const minSeverity = ruleMinimumSeverityForFinding(f, evidenceIds, candidateIndex, candidates.candidates);
-          return {
+          const minSeverity = ruleMinimumSeverityForEvidenceIds(evidenceIds, candidateIndex);
+          for (const id of evidenceIds) {
+            if (candidateIndex.get(id)?.min_severity) coveredRuleCandidateIds.add(id);
+          }
+          if (f.category === 'high_risk_permission' && evidenceIds.length === 0) {
+            return [];
+          }
+          return [{
             finding_id: `finding_${crypto.randomUUID()}`,
             review_id: reviewId,
             category: f.category,
@@ -521,8 +512,12 @@ export function createAuditReviewScheduler({
             risk_policy_version: riskPolicyVersion,
             prompt_version: promptVersion,
             reviewer_version: reviewerVersion,
-          };
+          }];
         });
+        const uncoveredRuleFindings = candidates.candidates
+          .filter((c) => c.min_severity && !coveredRuleCandidateIds.has(c.event_id))
+          .map((c) => findingFromCandidate(c, reviewId, riskPolicyVersion, promptVersion, reviewerVersion, agentsConfig));
+        findingsToPersist.push(...uncoveredRuleFindings);
       } else {
         // Degraded mode: convert each candidate to a basic finding.
         findingsToPersist = candidates.candidates.map((c) =>
