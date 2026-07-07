@@ -11,8 +11,8 @@ const EVIDENCE_FIELDS = [
   'duration_ms',
   'trace_id',
   'span_id',
-  'product_id',
-  'error_code',
+  'entity_type',
+  'entity_id',
   'error_message',
   'result_summary',
 ];
@@ -55,8 +55,8 @@ function makeCandidate(row, category, reason, extras = {}) {
     duration_ms: row.duration_ms,
     trace_id: row.trace_id,
     span_id: row.span_id,
-    product_id: row.product_id,
-    error_code: row.error_code,
+    entity_type: row.entity_type,
+    entity_id: row.entity_id,
     error_message: row.error_message,
     result_summary: row.result_summary,
     category,
@@ -77,8 +77,8 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
 
   const selectSql = `
     SELECT id, ts, agent_id, trace_id, span_id, parent_span_id, event, tool_name,
-           status, result_summary, duration_ms, channel, user_id, product_id,
-           error_code, error_message
+           status, result_summary, duration_ms, channel, user_id, entity_type,
+           entity_id, error_message
     FROM audit_events
     WHERE ts >= @from AND ts <= @to
     ORDER BY ts ASC
@@ -111,7 +111,7 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
     for (const row of rows) {
       const tsMs = toEpochMs(row.ts);
       if (tsMs == null) continue;
-      const key = `${row.agent_id}|${row.tool_name}|${row.product_id ?? ''}`;
+      const key = `${row.agent_id}|${row.tool_name}|${row.entity_type ?? ''}|${row.entity_id ?? ''}`;
       const bucket = repeatBuckets.get(key) ?? [];
       // Drop timestamps older than (tsMs - repeatWindowMs).
       const cutoff = tsMs - repeatWindowMs;
@@ -131,7 +131,7 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
             makeCandidate(
               anchor,
               'repeated_call',
-              `${kept.length} calls to same agent/tool/product within ${Math.round(repeatWindowMs / 60000)} min window`,
+              `${kept.length} calls to same agent/tool/entity within ${Math.round(repeatWindowMs / 60000)} min window`,
             ),
           );
         }
@@ -143,7 +143,7 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
     // We allow the same event_id to appear under multiple categories (e.g., a slow high-risk call).
     for (const row of rows) {
       // 1. failed_call
-      if (row.status === 'error' || row.status === 'timeout' || row.status === 'cancelled') {
+      if (row.status !== 'OK') {
         candidates.push(
           makeCandidate(row, 'failed_call', `status=${row.status}`),
         );

@@ -28,9 +28,12 @@ export function buildEvidenceDetail(event, config = {}) {
       event: event.event ?? null,
       status: event.status ?? null,
       duration_ms: event.duration_ms ?? null,
-      product_id: event.product_id ?? null,
+      entity: event.entity ?? (
+        event.entity_type || event.entity_id
+          ? { type: event.entity_type ?? null, id: event.entity_id ?? null }
+          : null
+      ),
       result_summary: event.result_summary ?? null,
-      error_code: event.error_code ?? null,
       error_message: event.error_message ?? null,
       reason: event.reason ?? null,
     },

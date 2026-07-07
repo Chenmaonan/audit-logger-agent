@@ -60,7 +60,14 @@ export function validateReview(review) {
     if (!isString(f.agent_id) && f.agent_id != null) return invalid(`${ctx}.agent_id must be a string or null/omitted`);
     if (!isString(f.tool_name) && f.tool_name != null) return invalid(`${ctx}.tool_name must be a string or null/omitted`);
     if (!isString(f.trace_id) && f.trace_id != null) return invalid(`${ctx}.trace_id must be a string or null/omitted`);
-    if (!isString(f.product_id) && f.product_id != null) return invalid(`${ctx}.product_id must be a string or null/omitted`);
+    if (Object.prototype.hasOwnProperty.call(f, 'product_id')) {
+      return invalid(`${ctx}.product_id has been removed; use entity`);
+    }
+    if (f.entity != null) {
+      if (typeof f.entity !== 'object' || Array.isArray(f.entity)) return invalid(`${ctx}.entity must be an object or null/omitted`);
+      if (!isString(f.entity.type) || f.entity.type.trim() === '') return invalid(`${ctx}.entity.type is required`);
+      if (!isString(f.entity.id) || f.entity.id.trim() === '') return invalid(`${ctx}.entity.id is required`);
+    }
 
     if (!isString(f.title) || f.title.length > MAX_TEXT_LEN) return invalid(`${ctx}.title is required and must be <= 300 chars`);
     if (!isString(f.summary) || f.summary.length > MAX_TEXT_LEN) return invalid(`${ctx}.summary is required and must be <= 300 chars`);
@@ -129,7 +136,15 @@ export function reviewJsonSchema() {
               agent_id: { type: ['string', 'null'] },
               tool_name: { type: ['string', 'null'] },
               trace_id: { type: ['string', 'null'] },
-              product_id: { type: ['string', 'null'] },
+              entity: {
+                type: ['object', 'null'],
+                additionalProperties: false,
+                properties: {
+                  type: { type: 'string' },
+                  id: { type: 'string' },
+                },
+                required: ['type', 'id'],
+              },
               title: { type: 'string', maxLength: MAX_TEXT_LEN },
               summary: { type: 'string', maxLength: MAX_TEXT_LEN },
               recommendation: { type: 'string', maxLength: MAX_TEXT_LEN },
@@ -142,7 +157,7 @@ export function reviewJsonSchema() {
               'agent_id',
               'tool_name',
               'trace_id',
-              'product_id',
+              'entity',
               'title',
               'summary',
               'recommendation',

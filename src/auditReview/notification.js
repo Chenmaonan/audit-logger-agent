@@ -76,7 +76,11 @@ export function buildFindingPayload({ finding, reviewId, run, dashboardUrl }) {
     agent_name: finding.agent_name ?? finding.evidence?.[0]?.agent_name ?? finding.agent_id,
     tool_name: finding.tool_name,
     trace_id: finding.trace_id,
-    product_id: finding.product_id,
+    entity: finding.entity ?? (
+      finding.entity_type || finding.entity_id
+        ? { type: finding.entity_type ?? null, id: finding.entity_id ?? null }
+        : null
+    ),
     evidence: Array.isArray(finding.evidence) ? finding.evidence.slice(0, 5) : [],
     dashboard_url: dashboardUrl,
     window: { from: windowFrom, to: windowTo },

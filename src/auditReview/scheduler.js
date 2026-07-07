@@ -1,4 +1,4 @@
-// src/auditReview/scheduler.js
+﻿// src/auditReview/scheduler.js
 //
 // Audit review orchestration scheduler for v1.4.
 // See v1.4 PERIODIC_LLM_AUDIT_REVIEW_DESIGN.md sections 4, 9.5, 12.5, 14.
@@ -31,6 +31,14 @@ function reviewIdFor(now) {
 }
 
 const SEVERITY_RANK = { low: 1, medium: 2, high: 3, critical: 4 };
+
+function entityTypeOf(value) {
+  return value?.entity?.type ?? value?.entity_type ?? null;
+}
+
+function entityIdOf(value) {
+  return value?.entity?.id ?? value?.entity_id ?? null;
+}
 
 function maxSeverity(...severities) {
   return severities
@@ -68,7 +76,8 @@ function ruleCandidateKey(candidate) {
     candidate.agent_id ?? '',
     candidate.tool_name ?? '',
     candidate.trace_id ?? '',
-    candidate.product_id ?? '',
+    entityTypeOf(candidate) ?? '',
+    entityIdOf(candidate) ?? '',
   ].join('|');
 }
 
@@ -95,7 +104,8 @@ function findingMatchesCandidateIdentity(finding, candidate) {
     sameNullable(candidate.agent_id, finding.agent_id) &&
     sameNullable(candidate.tool_name, finding.tool_name) &&
     sameNullable(candidate.trace_id, finding.trace_id) &&
-    sameNullable(candidate.product_id, finding.product_id);
+    sameNullable(entityTypeOf(candidate), entityTypeOf(finding)) &&
+    sameNullable(entityIdOf(candidate), entityIdOf(finding));
 }
 
 /**
@@ -125,7 +135,11 @@ function findingFromCandidate(candidate, reviewId, riskPolicyVersion, promptVers
     agent_id: candidate.agent_id,
     tool_name: candidate.tool_name,
     trace_id: candidate.trace_id,
-    product_id: candidate.product_id,
+    entity: entityTypeOf(candidate) || entityIdOf(candidate)
+      ? { type: entityTypeOf(candidate), id: entityIdOf(candidate) }
+      : null,
+    entity_type: entityTypeOf(candidate),
+    entity_id: entityIdOf(candidate),
     title: candidate.reason ?? candidate.category,
     summary: candidate.reason ?? candidate.category,
     recommendation: '',
@@ -133,13 +147,12 @@ function findingFromCandidate(candidate, reviewId, riskPolicyVersion, promptVers
     evidence_event_ids: [candidate.event_id],
     evidence_event_ids_json: JSON.stringify([candidate.event_id]),
     evidence_json: JSON.stringify(evidence),
-    normalized_error_code: candidate.error_code ?? null,
+    normalized_error_code: null,
     risk_policy_version: riskPolicyVersion,
     prompt_version: promptVersion,
     reviewer_version: reviewerVersion,
   };
 }
-
 /**
  * Build a degraded-mode review object from candidates, mirroring the LLM output contract
  * (design 6.7) just enough for the notifier to build a summary payload.
@@ -155,8 +168,8 @@ function degradedReview({ reviewId, window, candidates }) {
     review_id: reviewId,
     window,
     summary: {
-      title: 'LLM 审查失败，本轮仅包含规则检测结果',
-      overview: `LLM 审查不可用，已基于 ${candidates.length} 条候选事件生成规则层 findings。`,
+      title: 'LLM review unavailable; rule-based findings only',
+      overview: `LLM review unavailable; generated rule-based findings from ${candidates.length} candidate event(s).`,
       severity_counts: severityCounts,
     },
     findings: candidates.map((c) => ({
@@ -165,7 +178,9 @@ function degradedReview({ reviewId, window, candidates }) {
       agent_id: c.agent_id,
       tool_name: c.tool_name,
       trace_id: c.trace_id,
-      product_id: c.product_id,
+      entity: entityTypeOf(c) || entityIdOf(c)
+        ? { type: entityTypeOf(c), id: entityIdOf(c) }
+        : null,
       title: c.reason ?? c.category,
       summary: c.reason ?? c.category,
       recommendation: '',
@@ -212,10 +227,12 @@ function parseErrorFindings(parseErrors, reviewId, riskPolicyVersion, reviewerVe
       agent_id: agentId,
       tool_name: 'audit.ingest',
       trace_id: null,
-      product_id: null,
-      title: '日志解析失败',
-      summary: `${errors.length} 条解析错误，涉及 ${uniqueFiles.size} 个文件。样例: ${samples.join('; ')}`,
-      recommendation: '检查日志格式是否符合 agent-audit-log v1.0 规范',
+      entity: null,
+      entity_type: null,
+      entity_id: null,
+      title: '鏃ュ織瑙ｆ瀽澶辫触',
+      summary: `${errors.length} 鏉¤В鏋愰敊璇紝娑夊強 ${uniqueFiles.size} 涓枃浠躲€傛牱渚? ${samples.join('; ')}`,
+      recommendation: '妫€鏌ユ棩蹇楁牸寮忔槸鍚︾鍚?agent-audit-log v1.0 瑙勮寖',
       requires_action: 0,
       evidence_event_ids: [],
       evidence_event_ids_json: '[]',
@@ -325,14 +342,14 @@ export function createAuditReviewScheduler({
       }
       logAudit(
         'review.recovered',
-        'ok',
+        'OK',
         `Recovered ${recoveredCount} stale run(s), released ${expiredLocks.length} expired lock(s).`,
         'audit.review.recovery',
       );
     } catch (error) {
       logAudit(
         'review.recovered',
-        'error',
+        'INTERNAL',
         `Recovery failed: ${error.message}`,
         'audit.review.recovery',
       );
@@ -349,7 +366,7 @@ export function createAuditReviewScheduler({
     // 1. Acquire lease lock.
     const acquired = lockStore.acquire({ lockName: LOCK_NAME, ownerId, leaseMinutes: LEASE_MINUTES });
     if (!acquired.acquired) {
-      // Another run holds the lease — record a skipped run and return.
+      // Another run holds the lease 鈥?record a skipped run and return.
       const reviewId = reviewIdFor(now());
       reviewStore.createRun({
         reviewId,
@@ -365,7 +382,7 @@ export function createAuditReviewScheduler({
       reviewStore.finishRun(reviewId, { status: 'skipped' });
       logAudit(
         'review.lock.skipped',
-        'ok',
+        'OK',
         `Skipped review ${reviewId}: lock held by ${acquired.currentOwner ?? 'another owner'}.`,
       );
       return { reviewId, status: 'skipped' };
@@ -393,7 +410,7 @@ export function createAuditReviewScheduler({
     });
     logAudit(
       'review.start',
-      'ok',
+      'OK',
       `Started review ${reviewId} window=${windowFrom}..${windowTo} trigger=${triggerType}`,
     );
 
@@ -420,14 +437,14 @@ export function createAuditReviewScheduler({
         ingestResult = ingestService.ingestSince({ sinceDate, reviewId });
         logAudit(
           'review.ingest.completed',
-          'ok',
+          'OK',
           `Ingest: scanned=${ingestResult.scannedFiles}, inserted=${ingestResult.inserted}, parseErrors=${ingestResult.parseErrors.length}`,
           'audit.ingest',
         );
       } catch (err) {
         logAudit(
           'review.ingest.completed',
-          'error',
+          'INTERNAL',
           `Ingest failed: ${err.message}`,
           'audit.ingest',
         );
@@ -443,7 +460,7 @@ export function createAuditReviewScheduler({
         });
         logAudit(
           'review.completed',
-          'error',
+          'INTERNAL',
           `Review ${reviewId} failed during ingest: ${err.message}`,
         );
         clearRefreshTimer();
@@ -456,14 +473,14 @@ export function createAuditReviewScheduler({
         candidates = detector.detect({ windowFrom, windowTo, maxEventsPerReview });
         logAudit(
           'review.detector.completed',
-          'ok',
+          'OK',
           `Detector: ${candidates.candidates.length} candidates from ${candidates.totalEvents} events.`,
           'audit.detector',
         );
       } catch (err) {
         logAudit(
           'review.detector.completed',
-          'error',
+          'INTERNAL',
           `Detector failed: ${err.message}`,
           'audit.detector',
         );
@@ -503,7 +520,7 @@ export function createAuditReviewScheduler({
         llmResult = { ok: false, degraded: true, error: 'llm_budget_exceeded' };
         logAudit(
           'review.llm.budget_exceeded',
-          'error',
+          'INTERNAL',
           `Skipped LLM review: usage calls=${llmUsage.calls}/${llmBudget.maxCallsPerDay}, est_tokens=${llmUsage.est_tokens}/${llmBudget.maxTokensPerDay}, next_est_tokens=${estimatedTokens}.`,
           'audit.llm',
         );
@@ -518,7 +535,7 @@ export function createAuditReviewScheduler({
           reviewStore.recordLlmUsage?.({ day: llmDay, calls: 1, estTokens: estimatedTokens });
           logAudit(
             'review.llm.completed',
-            llmResult.ok ? 'ok' : 'error',
+            llmResult.ok ? 'OK' : 'INTERNAL',
             llmResult.ok
               ? `LLM review ok, model=${llmModel}, prompt=${promptVersion}`
               : `LLM review degraded: ${llmResult.error ?? 'unknown error'}`,
@@ -529,7 +546,7 @@ export function createAuditReviewScheduler({
           llmResult = { ok: false, degraded: true, error: err.message };
           logAudit(
             'review.llm.completed',
-            'error',
+            'INTERNAL',
             `LLM review threw: ${err.message}`,
             'audit.llm',
           );
@@ -569,7 +586,9 @@ export function createAuditReviewScheduler({
             agent_id: f.agent_id,
             tool_name: f.tool_name,
             trace_id: f.trace_id,
-            product_id: f.product_id,
+            entity: f.entity ?? null,
+            entity_type: f.entity?.type ?? null,
+            entity_id: f.entity?.id ?? null,
             title: f.title,
             summary: f.summary,
             recommendation: f.recommendation,
@@ -577,7 +596,7 @@ export function createAuditReviewScheduler({
             evidence_event_ids: evidenceIds,
             evidence_event_ids_json: JSON.stringify(evidenceIds),
             evidence_json: JSON.stringify(evidence),
-            normalized_error_code: f.error_code ?? null,
+            normalized_error_code: null,
             risk_policy_version: riskPolicyVersion,
             prompt_version: promptVersion,
             reviewer_version: reviewerVersion,
@@ -613,13 +632,14 @@ export function createAuditReviewScheduler({
         // the earliest review_id on a re-observed finding, so filtering by this
         // run's review_id would miss rows that were merged into an earlier run.
         const persistedRows = reviewStore.listFindings({ limit: 1000 });
-        // Match by category+agent+tool+trace+product (the hash inputs) to find the DB row.
+        // Match by category+agent+tool+trace+entity (the hash inputs) to find the DB row.
         const matchRow = (f) => persistedRows.find((row) =>
           row.category === f.category &&
           (row.agent_id ?? null) === (f.agent_id ?? null) &&
           (row.tool_name ?? null) === (f.tool_name ?? null) &&
           (row.trace_id ?? null) === (f.trace_id ?? null) &&
-          (row.product_id ?? null) === (f.product_id ?? null));
+          (row.entity_type ?? null) === entityTypeOf(f) &&
+          (row.entity_id ?? null) === entityIdOf(f));
         const baseReview = llmResult.ok
           ? llmResult.review
           : degradedReview({ reviewId, window: { from: windowFrom, to: windowTo }, candidates: candidates.candidates });
@@ -644,14 +664,14 @@ export function createAuditReviewScheduler({
         }
         logAudit(
           'review.notification.enqueued',
-          'ok',
+          'OK',
           `Notifications enqueued for review ${reviewId}.`,
           'audit.notify',
         );
       } catch (err) {
         logAudit(
           'review.notification.enqueued',
-          'error',
+          'INTERNAL',
           `Notification enqueue failed: ${err.message}`,
           'audit.notify',
         );
@@ -670,7 +690,7 @@ export function createAuditReviewScheduler({
       });
       logAudit(
         'review.completed',
-        status === 'completed' ? 'ok' : 'error',
+        status === 'completed' ? 'OK' : 'INTERNAL',
         `Review ${reviewId} finished with status=${status}, findings=${findingCount}.`,
       );
       return { reviewId, status };
@@ -695,7 +715,7 @@ export function createAuditReviewScheduler({
       }
       logAudit(
         'review.completed',
-        'error',
+        'INTERNAL',
         `Review ${reviewId} failed unexpectedly: ${err.message}`,
       );
       return { reviewId, status: 'failed' };

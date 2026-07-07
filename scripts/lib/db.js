@@ -18,8 +18,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
   duration_ms INTEGER,
   channel TEXT,
   user_id TEXT,
-  product_id TEXT,
-  error_code TEXT,
+  entity_type TEXT,
+  entity_id TEXT,
+  llm_intent_json TEXT,
   error_message TEXT,
   tags TEXT,
   raw_json TEXT
@@ -31,7 +32,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_tool ON audit_events(tool_name);
 CREATE INDEX IF NOT EXISTS idx_audit_trace ON audit_events(trace_id);
 CREATE INDEX IF NOT EXISTS idx_audit_span ON audit_events(span_id);
 CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_events(status);
-CREATE INDEX IF NOT EXISTS idx_audit_product ON audit_events(product_id);
+CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_events(entity_type, entity_id);
 `;
 
 import crypto from 'crypto';
@@ -96,26 +97,58 @@ export function openDb(dbPath) {
   db.pragma('cache_size = -8000');
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
+  migrateAuditEvents(db);
   return db;
+}
+
+function columnExists(db, table, column) {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all();
+  return rows.some((row) => row.name === column);
+}
+
+function tableExists(db, table) {
+  return db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(table) != null;
+}
+
+function addColumnIfMissing(db, table, column, definition) {
+  if (!tableExists(db, table)) return;
+  if (!columnExists(db, table, column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
+  }
+}
+
+function migrateAuditEvents(db) {
+  addColumnIfMissing(db, 'audit_events', 'entity_type', 'TEXT');
+  addColumnIfMissing(db, 'audit_events', 'entity_id', 'TEXT');
+  addColumnIfMissing(db, 'audit_events', 'llm_intent_json', 'TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_events(entity_type, entity_id);');
 }
 
 export function insertEvents(db, events) {
   const stmt = db.prepare(`
     INSERT OR IGNORE INTO audit_events
       (row_hash, ts, agent_id, trace_id, span_id, parent_span_id, event, tool_name, status,
-       result_summary, duration_ms, channel, user_id, product_id,
-       error_code, error_message, tags, raw_json)
+       result_summary, duration_ms, channel, user_id, entity_type, entity_id,
+       llm_intent_json, error_message, tags, raw_json)
     VALUES
       (@row_hash, @ts, @agent_id, @trace_id, @span_id, @parent_span_id, @event, @tool_name, @status,
-       @result_summary, @duration_ms, @channel, @user_id, @product_id,
-       @error_code, @error_message, @tags, @raw_json)
+       @result_summary, @duration_ms, @channel, @user_id, @entity_type, @entity_id,
+       @llm_intent_json, @error_message, @tags, @raw_json)
   `);
 
   const insertMany = db.transaction((rows) => {
     let count = 0;
     for (const row of rows) {
       const rowHash = hashRow(row.raw_json);
-      const info = stmt.run({ ...row, row_hash: rowHash });
+      const info = stmt.run({
+        entity_type: null,
+        entity_id: null,
+        llm_intent_json: null,
+        error_message: null,
+        tags: null,
+        ...row,
+        row_hash: rowHash,
+      });
       if (info.changes > 0) count++;
     }
     return count;
@@ -160,9 +193,13 @@ export function queryEvents(db, filters = {}, options = {}) {
     conditions.push('trace_id = @trace_id');
     params.trace_id = filters.trace_id;
   }
-  if (filters.product_id) {
-    conditions.push('product_id = @product_id');
-    params.product_id = filters.product_id;
+  if (filters.entity_type) {
+    conditions.push('entity_type = @entity_type');
+    params.entity_type = filters.entity_type;
+  }
+  if (filters.entity_id) {
+    conditions.push('entity_id = @entity_id');
+    params.entity_id = filters.entity_id;
   }
   if (filters.channel) {
     conditions.push('channel = @channel');
@@ -198,11 +235,11 @@ export function dailySummary(db, date, agentId, options = {}) {
 }
 
 export function errorReport(db, from, to, agentId) {
-  const where = ['status = \'error\'', 'ts >= @from', 'ts <= @to'];
+  const where = ['status <> \'OK\'', 'ts >= @from', 'ts <= @to'];
   const params = { from, to };
   if (agentId) { where.push('agent_id = @agentId'); params.agentId = agentId; }
   return db.prepare(`
-    SELECT ts, agent_id, tool_name, error_code, error_message, result_summary, trace_id
+    SELECT ts, agent_id, tool_name, status, error_message, result_summary, trace_id, entity_type, entity_id
     FROM audit_events
     WHERE ${where.join(' AND ')}
     ORDER BY ts DESC
@@ -218,8 +255,8 @@ export function toolUsageStats(db, from, to, agentId) {
       agent_id,
       tool_name,
       COUNT(*) as total,
-      SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) as ok_count,
-      SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as error_count,
+      SUM(CASE WHEN status = 'OK' THEN 1 ELSE 0 END) as ok_count,
+      SUM(CASE WHEN status <> 'OK' THEN 1 ELSE 0 END) as error_count,
       ROUND(AVG(duration_ms), 0) as avg_duration_ms,
       MAX(duration_ms) as max_duration_ms
     FROM audit_events

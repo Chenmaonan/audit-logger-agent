@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS audit_review_findings (
   agent_id TEXT,
   tool_name TEXT,
   trace_id TEXT,
-  product_id TEXT,
+  entity_type TEXT,
+  entity_id TEXT,
   title TEXT NOT NULL,
   summary TEXT NOT NULL,
   recommendation TEXT,
@@ -104,6 +105,8 @@ function addColumnIfMissing(db, tableName, columnName, definition) {
 
 export function ensureReviewSchema(db) {
   db.exec(REVIEW_TABLES);
+  addColumnIfMissing(db, 'audit_review_findings', 'entity_type', 'TEXT');
+  addColumnIfMissing(db, 'audit_review_findings', 'entity_id', 'TEXT');
   addColumnIfMissing(db, 'audit_review_findings', 'llm_analysis_json', 'TEXT');
   addColumnIfMissing(db, 'audit_review_findings', 'analysis_generated_at', 'TEXT');
   db.exec(REVIEW_INDEXES);

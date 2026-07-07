@@ -18,8 +18,9 @@ function makeEvent(overrides = {}) {
     span_id: 'span-1',
     event: 'tool.end',
     tool_name: 'example.tool',
-    status: 'ok',
+    status: 'OK',
     result_summary: 'ok',
+    entity: { type: 'document', id: 'doc-1' },
     ...overrides,
   };
 }
@@ -130,6 +131,52 @@ test('POST /v1/ingest accepts NDJSON bodies', async () => {
     const ingestResult = ingestService.ingestSince({ sinceDate: '2026-07-06' });
     assert.equal(ingestResult.inserted, 2);
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM audit_events').get().count, 2);
+  });
+});
+
+test('POST /v1/ingest accepts entity and llm_intent fields and imports them', async () => {
+  await withIngestServer(async ({ baseUrl, ingestService, db }) => {
+    const response = await fetch(`${baseUrl}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(makeEvent({
+        trace_id: 'entity-intent',
+        span_id: 'span-entity-intent',
+        entity: { type: 'database', id: 'db-1' },
+        llm_intent: { input: 'inspect table', output: 'summarize schema' },
+      })),
+    });
+
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), { accepted: 1, rejected: 0, errors: [] });
+
+    const ingestResult = ingestService.ingestSince({ sinceDate: '2026-07-06' });
+    assert.equal(ingestResult.inserted, 1);
+    const row = db.prepare('SELECT entity_type, entity_id, llm_intent_json FROM audit_events WHERE trace_id = ?').get('entity-intent');
+    assert.equal(row.entity_type, 'database');
+    assert.equal(row.entity_id, 'db-1');
+    assert.equal(row.llm_intent_json, JSON.stringify({ input: 'inspect table', output: 'summarize schema' }));
+  });
+});
+
+test('POST /v1/ingest rejects legacy audit fields', async () => {
+  await withIngestServer(async ({ baseUrl, config }) => {
+    const response = await fetch(`${baseUrl}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(makeEvent({
+        trace_id: 'legacy-product',
+        product_id: 'prod-1',
+        error: { code: 'old_code', message: 'old code' },
+      })),
+    });
+
+    assert.equal(response.status, 202);
+    const body = await response.json();
+    assert.equal(body.accepted, 0);
+    assert.equal(body.rejected, 1);
+    assert.ok(body.errors.some((error) => /product_id|error\.code/.test(error.error)));
+    assert.equal(fs.existsSync(config.ingest.spoolDir), false);
   });
 });
 

@@ -13,7 +13,7 @@ const SYSTEM_PROMPT = [
   'Top-level fields: "type" (exactly "audit_review"), "review_id", "window" {from,to}, "summary" {title,overview,severity_counts}, "findings" array.',
   `Severity values (use exactly these): ${SEVERITIES.map((s) => JSON.stringify(s)).join(', ')}.`,
   `Category values (use exactly these): ${REVIEW_CATEGORIES.map((c) => JSON.stringify(c)).join(', ')}.`,
-  'Each finding MUST have: category, severity, agent_id, tool_name, trace_id, product_id (strings or null), title, summary (<=200 chars), recommendation, evidence_event_ids (array of integers referencing provided candidate event ids), requires_action (boolean).',
+  'Each finding MUST have: category, severity, agent_id, tool_name, trace_id (strings or null), entity ({type,id} or null), title, summary (<=200 chars), recommendation, evidence_event_ids (array of integers referencing provided candidate event ids), requires_action (boolean).',
   'Duties:',
   '- Merge duplicate candidates that describe the same underlying issue into a single finding.',
   '- Assign severity based on evidence and context (trace, agent, tool, error).',
@@ -51,8 +51,11 @@ function buildInput({ reviewId, window, candidates }) {
       duration_ms: c.duration_ms,
       trace_id: c.trace_id,
       span_id: c.span_id,
-      product_id: c.product_id,
-      error_code: c.error_code,
+      entity: c.entity ?? (
+        c.entity_type || c.entity_id
+          ? { type: c.entity_type ?? null, id: c.entity_id ?? null }
+          : null
+      ),
       error_message: sanitizeFreeText(c.error_message),
       result_summary: sanitizeFreeText(c.result_summary),
       category: c.category,

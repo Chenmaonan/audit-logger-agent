@@ -11,13 +11,14 @@ function severityRank(sev) {
   return SEVERITY_ORDER[sev] ?? 0;
 }
 
-export function computeFindingHash({ category, agentId, toolName, traceId, productId, normalizedErrorCode }) {
+export function computeFindingHash({ category, agentId, toolName, traceId, entityType, entityId, normalizedErrorCode }) {
   const parts = [
     category ?? '',
     agentId ?? '',
     toolName ?? '',
     traceId ?? '',
-    productId ?? '',
+    entityType ?? '',
+    entityId ?? '',
     normalizedErrorCode ?? '',
   ];
   return crypto.createHash('sha256').update(parts.join('|')).digest('hex').slice(0, 16);
@@ -43,6 +44,9 @@ function hydrateFinding(row) {
   void confidence;
   return {
     ...rest,
+    entity: rest.entity_type || rest.entity_id
+      ? { type: rest.entity_type ?? null, id: rest.entity_id ?? null }
+      : null,
     evidence_event_ids: parseJson(evidence_event_ids_json, []),
     evidence: parseJson(evidence_json, []),
     llm_analysis: parseJson(llm_analysis_json, null),
@@ -100,7 +104,7 @@ export function createReviewStore(db) {
   const insertFindingStmt = db.prepare(`
     INSERT INTO audit_review_findings (
       finding_id, review_id, finding_hash, category, severity,
-      agent_id, tool_name, trace_id, product_id,
+      agent_id, tool_name, trace_id, entity_type, entity_id,
       title, summary, recommendation, requires_action,
       evidence_event_ids_json, evidence_json,
       status, occurrence_count, created_at, last_seen_at,
@@ -110,7 +114,7 @@ export function createReviewStore(db) {
       risk_policy_version, prompt_version, reviewer_version
     ) VALUES (
       @finding_id, @review_id, @finding_hash, @category, @severity,
-      @agent_id, @tool_name, @trace_id, @product_id,
+      @agent_id, @tool_name, @trace_id, @entity_type, @entity_id,
       @title, @summary, @recommendation, @requires_action,
       @evidence_event_ids_json, @evidence_json,
       @status, @occurrence_count, @created_at, @last_seen_at,
@@ -271,8 +275,9 @@ export function createReviewStore(db) {
         agentId: finding.agent_id,
         toolName: finding.tool_name,
         traceId: finding.trace_id,
-        productId: finding.product_id,
-        normalizedErrorCode: finding.normalized_error_code ?? finding.error_code,
+        entityType: finding.entity?.type ?? finding.entity_type,
+        entityId: finding.entity?.id ?? finding.entity_id,
+        normalizedErrorCode: finding.normalized_error_code,
       });
       const existing = findExistingStmt.get(findingHash);
       const now = nowIso();
@@ -301,7 +306,8 @@ export function createReviewStore(db) {
         agent_id: finding.agent_id ?? null,
         tool_name: finding.tool_name ?? null,
         trace_id: finding.trace_id ?? null,
-        product_id: finding.product_id ?? null,
+        entity_type: finding.entity?.type ?? finding.entity_type ?? null,
+        entity_id: finding.entity?.id ?? finding.entity_id ?? null,
         title: finding.title,
         summary: finding.summary,
         recommendation: finding.recommendation ?? null,

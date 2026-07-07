@@ -77,7 +77,8 @@ switch (opts.type) {
     } else {
       for (const r of rows) {
         console.log(`[${r.ts}] ${r.agent_id} | ${r.tool_name}`);
-        console.log(`  error: ${r.error_code} — ${r.error_message}`);
+        console.log(`  status: ${r.status}`);
+        if (r.error_message) console.log(`  error: ${r.error_message}`);
         console.log(`  summary: ${r.result_summary}`);
         console.log(`  trace: ${r.trace_id}`);
         console.log('');

@@ -30,8 +30,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
   duration_ms INTEGER,
   channel TEXT,
   user_id TEXT,
-  product_id TEXT,
-  error_code TEXT,
+  entity_type TEXT,
+  entity_id TEXT,
+  llm_intent_json TEXT,
   error_message TEXT,
   tags TEXT,
   raw_json TEXT
@@ -89,11 +90,11 @@ function insertEvent(db, id, ts) {
     INSERT INTO audit_events (
       row_hash, ts, agent_id, trace_id, span_id, parent_span_id, event,
       tool_name, status, result_summary, duration_ms, channel, user_id,
-      product_id, error_code, error_message, tags, raw_json
+      entity_type, entity_id, llm_intent_json, error_message, tags, raw_json
     ) VALUES (
       @row_hash, @ts, 'agent', 'trace', @span_id, NULL, 'tool.end',
-      'tool.name', 'ok', NULL, 1, NULL, NULL,
-      NULL, NULL, NULL, NULL, '{}'
+      'tool.name', 'OK', NULL, 1, NULL, NULL,
+      NULL, NULL, NULL, NULL, NULL, '{}'
     )
   `).run({ row_hash: `hash-${id}`, ts, span_id: `span-${id}` });
 }

@@ -34,7 +34,8 @@ function parseArgs() {
       case '--from': filters.from = args[++i]; break;
       case '--to': filters.to = args[++i]; break;
       case '--trace-id': filters.trace_id = args[++i]; break;
-      case '--product-id': filters.product_id = args[++i]; break;
+      case '--entity-type': filters.entity_type = args[++i]; break;
+      case '--entity-id': filters.entity_id = args[++i]; break;
       case '--channel': filters.channel = args[++i]; break;
       case '--limit': filters.limit = parseInt(args[++i], 10); break;
       case '--offset': filters.offset = parseInt(args[++i], 10); break;
@@ -60,9 +61,9 @@ if (filters.format === 'json') {
       console.log(`  trace: ${row.trace_id}  span: ${row.span_id}`);
       console.log(`  ${row.result_summary}`);
       if (row.duration_ms) console.log(`  duration: ${row.duration_ms}ms`);
-      if (row.error_code) console.log(`  error: ${row.error_code} — ${row.error_message}`);
+      if (row.error_message) console.log(`  error: ${row.error_message}`);
       if (row.channel) console.log(`  channel: ${row.channel}`);
-      if (row.product_id) console.log(`  product: ${row.product_id}`);
+      if (row.entity_type || row.entity_id) console.log(`  entity: ${row.entity_type ?? ''}/${row.entity_id ?? ''}`);
       console.log('');
     }
   }

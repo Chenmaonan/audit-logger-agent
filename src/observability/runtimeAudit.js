@@ -1,6 +1,7 @@
 // src/observability/runtimeAudit.js
 import crypto from 'crypto';
 import { insertEvents } from '../../scripts/lib/db.js';
+import { normalizeCanonicalStatus } from '../../scripts/lib/auditSpec.js';
 
 export function createRuntimeAuditLogger(db, { agentId = 'audit-runtime-agent', channel = 'system' } = {}) {
   return {
@@ -8,6 +9,7 @@ export function createRuntimeAuditLogger(db, { agentId = 'audit-runtime-agent', 
       const ts = new Date().toISOString();
       const resolvedTraceId = traceId ?? `trace_${runId}`;
       const spanId = crypto.randomUUID();
+      const canonicalStatus = normalizeCanonicalStatus(status);
 
       insertEvents(db, [{
         ts,
@@ -17,13 +19,14 @@ export function createRuntimeAuditLogger(db, { agentId = 'audit-runtime-agent', 
         parent_span_id: null,
         event,
         tool_name: toolName,
-        status,
+        status: canonicalStatus,
         result_summary: summary,
         duration_ms: null,
         channel,
         user_id: null,
-        product_id: null,
-        error_code: null,
+        entity_type: null,
+        entity_id: null,
+        llm_intent_json: null,
         error_message: null,
         tags: JSON.stringify(['agent-runtime']),
         raw_json: JSON.stringify({
@@ -33,7 +36,7 @@ export function createRuntimeAuditLogger(db, { agentId = 'audit-runtime-agent', 
           span_id: spanId,
           event,
           tool_name: toolName,
-          status,
+          status: canonicalStatus,
           result_summary: summary,
         }),
       }]);

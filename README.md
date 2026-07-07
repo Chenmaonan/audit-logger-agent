@@ -429,7 +429,7 @@ npm run ingest -- --since 2026-07-01
 ### 查询日志
 
 ```bash
-npm run query -- --status error --limit 20
+npm run query -- --status INTERNAL --limit 20
 ```
 
 JSON 输出：
@@ -449,7 +449,7 @@ npm run query -- --agent-id mt-agent --format json --limit 50
 | `--from` | 起始时间，比较 `ts >= from`。 |
 | `--to` | 结束时间，比较 `ts <= to`。 |
 | `--trace-id` | 按链路 ID 过滤。 |
-| `--product-id` | 按产品 ID 过滤。 |
+| `--entity-type` / `--entity-id` | Filter by business entity type and ID. |
 | `--channel` | 按来源渠道过滤。 |
 | `--limit` | 返回数量，默认 100。 |
 | `--offset` | 分页偏移。 |
@@ -542,13 +542,13 @@ curl -X POST http://127.0.0.1:9320/v1/audit-reviews/run \
 `/query` 支持的查询参数与 CLI `query` 基本一致：
 
 ```text
-agent_id, tool_name, status, event, from, to, trace_id, product_id, channel, limit, offset
+agent_id, tool_name, status, event, from, to, trace_id, entity_type, entity_id, channel, limit, offset
 ```
 
 示例：
 
 ```text
-http://127.0.0.1:9320/query?status=error&limit=20
+http://127.0.0.1:9320/query?status=INTERNAL&limit=20
 ```
 
 ### 上游推送采集
@@ -597,7 +597,7 @@ JSON 批量示例：
 
 已接收的行会追加写入 `data/incoming/<agent_id>/audit-YYYY-MM-DD.jsonl`，
 随后由现有增量采集流程入库，并继续复用 `row_hash` 去重。`agent_id` 只允许
-字母、数字、`.`、`_`、`-`，空值、`..`、`/`、`\` 会被拒绝。请求体大小由
+字母、数字、`.`、`_`、`-`，空值、`..`、`/`、`` 会被拒绝。请求体大小由
 `ingest.http.maxBodyBytes` 控制，单行或单事件大小由 `ingest.http.maxLineBytes`
 控制。设置 `ingest.http.enabled=false` 可以关闭该 HTTP 推送端点，且不影响本地
 文件扫描。
@@ -660,117 +660,107 @@ JSON 批量示例：
 - 本机 loopback 访问且 `requireDashboardToken=false` 时，Dashboard 和审查读接口可以免 Token。
 - 非 loopback 或 `requireDashboardToken=true` 时，读接口也需要 Token。
 
-## 上游日志文件规范
+## Upstream Audit Log Spec
 
-上游 Agent 应输出一行一个 JSON 的 NDJSON 文件，文件名通常为：
+Upstream agents write one complete JSON object per line in NDJSON files, normally named:
 
 ```text
 audit-YYYY-MM-DD.jsonl
 ```
 
-每一行必须是完整 JSON 对象，不允许多行 JSON。
+This spec is not backward compatible with old audit events. New ingestion rejects events that still send `product_id`, `error.code`, or non-canonical `status` values.
 
-### 必填字段
+### Required Fields
 
-| 字段 | 类型 | 说明 |
+| Field | Type | Notes |
 | --- | --- | --- |
-| `ts` | string | ISO 8601 时间戳。必须能被 `Date.parse()` 解析。 |
-| `agent_id` | string | 产生日志的 Agent 标识，例如 `mt-agent`。 |
-| `trace_id` | string | 一次任务或链路的全局 ID。相同任务内的 span 应共享同一个 `trace_id`。 |
-| `span_id` | string | 当前事件所属 span ID。一次工具调用的 start/end/error 通常使用同一个 `span_id`。 |
-| `event` | string | 事件类型，必须在合法枚举内。 |
-| `tool_name` | string | 工具名或逻辑动作名，例如 `rental.apply`。 |
-| `status` | string | 状态，必须在合法枚举内。 |
-| `result_summary` | string | 简短摘要，最长 200 字符。 |
+| `ts` | string | ISO 8601 timestamp. |
+| `agent_id` | string | Producing agent id. |
+| `trace_id` | string | Request/task trace id. |
+| `span_id` | string | Current span id. |
+| `event` | string | Must be in the event table below. |
+| `tool_name` | string | Tool or runtime component name. |
+| `status` | string | Google/gRPC canonical code. Success is `OK`. |
+| `result_summary` | string | Short summary, max 200 chars. |
 
-### 可选字段
+### Optional Fields
 
-| 字段 | 类型 | 说明 |
+| Field | Type | Notes |
 | --- | --- | --- |
-| `parent_span_id` | string | 父 span ID，用于表达工具调用树或 agent/span 嵌套关系。 |
-| `duration_ms` | number | 当前工具调用耗时毫秒，通常写在 `tool.end` 或 `tool.error`。 |
-| `channel` | string | 来源渠道，例如 `cli`、`http`、`feishu`。 |
-| `user_id` | string | 触发用户 ID。 |
-| `product_id` | string | 业务对象 ID，例如商品、产品、订单等。 |
-| `error` | object | 错误对象。若存在，必须是对象。 |
-| `error.code` | string | 归一化错误码。 |
-| `error.message` | string | 错误消息。 |
-| `error.stack` | string | 可选堆栈。建议仅本地保留，避免含敏感信息。 |
-| `tags` | string[] | 标签数组，例如 `['batch', 'e2e-audit']`。 |
+| `parent_span_id` | string | Parent span for nested calls; empty or omitted when absent. |
+| `duration_ms` | number | Tool duration in milliseconds. |
+| `channel` | string | Source channel such as `cli`, `http`, or `feishu`. |
+| `user_id` | string | Required for user-triggered events; empty or omitted for autonomous agent events. |
+| `entity` | object | Business object with string `type` and string `id`. |
+| `llm_intent` | object | Tool LLM intent with string `input` and string `output`. |
+| `error` | object | Only `error.message` is allowed. `error.code` is rejected. |
+| `tags` | string[] | Optional tags for filtering. |
 
-### 合法 `event` 枚举
+### Event Mapping
 
-| event | 用途 |
+| event | process/stage |
 | --- | --- |
-| `tool.start` | 工具调用开始。 |
-| `tool.end` | 工具调用正常结束。 |
-| `tool.error` | 工具调用失败。 |
-| `agent.start` | Agent 级任务开始。 |
-| `agent.end` | Agent 级任务正常结束。 |
-| `agent.error` | Agent 级任务失败。 |
-| `run.start` | Runtime run 开始。 |
-| `run.resume` | Runtime run 从用户决策恢复。 |
-| `run.waiting_user` | Runtime run 等待用户输入。 |
-| `run.final_result` | Runtime run 产出最终结果。 |
-| `run.failed` | Runtime run 失败。 |
+| `tool.start` | `tool/start` |
+| `tool.end` | `tool/end` |
+| `tool.error` | `tool/error` |
+| `agent.start` | `agent/start` |
+| `agent.end` | `agent/end` |
+| `agent.error` | `agent/error` |
+| `run.start` | `run/start` |
+| `run.resume` | `run/resume` |
+| `run.waiting_user` | `run/waiting_user` |
+| `run.final_result` | `run/final_result` |
+| `run.failed` | `run/failed` |
 
-### 合法 `status` 枚举
+Runtime review logs also use `review.*` events such as `review.start`, `review.llm.completed`, and `review.completed`.
 
-| status | 用途 |
+### Status Values
+
+`status` uses Google/gRPC canonical codes. Common values:
+
+| status | Meaning |
 | --- | --- |
-| `ok` | 成功或正常状态。 |
-| `error` | 失败。 |
-| `timeout` | 超时。 |
-| `cancelled` | 被取消。 |
+| `OK` | Success. |
+| `PERMISSION_DENIED` | Permission denied. |
+| `DEADLINE_EXCEEDED` | Timeout. |
+| `INVALID_ARGUMENT` | Invalid input. |
+| `NOT_FOUND` | Missing resource. |
+| `RESOURCE_EXHAUSTED` | Quota/resource exhausted. |
+| `FAILED_PRECONDITION` | Failed precondition. |
+| `INTERNAL` | Internal error. |
+| `UNAVAILABLE` | Upstream unavailable. |
+| `UNAUTHENTICATED` | Missing/invalid auth. |
 
-### 字段入库映射
+The full canonical set also includes `CANCELLED`, `UNKNOWN`, `ALREADY_EXISTS`, `ABORTED`, `OUT_OF_RANGE`, `UNIMPLEMENTED`, and `DATA_LOSS`.
 
-解析后会写入 `audit_events`：
+### Database Mapping
 
-| 源字段 | 数据库字段 | 说明 |
-| --- | --- | --- |
-| 原始 JSON 行 | `row_hash` | SHA-256 截断到 16 位，用于去重。 |
-| `ts` | `ts` | 事件时间。 |
-| `agent_id` | `agent_id` | Agent 标识。 |
-| `trace_id` | `trace_id` | 链路 ID。 |
-| `span_id` | `span_id` | Span ID。 |
-| `parent_span_id` | `parent_span_id` | 父 Span。 |
-| `event` | `event` | 事件类型。 |
-| `tool_name` | `tool_name` | 工具名。 |
-| `status` | `status` | 状态。 |
-| `result_summary` | `result_summary` | 摘要。 |
-| `duration_ms` | `duration_ms` | 耗时。 |
-| `channel` | `channel` | 渠道。 |
-| `user_id` | `user_id` | 用户。 |
-| `product_id` | `product_id` | 业务对象。 |
-| `error.code` | `error_code` | 错误码。 |
-| `error.message` | `error_message` | 错误消息。 |
-| `tags` | `tags` | JSON 字符串。 |
-| 原始对象 | `raw_json` | 原始 JSON 字符串。 |
+| Upstream field | audit_events column |
+| --- | --- |
+| `entity.type` | `entity_type` |
+| `entity.id` | `entity_id` |
+| `llm_intent` | `llm_intent_json` |
+| `error.message` | `error_message` |
+| source object | `raw_json` |
 
-### 推荐写法：一次工具调用
+`product_id` and `error_code` are no longer used for new writes.
+
+### Examples
 
 ```json
-{"ts":"2026-07-06T07:33:08.199Z","agent_id":"mt-agent","trace_id":"trace-001","span_id":"span-tool-001","event":"tool.start","tool_name":"publicTraffic.reportQuery","status":"ok","result_summary":"Starting publicTraffic.reportQuery","channel":"cli","product_id":"mt-e2e-001"}
-{"ts":"2026-07-06T07:33:08.200Z","agent_id":"mt-agent","trace_id":"trace-001","span_id":"span-tool-001","event":"tool.end","tool_name":"publicTraffic.reportQuery","status":"ok","result_summary":"Read public traffic summary for mt-e2e-001","duration_ms":1,"channel":"cli","product_id":"mt-e2e-001"}
+{"ts":"2026-07-06T07:33:08.199Z","agent_id":"mt-agent","trace_id":"trace-001","span_id":"span-tool-001","event":"tool.start","tool_name":"publicTraffic.reportQuery","status":"OK","result_summary":"Starting report query","channel":"cli","entity":{"type":"product","id":"mt-e2e-001"},"llm_intent":{"input":"Read public traffic report","output":"Return summarized metrics"}}
+{"ts":"2026-07-06T07:33:08.200Z","agent_id":"mt-agent","trace_id":"trace-001","span_id":"span-tool-001","event":"tool.end","tool_name":"publicTraffic.reportQuery","status":"OK","result_summary":"Read public traffic summary","duration_ms":1,"channel":"cli","entity":{"type":"product","id":"mt-e2e-001"}}
+{"ts":"2026-07-06T07:34:00.000Z","agent_id":"mt-agent","trace_id":"trace-002","span_id":"span-tool-002","event":"tool.error","tool_name":"activityAutomation.updateDiscount","status":"PERMISSION_DENIED","result_summary":"Write action blocked","duration_ms":0,"channel":"cli","entity":{"type":"product","id":"mt-e2e-002"},"error":{"message":"Write action blocked because confirmation was not supplied"}}
 ```
 
-### 推荐写法：带父子 span 的任务
+### Field Guidance
 
-```json
-{"ts":"2026-07-06T07:33:08.199Z","agent_id":"mt-agent","trace_id":"trace-002","span_id":"span-agent-001","event":"agent.start","tool_name":"agent.runtime.auditProbe","status":"ok","result_summary":"Audit probe started","channel":"cli"}
-{"ts":"2026-07-06T07:33:08.200Z","agent_id":"mt-agent","trace_id":"trace-002","span_id":"span-tool-002","parent_span_id":"span-agent-001","event":"tool.error","tool_name":"activityAutomation.updateDiscount","status":"error","result_summary":"Write action blocked because confirmation was not supplied","duration_ms":0,"channel":"cli","product_id":"mt-e2e-002","error":{"code":"CONFIRMATION_REQUIRED","message":"Write action blocked because confirmation was not supplied"}}
-{"ts":"2026-07-06T07:33:08.201Z","agent_id":"mt-agent","trace_id":"trace-002","span_id":"span-agent-001","event":"agent.error","tool_name":"agent.runtime.auditProbe","status":"error","result_summary":"Audit probe completed with one blocked write action","duration_ms":3,"channel":"cli"}
-```
-
-### 字段建议
-
-- `trace_id` 应覆盖一次完整用户请求或自动任务。
-- `span_id` 应覆盖一次工具调用的开始和结束。
-- `parent_span_id` 用于表达嵌套关系；Dashboard 会基于 `trace_id` 和时间顺序展示链路。
-- `result_summary` 应短而可读，不要放完整响应体。
-- `error.message` 不要包含密钥、Cookie、Token、完整用户隐私数据。
-- `tags` 适合放 `batch`、`manual`、`e2e-audit` 这类便于后续筛选的标签。
+- `trace_id` should cover one complete user request or autonomous task.
+- `span_id` should cover one tool call start/end/error sequence.
+- `parent_span_id` must be a string; empty or omit it when there is no parent.
+- `user_id` must be a string; user-triggered events should include it.
+- Keep `result_summary` short and avoid full response bodies.
+- Do not put secrets, cookies, tokens, or private user data in `error.message`.
 
 ## 审查规则和 Finding
 

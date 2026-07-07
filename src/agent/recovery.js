@@ -49,7 +49,7 @@ export function recoverInflightRuns({ runStore, eventPublisher, auditLogger, sta
     }
 
     eventPublisher.enqueueRunEvent(failedRun, 'final_result', createFailedFinalResultPayload(failedRun, { code: errorCode, message: errorMessage, summary: errorMessage, retryable: true }));
-    auditLogger.log({ runId: run.run_id, event: 'run.failed', status: 'error', summary: errorMessage }).catch(() => {});
+    auditLogger.log({ runId: run.run_id, event: 'run.failed', status: 'INTERNAL', summary: errorMessage }).catch(() => {});
     recovered.push(run.run_id);
   }
 

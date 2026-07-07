@@ -27,7 +27,8 @@ test('ensureReviewSchema migrates legacy finding and LLM usage tables', () => {
       agent_id TEXT,
       tool_name TEXT,
       trace_id TEXT,
-      product_id TEXT,
+      entity_type TEXT,
+      entity_id TEXT,
       title TEXT NOT NULL,
       summary TEXT NOT NULL,
       recommendation TEXT,
@@ -63,8 +64,7 @@ const baseFinding = {
   agent_id: 'mt-agent',
   tool_name: 'publicTraffic.runReport',
   trace_id: 'trace_abc',
-  product_id: 'rental',
-  error_code: 'upstream_timeout',
+  entity: { type: 'product', id: 'rental' },
   title: 'publicTraffic.runReport 连续失败',
   summary: '10 分钟内同一工具失败 5 次',
   recommendation: '检查上游服务',
@@ -284,11 +284,11 @@ test('reviewStore: atomically reserves LLM usage within daily limits', () => {
 test('reviewStore: computeFindingHash is stable and ignores severity', () => {
   const h1 = computeFindingHash({
     category: 'failed_call', agentId: 'a', toolName: 't',
-    traceId: 'tr', productId: 'p', normalizedErrorCode: 'err',
+    traceId: 'tr', entityType: 'product', entityId: 'p', normalizedErrorCode: 'err',
   });
   const h2 = computeFindingHash({
     category: 'failed_call', agentId: 'a', toolName: 't',
-    traceId: 'tr', productId: 'p', normalizedErrorCode: 'err',
+    traceId: 'tr', entityType: 'product', entityId: 'p', normalizedErrorCode: 'err',
   });
   assert.equal(h1, h2);
   assert.equal(h1.length, 16);
@@ -371,7 +371,7 @@ test('reviewStore: listTraceEvents returns audit events for a trace in chronolog
     ts: '2026-07-03T10:02:00.000Z',
     event: 'tool.end',
     tool_name: 'db.delete',
-    status: 'error',
+    status: 'INTERNAL',
     result_summary: 'delete failed',
     duration_ms: 420,
     error_message: 'permission denied',
@@ -383,7 +383,7 @@ test('reviewStore: listTraceEvents returns audit events for a trace in chronolog
     ts: '2026-07-03T10:00:30.000Z',
     event: 'tool.end',
     tool_name: 'search',
-    status: 'ok',
+    status: 'OK',
     result_summary: 'ignored',
     duration_ms: 25,
     error_message: null,
@@ -395,7 +395,7 @@ test('reviewStore: listTraceEvents returns audit events for a trace in chronolog
     ts: '2026-07-03T10:01:00.000Z',
     event: 'tool.start',
     tool_name: 'db.delete',
-    status: 'ok',
+    status: 'OK',
     result_summary: 'delete requested',
     duration_ms: null,
     error_message: null,

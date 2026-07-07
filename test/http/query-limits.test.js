@@ -16,7 +16,7 @@ function makeEvent(index) {
     span_id: `span-${index}`,
     event: 'tool.end',
     tool_name: 'example.tool',
-    status: 'ok',
+    status: 'OK',
     result_summary: `ok-${index}`,
   };
   return {
@@ -32,8 +32,9 @@ function makeEvent(index) {
     duration_ms: null,
     channel: null,
     user_id: null,
-    product_id: null,
-    error_code: null,
+    entity_type: null,
+    entity_id: null,
+    llm_intent_json: null,
     error_message: null,
     tags: null,
     raw_json: JSON.stringify(event),

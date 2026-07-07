@@ -7,7 +7,7 @@ import path from 'path';
 import { openDb, insertEvents, dailySummary } from '../../scripts/lib/db.js';
 import { createHttpApp } from '../../src/adapters/http/app.js';
 
-function makeEvent({ ts, traceId, status = 'ok' }) {
+function makeEvent({ ts, traceId, status = 'OK' }) {
   const event = {
     ts,
     agent_id: 'tz-agent',
@@ -24,8 +24,9 @@ function makeEvent({ ts, traceId, status = 'ok' }) {
     duration_ms: null,
     channel: null,
     user_id: null,
-    product_id: null,
-    error_code: null,
+    entity_type: null,
+    entity_id: null,
+    llm_intent_json: null,
     error_message: null,
     tags: null,
     raw_json: JSON.stringify(event),
@@ -49,16 +50,16 @@ test('dailySummary groups events by configured report timezone offset', () => {
 
   try {
     insertEvents(db, [
-      makeEvent({ ts: '2026-07-06T15:59:59.000Z', traceId: 'utc-day-before-local-day-before', status: 'cancelled' }),
-      makeEvent({ ts: '2026-07-06T16:00:00.000Z', traceId: 'local-day-start', status: 'ok' }),
-      makeEvent({ ts: '2026-07-07T15:59:59.000Z', traceId: 'local-day-end', status: 'error' }),
-      makeEvent({ ts: '2026-07-07T16:00:00.000Z', traceId: 'local-next-day', status: 'timeout' }),
+      makeEvent({ ts: '2026-07-06T15:59:59.000Z', traceId: 'utc-day-before-local-day-before', status: 'CANCELLED' }),
+      makeEvent({ ts: '2026-07-06T16:00:00.000Z', traceId: 'local-day-start', status: 'OK' }),
+      makeEvent({ ts: '2026-07-07T15:59:59.000Z', traceId: 'local-day-end', status: 'INTERNAL' }),
+      makeEvent({ ts: '2026-07-07T16:00:00.000Z', traceId: 'local-next-day', status: 'DEADLINE_EXCEEDED' }),
     ]);
 
     const rows = dailySummary(db, '2026-07-07', undefined, { timezoneOffsetMinutes: 480 });
     const countsByStatus = Object.fromEntries(rows.map((row) => [row.status, row.count]));
 
-    assert.deepEqual(countsByStatus, { error: 1, ok: 1 });
+    assert.deepEqual(countsByStatus, { INTERNAL: 1, OK: 1 });
   } finally {
     db.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });

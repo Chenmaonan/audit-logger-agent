@@ -52,12 +52,12 @@ test('review input sanitizes and truncates untrusted free-text candidate fields'
       agent_id: 'mt-agent',
       tool_name: 'db.deleteTable',
       event: 'tool.end',
-      status: 'ok',
+      status: 'OK',
       duration_ms: 10,
       trace_id: 'trace-1',
       span_id: 'span-1',
-      product_id: 'prod-1',
-      error_code: null,
+      entity_type: 'product',
+      entity_id: 'prod-1',
       error_message: longInjection,
       result_summary: longInjection,
       category: 'high_risk_permission',
@@ -67,6 +67,9 @@ test('review input sanitizes and truncates untrusted free-text candidate fields'
 
   const payload = JSON.parse(capturedInput.find((message) => message.role === 'user').content);
   const candidate = payload.candidates[0];
+  assert.deepEqual(candidate.entity, { type: 'product', id: 'prod-1' });
+  assert.equal(Object.hasOwn(candidate, 'product_id'), false);
+  assert.equal(Object.hasOwn(candidate, 'error_code'), false);
   assert.equal(candidate.result_summary.length, 500);
   assert.equal(candidate.error_message.length, 500);
   assert.doesNotMatch(candidate.result_summary, /[\u0000-\u001F\u007F]/);

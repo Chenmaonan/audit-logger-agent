@@ -122,8 +122,8 @@ test('every candidate event has the expected audit-event fields', () => {
     'duration_ms',
     'trace_id',
     'span_id',
-    'product_id',
-    'error_code',
+    'entity_type',
+    'entity_id',
     'error_message',
     'result_summary',
   ];
