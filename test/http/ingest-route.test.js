@@ -235,7 +235,7 @@ test('POST /v1/ingest rejects legacy audit fields', async () => {
   });
 });
 
-test('POST /v1/ingest rejects unknown alias events without writing DB or spool', async () => {
+test('POST /v1/ingest accepts unknown lifecycle events as unknown without dropping logs', async () => {
   await withIngestServer(async ({ baseUrl, config, db }) => {
     const response = await fetch(`${baseUrl}/v1/ingest`, {
       method: 'POST',
@@ -249,14 +249,17 @@ test('POST /v1/ingest rejects unknown alias events without writing DB or spool',
 
     assert.equal(response.status, 202);
     const body = await response.json();
-    assert.equal(body.accepted, 0);
-    assert.equal(body.rejected, 1);
-    assert.ok(body.errors.some((error) => /invalid event/.test(error.error)));
-    assert.equal(
-      db.prepare('SELECT COUNT(*) AS count FROM audit_events WHERE trace_id = ?').get('unknown-alias').count,
-      0
+    assert.equal(body.accepted, 1);
+    assert.equal(body.rejected, 0);
+    assert.deepEqual(body.errors, []);
+    const row = db.prepare('SELECT event, raw_json FROM audit_events WHERE trace_id = ?').get('unknown-alias');
+    assert.equal(row.event, 'unknown');
+    assert.equal(JSON.parse(row.raw_json).event, 'tool/not-a-stage');
+    const spooled = fs.readFileSync(
+      path.join(config.ingest.spoolDir, 'remote-agent', 'audit-2026-07-06.jsonl'),
+      'utf-8',
     );
-    assert.equal(fs.existsSync(config.ingest.spoolDir), false);
+    assert.ok(spooled.includes('unknown-alias'));
   });
 });
 

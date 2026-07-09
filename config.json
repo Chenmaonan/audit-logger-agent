@@ -73,6 +73,26 @@
         "mt-agent": []
       }
     },
+    "toolMapping": {
+      "version": "tool-semantic-mapping-v1",
+      "taxonomy": [
+        "read",
+        "write",
+        "update",
+        "delete",
+        "deploy",
+        "permission",
+        "credential",
+        "shell",
+        "browser",
+        "network",
+        "database",
+        "file",
+        "notification",
+        "llm",
+        "unknown"
+      ]
+    },
     "llmReview": {
       "promptVersion": "audit-review-prompt-v1",
       "reviewerVersion": "audit-reviewer-v1"

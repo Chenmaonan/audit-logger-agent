@@ -23,6 +23,12 @@ CREATE TABLE IF NOT EXISTS audit_events (
   llm_intent_json TEXT,
   error_message TEXT,
   tags TEXT,
+  mapped_tool_type TEXT,
+  mapping_status TEXT,
+  mapping_reason TEXT,
+  mapping_model TEXT,
+  mapping_version TEXT,
+  mapped_at TEXT,
   raw_json TEXT
 );
 
@@ -120,40 +126,123 @@ function migrateAuditEvents(db) {
   addColumnIfMissing(db, 'audit_events', 'entity_type', 'TEXT');
   addColumnIfMissing(db, 'audit_events', 'entity_id', 'TEXT');
   addColumnIfMissing(db, 'audit_events', 'llm_intent_json', 'TEXT');
+  addColumnIfMissing(db, 'audit_events', 'mapped_tool_type', 'TEXT');
+  addColumnIfMissing(db, 'audit_events', 'mapping_status', 'TEXT');
+  addColumnIfMissing(db, 'audit_events', 'mapping_reason', 'TEXT');
+  addColumnIfMissing(db, 'audit_events', 'mapping_model', 'TEXT');
+  addColumnIfMissing(db, 'audit_events', 'mapping_version', 'TEXT');
+  addColumnIfMissing(db, 'audit_events', 'mapped_at', 'TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_events(entity_type, entity_id);');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_audit_tool_mapping ON audit_events(mapped_tool_type, mapping_status);');
 }
 
 export function insertEvents(db, events) {
+  const tableColumnNames = new Set(db.prepare('PRAGMA table_info(audit_events)').all().map((row) => row.name));
+  const insertColumns = [
+    'row_hash',
+    'ts',
+    'agent_id',
+    'trace_id',
+    'span_id',
+    'parent_span_id',
+    'event',
+    'tool_name',
+    'status',
+    'result_summary',
+    'duration_ms',
+    'channel',
+    'user_id',
+    'entity_type',
+    'entity_id',
+    'llm_intent_json',
+    'error_message',
+    'tags',
+    'mapped_tool_type',
+    'mapping_status',
+    'mapping_reason',
+    'mapping_model',
+    'mapping_version',
+    'mapped_at',
+    'raw_json',
+  ].filter((column) => tableColumnNames.has(column));
+  const placeholders = insertColumns.map((column) => `@${column}`).join(', ');
   const stmt = db.prepare(`
     INSERT OR IGNORE INTO audit_events
-      (row_hash, ts, agent_id, trace_id, span_id, parent_span_id, event, tool_name, status,
-       result_summary, duration_ms, channel, user_id, entity_type, entity_id,
-       llm_intent_json, error_message, tags, raw_json)
+      (${insertColumns.join(', ')})
     VALUES
-      (@row_hash, @ts, @agent_id, @trace_id, @span_id, @parent_span_id, @event, @tool_name, @status,
-       @result_summary, @duration_ms, @channel, @user_id, @entity_type, @entity_id,
-       @llm_intent_json, @error_message, @tags, @raw_json)
+      (${placeholders})
   `);
 
   const insertMany = db.transaction((rows) => {
     let count = 0;
     for (const row of rows) {
       const rowHash = hashRow(row.raw_json);
-      const info = stmt.run({
+      const values = {
         entity_type: null,
         entity_id: null,
         llm_intent_json: null,
         error_message: null,
         tags: null,
+        mapped_tool_type: null,
+        mapping_status: null,
+        mapping_reason: null,
+        mapping_model: null,
+        mapping_version: null,
+        mapped_at: null,
         ...row,
         row_hash: rowHash,
-      });
+      };
+      const filteredValues = Object.fromEntries(insertColumns.map((column) => [column, values[column]]));
+      const info = stmt.run(filteredValues);
       if (info.changes > 0) count++;
     }
     return count;
   });
 
   return insertMany(events);
+}
+
+export function listEventsNeedingToolMapping(db, { limit = 500, from, to } = {}) {
+  const conditions = ['(mapped_tool_type IS NULL OR mapping_status IS NULL)'];
+  const params = { limit: clampPositiveInteger(limit, DEFAULT_QUERY_LIMIT, 5000) };
+  if (from) {
+    conditions.push('ts >= @from');
+    params.from = from;
+  }
+  if (to) {
+    conditions.push('ts <= @to');
+    params.to = to;
+  }
+  return db.prepare(`
+    SELECT id, ts, agent_id, trace_id, span_id, parent_span_id, event, tool_name,
+           status, result_summary, duration_ms, channel, user_id, entity_type,
+           entity_id, llm_intent_json, error_message, tags, raw_json
+    FROM audit_events
+    WHERE ${conditions.join(' AND ')}
+    ORDER BY ts ASC
+    LIMIT @limit
+  `).all(params);
+}
+
+export function updateEventToolMapping(db, eventId, mapping) {
+  return db.prepare(`
+    UPDATE audit_events
+    SET mapped_tool_type = @mapped_tool_type,
+        mapping_status = @mapping_status,
+        mapping_reason = @mapping_reason,
+        mapping_model = @mapping_model,
+        mapping_version = @mapping_version,
+        mapped_at = @mapped_at
+    WHERE id = @event_id
+  `).run({
+    event_id: eventId,
+    mapped_tool_type: mapping.mapped_tool_type,
+    mapping_status: mapping.mapping_status,
+    mapping_reason: mapping.mapping_reason ?? null,
+    mapping_model: mapping.mapping_model ?? null,
+    mapping_version: mapping.mapping_version ?? null,
+    mapped_at: mapping.mapped_at,
+  });
 }
 
 export function queryEvents(db, filters = {}, options = {}) {
@@ -203,6 +292,14 @@ export function queryEvents(db, filters = {}, options = {}) {
   if (filters.channel) {
     conditions.push('channel = @channel');
     params.channel = filters.channel;
+  }
+  if (filters.mapped_tool_type) {
+    conditions.push('mapped_tool_type = @mapped_tool_type');
+    params.mapped_tool_type = filters.mapped_tool_type;
+  }
+  if (filters.mapping_status) {
+    conditions.push('mapping_status = @mapping_status');
+    params.mapping_status = filters.mapping_status;
   }
 
   const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';

@@ -242,6 +242,7 @@ Windows PowerShell 下也可以使用同一命令。
 | `auditReview.http.allowedOrigins` | 审查 API 和 Dashboard 的 CORS 白名单。 |
 | `auditReview.riskPolicy.highRiskToolPatterns` | 本地规则中被视为高风险的工具名模式。 |
 | `auditReview.riskPolicy.agentToolAllowlists` | Agent 允许调用的工具清单。空数组表示未配置允许工具，会更容易触发异常调用。 |
+| `auditReview.toolMapping.taxonomy` | LLM 工具语义映射允许输出的稳定类型清单，失败时降级为 `unknown`。 |
 | `auditReview.visualization.baseUrl` | 通知中生成 Dashboard 链接的地址前缀。 |
 | `auditReview.visualization.dashboardPath` | Dashboard 路由前缀，默认 `/dashboard`。 |
 
@@ -587,7 +588,7 @@ curl -X POST http://127.0.0.1:9320/v1/audit-reviews/run \
 `/query` 支持的查询参数与 CLI `query` 基本一致：
 
 ```text
-agent_id, tool_name, status, event, from, to, trace_id, entity_type, entity_id, channel, limit, offset
+agent_id, tool_name, mapped_tool_type, mapping_status, status, event, from, to, trace_id, entity_type, entity_id, channel, limit, offset
 ```
 
 示例：
@@ -611,7 +612,7 @@ curl -X POST http://127.0.0.1:9320/v1/ingest \
 - `Content-Type: application/x-ndjson`：每行一个 JSON 事件。
 - `Content-Type: application/json`：单个事件对象，或 `{ "events": [...] }` 批量事件。
 
-统一 HTTP ingest 接口会先校验并规范化 `event`，再写入 `audit_events`。支持的 alias 规则是：保留同一组小写 segment，只在 segment 之间替换分隔符 `.`、`/`、`_`、`-`。例如 `tool.end`、`tool/end`、`tool_end`、`tool-end` 都会归一为 `tool.end`。未知 `event` 会在入口直接拒收，不会进入 detector / LLM 审查链路。
+统一 HTTP ingest 接口会先校验基础字段并规范化 `event`，再写入 `audit_events`。支持的 alias 规则是：保留同一组小写 segment，只在 segment 之间替换分隔符 `.`、`/`、`_`、`-`。例如 `tool.end`、`tool/end`、`tool_end`、`tool-end` 都会归一为 `tool.end`。未知生命周期 `event` 不再丢弃日志，会以 canonical `event="unknown"` 入库，同时在 `raw_json` 保留上游原始值。
 
 JSON 批量示例：
 
@@ -714,7 +715,7 @@ Upstream agents write one complete JSON object per line in NDJSON files, normall
 audit-YYYY-MM-DD.jsonl
 ```
 
-This spec is not backward compatible with old audit events. New ingestion rejects events that still send `product_id`, `error.code`, non-canonical `status` values, or unknown `event` ids.
+This spec is not backward compatible with old audit events. New ingestion rejects events that still send `product_id`, `error.code`, or non-canonical `status` values. Unknown lifecycle `event` ids are accepted as canonical `unknown` while preserving the original value in `raw_json`.
 
 ### Required Fields
 
@@ -767,8 +768,12 @@ Ingestion canonicalizes `event` before writing to `audit_events`:
 - Canonical ids use dot-separated lowercase segments, for example `tool.end` and `review.llm.completed`.
 - Accepted aliases may swap only the separators between the same lowercase segments: `.`, `/`, `_`, and `-` are treated as equivalent. Examples: `tool/end`, `tool_end`, and `tool-end` all normalize to `tool.end`.
 - Multi-segment events follow the same rule, for example `review/llm/completed` and `review_llm_completed` both normalize to `review.llm.completed`.
-- Unknown ids such as `tool.finish` are rejected during ingestion and do not enter `audit_events`, detector candidates, or LLM review input.
+- Unknown ids such as `tool.finish` are accepted as canonical `unknown`, preserving the original upstream value in `raw_json` so audit evidence is not dropped.
 - LLM audit review uses only canonical `event` values read from `audit_events`; the original upstream payload is still retained in `raw_json`.
+
+### 工具语义映射
+
+所有已接收日志都会进入工具语义映射流程。系统优先用本地规则识别明显工具名；无法判断时，LLM 会结合 `tool_name`、`result_summary`、`llm_intent`、错误信息、实体和调用链上下文，把工具归类到 `auditReview.toolMapping.taxonomy` 中的类型。默认类型包括 `read`、`write`、`update`、`delete`、`deploy`、`permission`、`credential`、`shell`、`browser`、`network`、`database`、`file`、`notification`、`llm` 和 `unknown`。LLM 无法可靠分类时降级为 `unknown`，不会拒收日志。
 
 ### Status Values
 
@@ -820,7 +825,7 @@ The full canonical set also includes `CANCELLED`, `UNKNOWN`, `ALREADY_EXISTS`, `
 
 ## 审查规则和 Finding
 
-本地规则会先筛出候选事件，再交给 LLM 审查。detector 和 LLM 审查读取的是 `audit_events` 里的 canonical `event`，不会直接消费未知或未规范化的上游 event id。主要类别：
+本地规则会先筛出候选事件，再交给 LLM 审查。detector 和 LLM 审查读取的是 `audit_events` 里的 canonical `event`，并同时使用 `mapped_tool_type`、`mapping_status` 和 `mapping_reason` 理解上游工具语义。主要类别：
 
 | 类别 | 说明 |
 | --- | --- |

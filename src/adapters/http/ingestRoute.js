@@ -139,7 +139,7 @@ function appendAcceptedEvents(config, events) {
   }
 }
 
-export async function handleIngestRoute(req, res, { config = {}, db } = {}) {
+export async function handleIngestRoute(req, res, { config = {}, db, toolSemanticMapper } = {}) {
   const type = contentType(req);
   const limitBytes = maxBodyBytes(config);
   const lineLimitBytes = maxLineBytes(config);
@@ -189,6 +189,13 @@ export async function handleIngestRoute(req, res, { config = {}, db } = {}) {
     appendAcceptedEvents(config, accepted.map((item) => item.originalEvent));
     if (db) {
       insertEvents(db, accepted.map((item) => normalizeEntry(item.normalizedEvent)));
+      if (toolSemanticMapper) {
+        try {
+          await toolSemanticMapper.mapPendingEvents({ limit: Math.max(accepted.length, 1) });
+        } catch {
+          // Ingest must keep accepting logs even if semantic mapping is degraded.
+        }
+      }
     }
   }
 

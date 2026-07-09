@@ -15,6 +15,9 @@ const EVIDENCE_FIELDS = [
   'entity_id',
   'error_message',
   'result_summary',
+  'mapped_tool_type',
+  'mapping_status',
+  'mapping_reason',
 ];
 
 function matchGlob(name, pattern) {
@@ -59,6 +62,9 @@ function makeCandidate(row, category, reason, extras = {}) {
     entity_id: row.entity_id,
     error_message: row.error_message,
     result_summary: row.result_summary,
+    mapped_tool_type: row.mapped_tool_type,
+    mapping_status: row.mapping_status,
+    mapping_reason: row.mapping_reason,
     category,
     reason,
     ...extras,
@@ -67,6 +73,8 @@ function makeCandidate(row, category, reason, extras = {}) {
 
 export function createCandidateDetector({ db, riskPolicy } = {}) {
   if (!db) throw new Error('createCandidateDetector: db is required');
+  const columns = new Set(db.prepare('PRAGMA table_info(audit_events)').all().map((row) => row.name));
+  const selectOrNull = (column) => columns.has(column) ? column : `NULL AS ${column}`;
   const policy = riskPolicy ?? {};
   const repeatWindowMs = (policy.repeatWindowMinutes ?? 10) * 60000;
   const repeatThreshold = policy.repeatThreshold ?? 5;
@@ -78,7 +86,8 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
   const selectSql = `
     SELECT id, ts, agent_id, trace_id, span_id, parent_span_id, event, tool_name,
            status, result_summary, duration_ms, channel, user_id, entity_type,
-           entity_id, error_message
+           entity_id, error_message, ${selectOrNull('mapped_tool_type')},
+           ${selectOrNull('mapping_status')}, ${selectOrNull('mapping_reason')}
     FROM audit_events
     WHERE ts >= @from AND ts <= @to
     ORDER BY ts ASC

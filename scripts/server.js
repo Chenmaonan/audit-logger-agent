@@ -29,6 +29,7 @@ import { createIngestCursorStore } from '../src/auditReview/ingestCursorStore.js
 import { createAuditIngestService } from '../src/auditReview/ingestService.js';
 import { createCandidateDetector } from '../src/auditReview/candidateDetector.js';
 import { createLlmReviewer } from '../src/auditReview/llmReviewer.js';
+import { createToolSemanticMapper } from '../src/auditReview/toolSemanticMapper.js';
 import { createReviewNotifier } from '../src/auditReview/notification.js';
 import { createVisualization } from '../src/auditReview/visualization.js';
 import { createDashboardAuth } from '../src/auditReview/dashboardAuth.js';
@@ -171,6 +172,13 @@ const lockStore = createLockStore(db);
 const cursorStore = createIngestCursorStore(db);
 const ingestService = createAuditIngestService({ db, config: runtimeConfig, cursorStore, now: () => new Date() });
 const detector = createCandidateDetector({ db, riskPolicy: runtimeConfig.auditReview?.riskPolicy ?? {} });
+const toolSemanticMapper = createToolSemanticMapper({
+  db,
+  llmClient,
+  model: openAIConfig.model,
+  taxonomy: runtimeConfig.auditReview?.toolMapping?.taxonomy,
+  mappingVersion: runtimeConfig.auditReview?.toolMapping?.version,
+});
 const llmReviewer = createLlmReviewer({
   llmClient,
   model: openAIConfig.model,
@@ -189,6 +197,7 @@ const scheduler = createAuditReviewScheduler({
   cursorStore,
   detector,
   llmReviewer,
+  toolSemanticMapper,
   notifier: reviewNotifier,
   visualization: reviewVisualization,
   auditLogger: reviewAuditLogger,
@@ -238,6 +247,7 @@ const app = createHttpApp({
   reviewStore,
   visualization: reviewVisualization,
   dashboardAuth,
+  toolSemanticMapper,
 });
 const portIndex = process.argv.indexOf('--port');
 const portArg = portIndex >= 0 ? Number(process.argv[portIndex + 1]) : 9320;

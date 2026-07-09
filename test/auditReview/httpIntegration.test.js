@@ -24,6 +24,7 @@ import { createReviewNotifier } from '../../src/auditReview/notification.js';
 import { createVisualization } from '../../src/auditReview/visualization.js';
 import { createDashboardAuth } from '../../src/auditReview/dashboardAuth.js';
 import { createAuditReviewScheduler } from '../../src/auditReview/scheduler.js';
+import { createToolSemanticMapper } from '../../src/auditReview/toolSemanticMapper.js';
 import { createHttpApp } from '../../src/adapters/http/app.js';
 
 function makeUpstreamEvent(overrides = {}) {
@@ -513,7 +514,7 @@ test('audit review HTTP integration smoke test', async () => {
   }
 });
 
-test('audit review ingests alias events as canonical and rejects unknown events before detector/LLM', async () => {
+test('audit review ingests all events and sends mapped tool semantics to detector/LLM', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-review-alias-'));
   const dbPath = path.join(tmpDir, 'test.db');
   const db = openDb(dbPath);
@@ -581,7 +582,7 @@ test('audit review ingests alias events as canonical and rejects unknown events 
         window: payload.window,
         summary: {
           title: 'Alias event review',
-          overview: 'Canonical event reached the reviewer.',
+          overview: 'Canonical events and mapped tool semantics reached the reviewer.',
           severity_counts: { critical: 0, high: 1, medium: 0, low: 0 },
         },
         findings: [
@@ -592,8 +593,8 @@ test('audit review ingests alias events as canonical and rejects unknown events 
             tool_name: payload.candidates[0]?.tool_name ?? 'db.delete',
             trace_id: payload.candidates[0]?.trace_id ?? 'trace-alias',
             entity: payload.candidates[0]?.entity ?? null,
-            title: 'Canonical event only',
-            summary: 'Reviewer only received canonical event ids.',
+            title: 'Canonical event with mapped tool type',
+            summary: 'Reviewer received mapped tool semantics.',
             recommendation: 'Verify delete authorization.',
             evidence_event_ids: [payload.candidates[0]?.event_id ?? 1],
             requires_action: true,
@@ -607,6 +608,11 @@ test('audit review ingests alias events as canonical and rejects unknown events 
     model: 'test-model',
     promptVersion: 'prompt-test-v1',
     reviewerVersion: 'reviewer-test-v1',
+  });
+  const toolSemanticMapper = createToolSemanticMapper({
+    db,
+    llmClient: fakeLlmClient,
+    model: 'test-model',
   });
   const notifier = createReviewNotifier({
     outboxStore: {
@@ -637,6 +643,7 @@ test('audit review ingests alias events as canonical and rejects unknown events 
     cursorStore,
     detector,
     llmReviewer,
+    toolSemanticMapper,
     notifier,
     visualization,
     auditLogger: { log: async () => {} },
@@ -649,6 +656,7 @@ test('audit review ingests alias events as canonical and rejects unknown events 
     reviewStore,
     visualization,
     dashboardAuth,
+    toolSemanticMapper,
   });
 
   await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
@@ -682,22 +690,25 @@ test('audit review ingests alias events as canonical and rejects unknown events 
         span_id: 'span-unknown-tool-finish',
         event: 'tool.finish',
         tool_name: 'db.delete',
-        result_summary: 'should be rejected',
+        result_summary: 'unknown lifecycle event should be accepted',
       })),
     });
     assert.equal(unknownResponse.status, 202);
     const unknownBody = await unknownResponse.json();
-    assert.equal(unknownBody.accepted, 0);
-    assert.equal(unknownBody.rejected, 1);
-    assert.ok(unknownBody.errors.some((error) => /invalid event "tool\.finish"/.test(error.error)));
+    assert.equal(unknownBody.accepted, 1);
+    assert.equal(unknownBody.rejected, 0);
+    assert.deepEqual(unknownBody.errors, []);
 
-    const storedAlias = db.prepare('SELECT event, raw_json FROM audit_events WHERE trace_id = ?').get(aliasTraceId);
+    const storedAlias = db.prepare('SELECT event, mapped_tool_type, mapping_status, raw_json FROM audit_events WHERE trace_id = ?').get(aliasTraceId);
     assert.equal(storedAlias.event, 'tool.end');
+    assert.equal(storedAlias.mapped_tool_type, 'delete');
+    assert.equal(storedAlias.mapping_status, 'mapped');
     assert.equal(JSON.parse(storedAlias.raw_json).event, 'tool_end');
-    assert.equal(
-      db.prepare('SELECT COUNT(*) AS count FROM audit_events WHERE trace_id = ?').get(unknownTraceId).count,
-      0,
-    );
+    const storedUnknown = db.prepare('SELECT event, mapped_tool_type, mapping_status, raw_json FROM audit_events WHERE trace_id = ?').get(unknownTraceId);
+    assert.equal(storedUnknown.event, 'unknown');
+    assert.equal(storedUnknown.mapped_tool_type, 'delete');
+    assert.equal(storedUnknown.mapping_status, 'mapped');
+    assert.equal(JSON.parse(storedUnknown.raw_json).event, 'tool.finish');
 
     const spooled = fs.readFileSync(
       path.join(config.ingest.spoolDir, 'agent-test', `audit-${aliasEventTs.slice(0, 10)}.jsonl`),
@@ -705,7 +716,7 @@ test('audit review ingests alias events as canonical and rejects unknown events 
     );
     assert.ok(spooled.includes(aliasTraceId));
     assert.ok(spooled.includes('"event":"tool_end"'));
-    assert.equal(spooled.includes(unknownTraceId), false);
+    assert.ok(spooled.includes(unknownTraceId));
 
     const runResponse = await fetch(`${baseUrl}/v1/audit-reviews/run`, {
       method: 'POST',
@@ -715,12 +726,13 @@ test('audit review ingests alias events as canonical and rejects unknown events 
 
     assert.equal(capturedPayloads.length, 1);
     const [payload] = capturedPayloads;
-    assert.equal(payload.candidates.length, 1);
+    assert.equal(payload.candidates.length, 2);
     assert.equal(payload.candidates[0].trace_id, aliasTraceId);
     assert.equal(payload.candidates[0].tool_name, 'db.delete');
     assert.equal(payload.candidates[0].event, 'tool.end');
-    assert.ok(payload.candidates.every((candidate) => candidate.event === 'tool.end'));
-    assert.equal(payload.candidates.some((candidate) => candidate.trace_id === unknownTraceId), false);
+    assert.equal(payload.candidates[0].mapped_tool_type, 'delete');
+    assert.ok(payload.candidates.some((candidate) => candidate.trace_id === unknownTraceId));
+    assert.ok(payload.candidates.every((candidate) => candidate.mapped_tool_type === 'delete'));
   } finally {
     app.close();
     db.close();

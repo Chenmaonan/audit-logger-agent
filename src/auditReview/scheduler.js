@@ -254,6 +254,7 @@ export function createAuditReviewScheduler({
   cursorStore,
   detector,
   llmReviewer,
+  toolSemanticMapper,
   notifier,
   visualization,
   auditLogger,
@@ -470,6 +471,13 @@ export function createAuditReviewScheduler({
 
       // 6. Detect candidates.
       try {
+        if (toolSemanticMapper) {
+          await toolSemanticMapper.mapPendingEvents({
+            from: windowFrom,
+            to: windowTo,
+            limit: maxEventsPerReview,
+          });
+        }
         candidates = detector.detect({ windowFrom, windowTo, maxEventsPerReview });
         logAudit(
           'review.detector.completed',

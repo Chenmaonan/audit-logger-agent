@@ -81,7 +81,6 @@ test('parser rejects legacy and malformed audit fields', () => {
     ['incomplete entity', validEntry({ entity: { type: 'document' } }), /entity/],
     ['bad llm_intent', validEntry({ llm_intent: { input: 'x', output: 1 } }), /llm_intent/],
     ['non-canonical status', validEntry({ status: 'error' }), /status/],
-    ['unknown event', validEntry({ event: 'tool/unknown' }), /invalid event/],
   ];
 
   for (const [name, entry, pattern] of cases) {
@@ -89,6 +88,19 @@ test('parser rejects legacy and malformed audit fields', () => {
     assert.equal(entries.length, 0, name);
     assert.ok(errors.some((error) => pattern.test(error)), `${name}: ${errors.join('; ')}`);
   }
+});
+
+test('parser accepts unknown lifecycle events as unknown while preserving raw event', () => {
+  const entry = validEntry({ event: 'tool/unknown' });
+  const { entries, errors } = parseOne(entry);
+
+  assert.deepEqual(errors, []);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].event, 'tool/unknown');
+
+  const row = normalizeEntry(entries[0]);
+  assert.equal(row.event, 'unknown');
+  assert.equal(JSON.parse(row.raw_json).event, 'tool/unknown');
 });
 
 test('insertEvents stores canonical event and preserves original raw event for dedupe traceability', () => {
@@ -139,6 +151,42 @@ test('insertEvents stores entity and llm_intent columns and queryEvents filters 
     assert.ok(columns.includes('entity_type'));
     assert.ok(columns.includes('entity_id'));
     assert.ok(columns.includes('llm_intent_json'));
+    assert.ok(columns.includes('mapped_tool_type'));
+    assert.ok(columns.includes('mapping_status'));
+    assert.ok(columns.includes('mapping_reason'));
+    assert.ok(columns.includes('mapping_model'));
+    assert.ok(columns.includes('mapping_version'));
+    assert.ok(columns.includes('mapped_at'));
+  } finally {
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('queryEvents filters by mapped tool type and mapping status', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-mapping-query-db-'));
+  const db = openDb(path.join(tmpDir, 'audit.db'));
+  try {
+    insertEvents(db, [
+      {
+        ...normalizeEntry(validEntry({ trace_id: 'trace-delete', tool_name: 'db.delete' })),
+        mapped_tool_type: 'delete',
+        mapping_status: 'mapped',
+      },
+      {
+        ...normalizeEntry(validEntry({ trace_id: 'trace-unknown', tool_name: 'custom.action' })),
+        mapped_tool_type: 'unknown',
+        mapping_status: 'unknown',
+      },
+    ]);
+
+    const deletes = queryEvents(db, { mapped_tool_type: 'delete', mapping_status: 'mapped' });
+    assert.equal(deletes.length, 1);
+    assert.equal(deletes[0].trace_id, 'trace-delete');
+
+    const unknown = queryEvents(db, { mapped_tool_type: 'unknown' });
+    assert.equal(unknown.length, 1);
+    assert.equal(unknown[0].trace_id, 'trace-unknown');
   } finally {
     db.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -183,6 +231,12 @@ test('openDb migrates legacy audit_events before creating entity index', () => {
     assert.ok(columns.includes('entity_type'));
     assert.ok(columns.includes('entity_id'));
     assert.ok(columns.includes('llm_intent_json'));
+    assert.ok(columns.includes('mapped_tool_type'));
+    assert.ok(columns.includes('mapping_status'));
+    assert.ok(columns.includes('mapping_reason'));
+    assert.ok(columns.includes('mapping_model'));
+    assert.ok(columns.includes('mapping_version'));
+    assert.ok(columns.includes('mapped_at'));
     const index = db.prepare(`
       SELECT name
       FROM sqlite_master

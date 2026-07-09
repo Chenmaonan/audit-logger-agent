@@ -21,6 +21,7 @@ export function buildEvidenceDetail(event, config = {}) {
     agent_id: event.agent_id ?? null,
     agent_name: agentDisplayName(event.agent_id, config),
     tool_name: event.tool_name ?? null,
+    mapped_tool_type: event.mapped_tool_type ?? null,
     trace_id: event.trace_id ?? null,
     span_id: event.span_id ?? null,
     log_detail: {
@@ -35,6 +36,8 @@ export function buildEvidenceDetail(event, config = {}) {
       ),
       result_summary: event.result_summary ?? null,
       error_message: event.error_message ?? null,
+      mapping_status: event.mapping_status ?? null,
+      mapping_reason: event.mapping_reason ?? null,
       reason: event.reason ?? null,
     },
   };

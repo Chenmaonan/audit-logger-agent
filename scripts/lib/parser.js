@@ -28,8 +28,8 @@ export function validateLogEntry(entry, lineNumber) {
     }
   }
 
-  if (entry.event && !normalizeEventId(entry.event)) {
-    errors.push(`line ${lineNumber}: invalid event "${entry.event}"`);
+  if (entry.event && typeof entry.event !== 'string') {
+    errors.push(`line ${lineNumber}: event must be a string`);
   }
 
   if (entry.status && !isCanonicalStatus(entry.status)) {
@@ -138,7 +138,7 @@ export function normalizeEntry(entry) {
     trace_id: entry.trace_id,
     span_id: entry.span_id,
     parent_span_id: entry.parent_span_id === '' ? null : (entry.parent_span_id ?? null),
-    event: canonicalEvent ?? entry.event,
+    event: canonicalEvent ?? 'unknown',
     tool_name: entry.tool_name,
     status: entry.status,
     result_summary: entry.result_summary,
