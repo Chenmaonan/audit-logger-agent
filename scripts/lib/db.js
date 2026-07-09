@@ -32,7 +32,6 @@ CREATE INDEX IF NOT EXISTS idx_audit_tool ON audit_events(tool_name);
 CREATE INDEX IF NOT EXISTS idx_audit_trace ON audit_events(trace_id);
 CREATE INDEX IF NOT EXISTS idx_audit_span ON audit_events(span_id);
 CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_events(status);
-CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_events(entity_type, entity_id);
 `;
 
 import crypto from 'crypto';

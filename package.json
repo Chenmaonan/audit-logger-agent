@@ -5,6 +5,7 @@
   "type": "module",
   "main": "scripts/ingest.js",
   "scripts": {
+    "test": "node scripts/run-tests.js",
     "ingest": "node scripts/ingest.js",
     "query": "node scripts/query.js",
     "report": "node scripts/report.js",

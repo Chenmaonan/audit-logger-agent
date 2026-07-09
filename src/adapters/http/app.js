@@ -395,7 +395,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
       }
 
       if (req.method === 'POST' && url.pathname === '/v1/ingest' && isHttpIngestEnabled(config)) {
-        await handleIngestRoute(req, res, { config });
+        await handleIngestRoute(req, res, { config, db });
         return;
       }
 

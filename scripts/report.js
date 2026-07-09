@@ -9,19 +9,14 @@ import {
   reportDateForNow,
   reportTimezoneOffsetMinutes,
 } from './lib/db.js';
+import { loadAppConfig } from '../src/app/loadConfig.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const configPath = path.resolve(__dirname, '..', 'config.json');
+const rootDir = path.resolve(__dirname, '..');
+const config = loadAppConfig(rootDir);
+const dbPath = config.paths.dbPath;
 
-if (!fs.existsSync(configPath)) {
-  console.error('config.json not found.');
-  process.exit(1);
-}
-
-const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-const dbPath = path.resolve(__dirname, '..', config.dbPath);
-
-if (!fs.existsSync(path.dirname(dbPath))) {
+if (!fs.existsSync(dbPath)) {
   console.error('No database found. Run ingest first.');
   process.exit(1);
 }

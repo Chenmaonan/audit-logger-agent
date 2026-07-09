@@ -10,7 +10,7 @@ Prefer setting `AUDIT_AGENT_LLM_API_KEY` in the process environment managed by P
 chmod 600 .config
 ```
 
-The repository ignores `.config`, `data/`, and `.server.log`; keep SQLite databases, WAL files, local credentials, and process logs out of Git.
+The repository ignores normalized app-owned runtime storage under `data/` and `logs/`. Repo-root `tmp/` stays ignored as local scratch only, and root `.server*` / `.callback-*` files such as `.server.log` stay ignored for legacy migration compatibility. Keep SQLite databases, WAL files, spool files, captures, temp files, local credentials, and process logs out of Git.
 
 ### Process supervision
 
@@ -35,8 +35,8 @@ ExecStart=/usr/bin/node scripts/server.js --port 9320
 Environment=AUDIT_AGENT_LLM_API_KEY=replace-with-secret
 Restart=always
 RestartSec=5
-StandardOutput=append:/opt/audit-logger-agent/.server.log
-StandardError=append:/opt/audit-logger-agent/.server.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -67,10 +67,10 @@ When `bindHost` is non-loopback, set `AUDIT_AGENT_DASHBOARD_TOKEN` in the servic
 
 ### Log rotation
 
-Rotate `.server.log` or the supervisor stdout/stderr target. A simple `logrotate` rule:
+Rotate the normalized files under `logs/` such as `server.log`, `server.err.log`, and callback receiver logs. Root `.server.log`, `.server.err.log`, `.callback-*.log`, and `.callback-*.err.log` are legacy migration-compatibility leftovers only; when present, startup migrates/appends them into normalized paths instead of treating them as steady-state write targets. A simple `logrotate` rule:
 
 ```text
-/opt/audit-logger-agent/.server.log {
+/opt/audit-logger-agent/logs/*.log {
   daily
   rotate 14
   compress
@@ -79,17 +79,79 @@ Rotate `.server.log` or the supervisor stdout/stderr target. A simple `logrotate
 }
 ```
 
-If PM2 owns the logs, use the PM2 logrotate module or an equivalent host-level rotation policy.
+If PM2 also stores supervisor stdout/stderr logs, rotate the PM2 log directory separately.
 
 ### SQLite backups
 
-Do not directly copy active SQLite database, `-wal`, or `-shm` files while the service is running. Use SQLite online backup so WAL-active databases are copied consistently:
+Do not directly copy the active SQLite database, `-wal`, or `-shm` files while the service is running. Use SQLite online backup so WAL-active databases are copied consistently:
 
 ```bash
-sqlite3 data/audit.db ".backup 'backups/audit-$(date +%F).db'"
+sqlite3 data/db/audit.db ".backup 'backups/audit-$(date +%F).db'"
 ```
 
 Keep backups outside `data/` if they need separate retention or off-host sync.
+
+### Workspace-owned runtime storage
+
+The normalized app-owned runtime layout is:
+
+```text
+data/db/audit.db
+data/db/audit.db-wal
+data/db/audit.db-shm
+data/spool/incoming/
+data/tmp/
+data/captures/
+logs/
+```
+
+Repo-root `tmp/` is not part of the normalized runtime layout. Root `.server*` / `.callback-*` files are legacy migration-compatibility artifacts only, not normal runtime targets. When present at startup, the service migrates or appends them into normalized paths.
+
+Built-in retention and `node scripts/prune.js` only touch retention-managed SQLite rows and app-owned directories resolved from `config.json` under the repository root. They do not scan or delete workspace-local directories/files such as `.agents/`, `.claude/`, `.superpowers/`, `record.json`, or `Typora_Hook_Log.txt`. Those paths are outside app self-cleanup scope even if they contain log-like files.
+
+### Built-in prune and retention
+
+Dry-run:
+
+```bash
+node scripts/prune.js --dry-run
+```
+
+Apply cleanup:
+
+```bash
+node scripts/prune.js
+```
+
+Use a different repository root:
+
+```bash
+AUDIT_LOGGER_ROOT=/opt/audit-logger-agent node scripts/prune.js --dry-run
+```
+
+Default retention windows:
+
+| Target | Default behavior |
+| --- | --- |
+| `audit_events` | Delete rows older than 90 days. |
+| `agent_runs` | Delete only terminal (`completed` / `failed` / `cancelled`) runs older than 30 days. |
+| `agent_run_steps` | Delete steps that belong to terminal runs older than 30 days. |
+| `agent_waiting_states` | Delete resolved states older than 30 days, plus states attached to terminal runs older than 30 days. |
+| `audit_review_runs` | Delete rows older than 60 days. |
+| `audit_review_findings` | Delete only `resolved` rows with `resolved_at` older than 30 days. |
+| `audit_llm_usage` | Delete day buckets older than 90 days. |
+| `agent_outbox_events` | Delete only `delivered` / `dead_letter` rows older than 14 days. |
+| `data/spool/incoming/<agent>/audit-*.jsonl` | Delete files older than 90 days only when the ingest cursor proves the whole file was consumed. |
+| `logs/` | Delete files older than 14 days. |
+| `data/tmp/` | Delete files older than 7 days. |
+| `data/captures/` | Delete files older than 30 days. |
+
+Notes:
+
+- Prune walks only these retention-managed SQLite tables: `audit_events`, `agent_runs`, `agent_run_steps`, `agent_waiting_states`, `audit_review_runs`, `audit_review_findings` (`resolved` only), `audit_llm_usage`, and `agent_outbox_events`; plus app-owned directories resolved from config: `ingest.spoolDir`, `logDir`, `tmpDir`, and `capturesDir`.
+- Cleanup targets must stay inside the repository root. Paths that resolve outside the root are skipped rather than deleted.
+- It does not scan or delete `.agents/`, `.claude/`, `.superpowers/`, `record.json`, or `Typora_Hook_Log.txt`.
+- Root `.server*` / `.callback-*` files are Git-ignored only for runtime path migration compatibility. They are not part of app self-cleanup, not the normal runtime layout, and not pruned as standalone steady-state targets.
 
 `audit-logger-agent` 是一个 Agent 审计日志中台。它负责采集多个 Agent 输出的 NDJSON 审计日志，写入本地 SQLite，提供命令行查询、HTTP API、周期性 LLM 审查、风险发现 Dashboard 和回调通知。
 
@@ -126,21 +188,20 @@ Keep backups outside `data/` if they need separate retention or off-host sync.
 ```text
 config.json               主配置文件
 package.json              npm 脚本和依赖
-scripts/ingest.js         批量采集日志
+scripts/ingest.js         已停用的旧 ingest CLI（提示改用 /v1/ingest）
 scripts/query.js          命令行查询审计事件
 scripts/report.js         命令行报表
 scripts/server.js         HTTP 服务入口
-scripts/lib/              解析、扫描、数据库基础能力
+scripts/lib/              解析、spool 扫描、数据库基础能力
 src/                      服务端运行源码
-data/audit.db             本地 SQLite 数据库，本地生成，不进入 Git
+data/db/audit.db          本地 SQLite 数据库，本地生成，不进入 Git
 .config                   本地 LLM 凭证，本地创建，不进入 Git
 ```
 
 ## 环境要求
 
 - Node.js 20 或更高版本。
-- 能访问上游 Agent 日志目录的本地文件权限。
-- 项目目录可写，用于创建 `data/audit.db`。
+- 项目目录可写，用于创建 `data/db/audit.db` 及其父目录。
 - 启动 `server` 模式时必须提供 OpenAI 兼容 LLM 凭证。
 - 如果启用回调通知，需要准备一个可访问的 HTTP 回调接收端。
 
@@ -156,21 +217,12 @@ Windows PowerShell 下也可以使用同一命令。
 
 ### `config.json`
 
-`config.json` 是主配置文件。当前默认配置采集两个上游 Agent：
+`config.json` 是主配置文件。当前部署只保留 HTTP ingest -> 本机 spool -> 审计/查询 链路：
 
 ```json
 {
-  "dbPath": "data/audit.db",
-  "agents": {
-    "rental-price-agent": {
-      "logDir": "../../rental-price-agent-main/tasks/logs",
-      "pattern": "audit-*.jsonl"
-    },
-    "mt-agent": {
-      "logDir": "../../MT-agent-master/output/logs",
-      "pattern": "audit-*.jsonl"
-    }
-  }
+  "dbPath": "data/db/audit.db",
+  "agents": {}
 }
 ```
 
@@ -178,10 +230,8 @@ Windows PowerShell 下也可以使用同一命令。
 
 | 字段 | 说明 |
 | --- | --- |
-| `dbPath` | SQLite 数据库路径。目录不存在时会自动创建。 |
-| `agents` | 需要采集的上游 Agent 列表。对象 key 通常与日志里的 `agent_id` 对应。 |
-| `agents.<id>.logDir` | 该 Agent 的日志目录。 |
-| `agents.<id>.pattern` | 日志文件匹配模式，常用 `audit-*.jsonl`。 |
+| `dbPath` | SQLite 数据库路径。父目录不存在时会自动创建。 |
+| `agents` | 预留字段。当前不再使用 `config.agents[].logDir/pattern` 做本地扫描。 |
 | `auditReview.enabled` | 是否启动周期性审查调度器。 |
 | `auditReview.intervalMinutes` | 周期性审查间隔，单位分钟。 |
 | `auditReview.initialDelaySeconds` | 服务启动后第一次自动审查延迟秒数。 |
@@ -303,7 +353,7 @@ Invoke-RestMethod -Uri "http://127.0.0.1:9320/health"
 ```json
 {
   "status": "ok",
-  "dbPath": "e:\\工作空间\\audit-logger-agent\\data\\audit.db"
+  "dbPath": "e:\\工作空间\\audit-logger-agent\\data\\db\\audit.db"
 }
 ```
 
@@ -413,15 +463,10 @@ pm2 logs audit-logger-agent --lines 100
 npm run ingest
 ```
 
-按文件名日期过滤：
-
-```bash
-npm run ingest -- --since 2026-07-01
-```
-
 说明：
 
-- CLI 采集会扫描 `config.json` 中所有 `agents`。
+- `npm run ingest` 已停用，会直接提示改用 `POST /v1/ingest`。
+- 所有上游 Agent 必须主动把审计事件 POST 到服务端。
 - 去重依据是原始 JSON 行的哈希 `row_hash`。
 - 同一 span 的 `tool.start` 和 `tool.end` 是两条独立事件。
 - 解析失败的行会打印错误，不会写入 `audit_events`。
@@ -553,7 +598,7 @@ http://127.0.0.1:9320/query?status=INTERNAL&limit=20
 
 ### 上游推送采集
 
-远端 Agent 无法共享本地日志目录时，可以把审计事件推送到服务端：
+所有上游 Agent 都必须把审计事件主动推送到服务端；不再支持被动扫描其他机器上的本地日志目录：
 
 ```bash
 curl -X POST http://127.0.0.1:9320/v1/ingest \
@@ -565,6 +610,8 @@ curl -X POST http://127.0.0.1:9320/v1/ingest \
 
 - `Content-Type: application/x-ndjson`：每行一个 JSON 事件。
 - `Content-Type: application/json`：单个事件对象，或 `{ "events": [...] }` 批量事件。
+
+统一 HTTP ingest 接口会先校验并规范化 `event`，再写入 `audit_events`。支持的 alias 规则是：保留同一组小写 segment，只在 segment 之间替换分隔符 `.`、`/`、`_`、`-`。例如 `tool.end`、`tool/end`、`tool_end`、`tool-end` 都会归一为 `tool.end`。未知 `event` 会在入口直接拒收，不会进入 detector / LLM 审查链路。
 
 JSON 批量示例：
 
@@ -595,12 +642,11 @@ JSON 批量示例：
 }
 ```
 
-已接收的行会追加写入 `data/incoming/<agent_id>/audit-YYYY-MM-DD.jsonl`，
+已接收的行会追加写入 `data/spool/incoming/<agent_id>/audit-YYYY-MM-DD.jsonl`，
 随后由现有增量采集流程入库，并继续复用 `row_hash` 去重。`agent_id` 只允许
 字母、数字、`.`、`_`、`-`，空值、`..`、`/`、`` 会被拒绝。请求体大小由
 `ingest.http.maxBodyBytes` 控制，单行或单事件大小由 `ingest.http.maxLineBytes`
-控制。设置 `ingest.http.enabled=false` 可以关闭该 HTTP 推送端点，且不影响本地
-文件扫描。
+控制。设置 `ingest.http.enabled=false` 可以关闭该 HTTP 推送端点；关闭后将没有日志进入本机 spool。
 
 ### LLM Runtime 接口
 
@@ -668,7 +714,7 @@ Upstream agents write one complete JSON object per line in NDJSON files, normall
 audit-YYYY-MM-DD.jsonl
 ```
 
-This spec is not backward compatible with old audit events. New ingestion rejects events that still send `product_id`, `error.code`, or non-canonical `status` values.
+This spec is not backward compatible with old audit events. New ingestion rejects events that still send `product_id`, `error.code`, non-canonical `status` values, or unknown `event` ids.
 
 ### Required Fields
 
@@ -678,7 +724,7 @@ This spec is not backward compatible with old audit events. New ingestion reject
 | `agent_id` | string | Producing agent id. |
 | `trace_id` | string | Request/task trace id. |
 | `span_id` | string | Current span id. |
-| `event` | string | Must be in the event table below. |
+| `event` | string | Must be a canonical event below, or a supported separator alias that normalizes to one. |
 | `tool_name` | string | Tool or runtime component name. |
 | `status` | string | Google/gRPC canonical code. Success is `OK`. |
 | `result_summary` | string | Short summary, max 200 chars. |
@@ -713,6 +759,16 @@ This spec is not backward compatible with old audit events. New ingestion reject
 | `run.failed` | `run/failed` |
 
 Runtime review logs also use `review.*` events such as `review.start`, `review.llm.completed`, and `review.completed`.
+
+### Event Normalization
+
+Ingestion canonicalizes `event` before writing to `audit_events`:
+
+- Canonical ids use dot-separated lowercase segments, for example `tool.end` and `review.llm.completed`.
+- Accepted aliases may swap only the separators between the same lowercase segments: `.`, `/`, `_`, and `-` are treated as equivalent. Examples: `tool/end`, `tool_end`, and `tool-end` all normalize to `tool.end`.
+- Multi-segment events follow the same rule, for example `review/llm/completed` and `review_llm_completed` both normalize to `review.llm.completed`.
+- Unknown ids such as `tool.finish` are rejected during ingestion and do not enter `audit_events`, detector candidates, or LLM review input.
+- LLM audit review uses only canonical `event` values read from `audit_events`; the original upstream payload is still retained in `raw_json`.
 
 ### Status Values
 
@@ -764,7 +820,7 @@ The full canonical set also includes `CANCELLED`, `UNKNOWN`, `ALREADY_EXISTS`, `
 
 ## 审查规则和 Finding
 
-本地规则会先筛出候选事件，再交给 LLM 审查。主要类别：
+本地规则会先筛出候选事件，再交给 LLM 审查。detector 和 LLM 审查读取的是 `audit_events` 里的 canonical `event`，不会直接消费未知或未规范化的上游 event id。主要类别：
 
 | 类别 | 说明 |
 | --- | --- |
@@ -842,13 +898,11 @@ LLM Runtime 会向请求里的 `delivery.target_url` 投递：
 
 说明服务读取到了 Token，但请求里的 Token 不匹配。
 
-### 有日志文件但没有采集到
+### HTTP ingest 没有采集到事件
 
 检查：
 
-- `config.json` 里的 `logDir` 是否指向真实目录。
-- 文件名是否匹配 `pattern`。
-- `--since` 是否把文件名日期过滤掉。
+- 上游 Agent 是否已经实际发送 `POST /v1/ingest`。
 - NDJSON 是否一行一个 JSON。
 - 是否缺少必填字段。
 - `event` / `status` 是否使用合法枚举。
@@ -858,7 +912,7 @@ LLM Runtime 会向请求里的 `delivery.target_url` 投递：
 
 检查：
 
-- 是否已经执行 `npm run ingest` 或触发审查。
+- 是否已经发送 `POST /v1/ingest` 或触发审查。
 - 审查批次 `inserted_events` 是否大于 0。
 - 审查批次 `candidate_event_count` 是否大于 0。
 - LLM 是否返回成功；失败时批次状态会是 `completed_degraded`。

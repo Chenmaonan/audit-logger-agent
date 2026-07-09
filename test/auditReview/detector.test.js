@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 import { createCandidateDetector, matchGlob } from '../../src/auditReview/candidateDetector.js';
+import { normalizeEntry } from '../../scripts/lib/parser.js';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -62,6 +63,32 @@ function makeDb() {
   const db = new Database(':memory:');
   db.exec(SCHEMA);
   return db;
+}
+
+function mkNormalized(db, n, opts) {
+  const normalized = normalizeEntry({
+    ts: opts.ts ?? '2026-07-03T10:00:00.000Z',
+    agent_id: opts.agent_id ?? 'mt-agent',
+    trace_id: opts.trace_id ?? 'trace-1',
+    span_id: opts.span_id ?? `span-${n}`,
+    parent_span_id: opts.parent_span_id ?? null,
+    event: opts.event ?? 'tool.end',
+    tool_name: opts.tool_name ?? 'some.tool',
+    status: opts.status ?? 'OK',
+    result_summary: opts.result_summary ?? 'ok',
+    duration_ms: opts.duration_ms ?? 10,
+    channel: opts.channel ?? null,
+    user_id: opts.user_id ?? null,
+    entity: opts.entity ?? null,
+    llm_intent: opts.llm_intent ?? null,
+    error: opts.error ?? null,
+    tags: opts.tags ?? null,
+  });
+
+  mk(db, n, {
+    ...normalized,
+    raw_json: normalized.raw_json,
+  });
 }
 
 test('matchGlob supports * wildcards case-insensitively', () => {
@@ -225,6 +252,45 @@ test('detect flags anomalous_call for unknown tool not in agent allowlist', () =
 
   const anomalous = candidates.filter((c) => c.category === 'anomalous_call');
   assert.ok(anomalous.some((c) => c.event_id === 1), 'unknown tool should be anomalous_call');
+});
+
+test('detect sees canonical event after upstream alias is normalized before insert', () => {
+  const db = makeDb();
+  mkNormalized(db, 1, {
+    ts: '2026-07-03T10:05:00.000Z',
+    trace_id: 'trace-alias',
+    span_id: 'span-alias',
+    event: 'tool_end',
+    tool_name: 'db.deleteTable',
+    status: 'OK',
+    result_summary: 'deleted 1 table',
+  });
+
+  const stored = db.prepare('SELECT event, raw_json FROM audit_events WHERE trace_id = ?').get('trace-alias');
+  assert.equal(stored.event, 'tool.end');
+  assert.equal(JSON.parse(stored.raw_json).event, 'tool_end');
+
+  const detector = createCandidateDetector({
+    db,
+    riskPolicy: {
+      version: 'risk-policy-v1',
+      repeatWindowMinutes: 10,
+      repeatThreshold: 5,
+      slowCallDurationMs: 30000,
+      highRiskToolPatterns: ['*delete*'],
+      agentToolAllowlists: {},
+    },
+  });
+
+  const { candidates } = detector.detect({
+    windowFrom: '2026-07-03T10:00:00.000Z',
+    windowTo: '2026-07-03T10:30:00.000Z',
+    maxEventsPerReview: 500,
+  });
+
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].category, 'high_risk_permission');
+  assert.equal(candidates[0].event, 'tool.end');
 });
 
 test('detect trims and caps candidates when totalEvents exceeds maxEventsPerReview', () => {

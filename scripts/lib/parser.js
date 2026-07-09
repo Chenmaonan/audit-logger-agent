@@ -2,7 +2,7 @@ import {
   CANONICAL_STATUS_CODES,
   REQUIRED_FIELDS,
   isCanonicalStatus,
-  isValidEvent,
+  normalizeEventId,
 } from './auditSpec.js';
 
 const DEFAULT_MAX_LINE_BYTES = 64 * 1024;
@@ -28,7 +28,7 @@ export function validateLogEntry(entry, lineNumber) {
     }
   }
 
-  if (entry.event && !isValidEvent(entry.event)) {
+  if (entry.event && !normalizeEventId(entry.event)) {
     errors.push(`line ${lineNumber}: invalid event "${entry.event}"`);
   }
 
@@ -131,13 +131,14 @@ export function parseNdjson(content, options = {}) {
 export function normalizeEntry(entry) {
   const error = entry.error || null;
   const entity = entry.entity || null;
+  const canonicalEvent = normalizeEventId(entry.event);
   return {
     ts: entry.ts,
     agent_id: entry.agent_id,
     trace_id: entry.trace_id,
     span_id: entry.span_id,
     parent_span_id: entry.parent_span_id === '' ? null : (entry.parent_span_id ?? null),
-    event: entry.event,
+    event: canonicalEvent ?? entry.event,
     tool_name: entry.tool_name,
     status: entry.status,
     result_summary: entry.result_summary,

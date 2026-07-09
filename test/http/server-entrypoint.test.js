@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { resolveServerBindHost, listenHttpServer } from '../../src/adapters/http/serverListen.js';
+import { loadAppConfig } from '../../src/app/loadConfig.js';
+import { getRuntimePaths, migrateLegacyRuntimeArtifacts } from '../../src/app/paths.js';
 
 test('server entrypoint resolves configured auditReview.http.bindHost', () => {
   assert.equal(
@@ -29,4 +34,124 @@ test('server entrypoint starts app on the resolved bind host', async () => {
 
   assert.deepEqual(listenCalls, [{ port: 9321, host: '0.0.0.0' }]);
   assert.equal(announced, 'http://0.0.0.0:9321');
+});
+
+test('loadAppConfig fills the normalized runtime path defaults', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-config-layout-'));
+  try {
+    fs.writeFileSync(path.join(tmpDir, 'config.json'), JSON.stringify({
+      agents: {},
+      ingest: { http: { enabled: true } },
+    }), 'utf-8');
+
+    const config = loadAppConfig(tmpDir);
+    assert.equal(config.rootDir, tmpDir);
+    assert.equal(config.dbPath, 'data/db/audit.db');
+    assert.equal(config.ingest.spoolDir, 'data/spool/incoming');
+    assert.equal(config.capturesDir, 'data/captures');
+    assert.equal(config.tmpDir, 'data/tmp');
+    assert.equal(config.logDir, 'logs');
+    assert.equal(config.paths.dbPath, path.join(tmpDir, 'data', 'db', 'audit.db'));
+    assert.equal(config.paths.spoolDir, path.join(tmpDir, 'data', 'spool', 'incoming'));
+    assert.equal(config.paths.capturesDir, path.join(tmpDir, 'data', 'captures'));
+    assert.equal(config.paths.tmpDir, path.join(tmpDir, 'data', 'tmp'));
+    assert.equal(config.paths.logDir, path.join(tmpDir, 'logs'));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('legacy runtime artifacts migrate into the normalized layout', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-migrate-layout-'));
+  try {
+    fs.writeFileSync(path.join(tmpDir, 'config.json'), JSON.stringify({
+      dbPath: 'data/db/audit.db',
+      ingest: {
+        http: { enabled: true },
+        spoolDir: 'data/spool/incoming',
+      },
+      capturesDir: 'data/captures',
+      tmpDir: 'data/tmp',
+      logDir: 'logs',
+    }), 'utf-8');
+
+    fs.mkdirSync(path.join(tmpDir, 'data', 'incoming', 'legacy-agent'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, '.server.log'), 'legacy server log\n', 'utf-8');
+    fs.writeFileSync(path.join(tmpDir, '.callback-9999.log'), 'legacy callback log\n', 'utf-8');
+    fs.writeFileSync(path.join(tmpDir, 'data', 'callback-events.ndjson'), '{"ok":true}\n', 'utf-8');
+    fs.writeFileSync(path.join(tmpDir, 'data', 'audit.db'), 'db', 'utf-8');
+    fs.writeFileSync(path.join(tmpDir, 'data', 'audit.db-wal'), 'wal', 'utf-8');
+    fs.writeFileSync(path.join(tmpDir, 'data', 'incoming', 'legacy-agent', 'audit-2026-07-07.jsonl'), '{"trace_id":"legacy"}\n', 'utf-8');
+
+    const config = loadAppConfig(tmpDir);
+    const migration = migrateLegacyRuntimeArtifacts(config);
+
+    assert.ok(migration.moved.length >= 5);
+    assert.equal(fs.existsSync(path.join(tmpDir, '.server.log')), false);
+    assert.equal(fs.existsSync(path.join(tmpDir, '.callback-9999.log')), false);
+    assert.equal(fs.existsSync(path.join(tmpDir, 'data', 'callback-events.ndjson')), false);
+    assert.equal(fs.existsSync(path.join(tmpDir, 'data', 'audit.db')), false);
+    assert.equal(fs.existsSync(path.join(tmpDir, 'data', 'incoming')), false);
+    assert.equal(
+      fs.readFileSync(path.join(tmpDir, 'logs', 'server.log'), 'utf-8'),
+      'legacy server log\n',
+    );
+    assert.equal(
+      fs.readFileSync(path.join(tmpDir, 'logs', 'callback-9999.log'), 'utf-8'),
+      'legacy callback log\n',
+    );
+    assert.equal(
+      fs.readFileSync(path.join(tmpDir, 'data', 'captures', 'callback-events.ndjson'), 'utf-8'),
+      '{"ok":true}\n',
+    );
+    assert.equal(fs.readFileSync(path.join(tmpDir, 'data', 'db', 'audit.db'), 'utf-8'), 'db');
+    assert.equal(fs.readFileSync(path.join(tmpDir, 'data', 'db', 'audit.db-wal'), 'utf-8'), 'wal');
+    assert.equal(
+      fs.readFileSync(path.join(tmpDir, 'data', 'spool', 'incoming', 'legacy-agent', 'audit-2026-07-07.jsonl'), 'utf-8'),
+      '{"trace_id":"legacy"}\n',
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('getRuntimePaths preserves an already-resolved custom layout object', () => {
+  const rootDir = path.join(os.tmpdir(), 'audit-runtime-paths-custom');
+  const resolvedPaths = {
+    rootDir,
+    dbPath: path.join(rootDir, 'var', 'db', 'audit.db'),
+    dbDir: path.join(rootDir, 'var', 'db'),
+    spoolDir: path.join(rootDir, 'var', 'spool', 'incoming'),
+    capturesDir: path.join(rootDir, 'var', 'captures'),
+    tmpDir: path.join(rootDir, 'var', 'tmp'),
+    logDir: path.join(rootDir, 'var', 'logs'),
+    serverLogPath: path.join(rootDir, 'var', 'logs', 'server.log'),
+    serverErrLogPath: path.join(rootDir, 'var', 'logs', 'server.err.log'),
+    callbackReceiverLogPath: path.join(rootDir, 'var', 'logs', 'callback-9999.log'),
+    callbackReceiverErrLogPath: path.join(rootDir, 'var', 'logs', 'callback-9999.err.log'),
+    callbackCapturePath: path.join(rootDir, 'var', 'captures', 'callback-events.ndjson'),
+  };
+
+  assert.equal(getRuntimePaths(resolvedPaths), resolvedPaths);
+});
+
+test('getRuntimePaths merges partial config.paths overrides with normalized defaults', () => {
+  const rootDir = path.join(os.tmpdir(), 'audit-runtime-paths-partial');
+
+  const paths = getRuntimePaths({
+    rootDir,
+    ingest: {
+      spoolDir: 'data/spool/incoming',
+    },
+    paths: {
+      rootDir,
+      dbPath: path.join(rootDir, 'runtime', 'db', 'audit.db'),
+    },
+  });
+
+  assert.equal(paths.dbPath, path.join(rootDir, 'runtime', 'db', 'audit.db'));
+  assert.equal(paths.spoolDir, path.join(rootDir, 'data', 'spool', 'incoming'));
+  assert.equal(paths.capturesDir, path.join(rootDir, 'data', 'captures'));
+  assert.equal(paths.tmpDir, path.join(rootDir, 'data', 'tmp'));
+  assert.equal(paths.logDir, path.join(rootDir, 'logs'));
 });

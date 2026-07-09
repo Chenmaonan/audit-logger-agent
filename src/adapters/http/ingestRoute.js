@@ -1,6 +1,8 @@
 import fs from 'fs';
 import path from 'path';
-import { validateLogEntry } from '../../../scripts/lib/parser.js';
+import { normalizeEntry, validateLogEntry } from '../../../scripts/lib/parser.js';
+import { insertEvents } from '../../../scripts/lib/db.js';
+import { getRuntimePaths } from '../../app/paths.js';
 
 const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
 const DEFAULT_MAX_LINE_BYTES = 64 * 1024;
@@ -32,10 +34,7 @@ export function isHttpIngestEnabled(config = {}) {
 }
 
 export function resolveSpoolDir(config = {}) {
-  const spoolDir = config.ingest?.spoolDir ?? 'data/incoming';
-  if (path.isAbsolute(spoolDir)) return spoolDir;
-  const baseDir = config.rootDir ?? process.cwd();
-  return path.resolve(baseDir, spoolDir);
+  return getRuntimePaths(config).spoolDir;
 }
 
 function isSafeAgentId(agentId) {
@@ -107,7 +106,10 @@ function parseNdjsonBody(raw, lineLimitBytes) {
 function validateEvent(event, index, lineLimitBytes) {
   const errors = [];
   if (!event || typeof event !== 'object' || Array.isArray(event)) {
-    return [{ index, error: 'event must be a JSON object' }];
+    return {
+      errors: [{ index, error: 'event must be a JSON object' }],
+      normalizedEvent: null,
+    };
   }
 
   const serialized = JSON.stringify(event);
@@ -124,7 +126,7 @@ function validateEvent(event, index, lineLimitBytes) {
     errors.push({ index, error });
   }
 
-  return errors;
+  return { errors, normalizedEvent: event };
 }
 
 function appendAcceptedEvents(config, events) {
@@ -137,7 +139,7 @@ function appendAcceptedEvents(config, events) {
   }
 }
 
-export async function handleIngestRoute(req, res, { config = {} } = {}) {
+export async function handleIngestRoute(req, res, { config = {}, db } = {}) {
   const type = contentType(req);
   const limitBytes = maxBodyBytes(config);
   const lineLimitBytes = maxLineBytes(config);
@@ -174,17 +176,20 @@ export async function handleIngestRoute(req, res, { config = {} } = {}) {
   const accepted = [];
   const rejectedIndexes = new Set(errors.map((error) => error.index));
   for (const item of events) {
-    const eventErrors = validateEvent(item.event, item.index, lineLimitBytes);
+    const { errors: eventErrors, normalizedEvent } = validateEvent(item.event, item.index, lineLimitBytes);
     if (eventErrors.length > 0) {
       errors.push(...eventErrors);
       rejectedIndexes.add(item.index);
       continue;
     }
-    accepted.push(item.event);
+    accepted.push({ originalEvent: item.event, normalizedEvent });
   }
 
   if (accepted.length > 0) {
-    appendAcceptedEvents(config, accepted);
+    appendAcceptedEvents(config, accepted.map((item) => item.originalEvent));
+    if (db) {
+      insertEvents(db, accepted.map((item) => normalizeEntry(item.normalizedEvent)));
+    }
   }
 
   json(res, 202, {

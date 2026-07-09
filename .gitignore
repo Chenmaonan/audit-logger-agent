@@ -1,19 +1,32 @@
 node_modules/
 
-# Local runtime data and databases
-data/
+# Normalized app-owned runtime storage and local SQLite artifacts
+/data/
+/logs/
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
 
-# Local configuration and generated process files
+# Local configuration
 .config
 .config.example
+
+# Legacy migration-compatibility root files (not normalized runtime outputs)
+/.server.log
+/.server.err.log
+/.callback-*.log
+/.callback-*.err.log
+
+# Legacy/workspace-local repo-root scratch; normalized runtime temp files live under /data/tmp/
+/tmp/
+
+# Workspace-local files outside app self-cleanup scope
 record.json
-.server.log
-*.log
 Typora_Hook_Log.txt
+.agents/
+.claude/
+.superpowers/
 
 # Development-only files kept locally but not published
 .editorconfig
@@ -22,10 +35,13 @@ TODOS.md
 docs/
 v1.5/
 test/
+!test/
+test/*
+!test/audit-spec.test.js
+!test/auditReview/
+test/auditReview/*
+!test/auditReview/httpIntegration.test.js
 scripts/run-tests.js
-.agents/
-.claude/
-tmp/
 
 # OS/editor noise
 .DS_Store

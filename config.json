@@ -1,23 +1,17 @@
 {
-  "dbPath": "data/audit.db",
-  "agents": {
-    "rental-price-agent": {
-      "logDir": "../../rental-price-agent-main/tasks/logs",
-      "pattern": "audit-*.jsonl"
-    },
-    "mt-agent": {
-      "logDir": "../../MT-agent-master/output/logs",
-      "pattern": "audit-*.jsonl"
-    }
-  },
+  "dbPath": "data/db/audit.db",
+  "agents": {},
   "ingest": {
     "http": {
       "enabled": true,
       "maxBodyBytes": 1048576,
       "maxLineBytes": 65536
     },
-    "spoolDir": "data/incoming"
+    "spoolDir": "data/spool/incoming"
   },
+  "capturesDir": "data/captures",
+  "tmpDir": "data/tmp",
+  "logDir": "logs",
   "limits": {
     "maxLineBytes": 65536,
     "maxChunkBytes": 16777216,
@@ -31,9 +25,15 @@
     "enabled": true,
     "runAtHour": 4,
     "eventsDays": 90,
+    "runtimeRunsDays": 30,
+    "waitingStatesDays": 30,
     "resolvedFindingsDays": 30,
     "reviewRunsDays": 60,
+    "llmUsageDays": 90,
     "outboxDays": 14,
+    "logFilesDays": 14,
+    "tmpFilesDays": 7,
+    "captureFilesDays": 30,
     "vacuum": "incremental"
   },
   "auditReview": {

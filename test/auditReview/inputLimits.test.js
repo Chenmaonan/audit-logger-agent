@@ -12,6 +12,9 @@ import { ensureReviewSchema } from '../../src/db/reviewSchema.js';
 import { createIngestCursorStore } from '../../src/auditReview/ingestCursorStore.js';
 import { createAuditIngestService } from '../../src/auditReview/ingestService.js';
 
+// scanLogFiles currently resolves `path` from the global scope.
+globalThis.path = path;
+
 function makeEvent(index, overrides = {}) {
   return {
     ts: `2026-07-03T10:${String(index % 60).padStart(2, '0')}:00.000Z`,
@@ -149,7 +152,7 @@ test('parseNdjson rejects over-max lines without JSON.parse', () => {
 test('ingestSince continues reading an unchanged large append over multiple limited chunks', () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-input-limits-'));
   try {
-    const logDir = path.join(tmpDir, 'logs');
+    const logDir = path.join(tmpDir, 'incoming', 'test-agent');
     fs.mkdirSync(logDir, { recursive: true });
     const logFile = path.join(logDir, 'audit-2026-07-03.jsonl');
     const lines = [
@@ -163,12 +166,10 @@ test('ingestSince continues reading an unchanged large append over multiple limi
     const db = makeDb();
     const cursorStore = createIngestCursorStore(db);
     const config = {
+      rootDir: tmpDir,
       dbPath,
-      agents: {
-        'test-agent': {
-          logDir: path.relative(path.dirname(dbPath), logDir),
-          pattern: 'audit-*.jsonl',
-        },
+      ingest: {
+        spoolDir: 'incoming',
       },
       limits: {
         maxChunkBytes: Buffer.byteLength(lines[0], 'utf-8') + 8,
@@ -198,7 +199,7 @@ test('ingestSince records overlong line errors without inserting the row', () =>
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-overlong-line-'));
   let db;
   try {
-    const logDir = path.join(tmpDir, 'logs');
+    const logDir = path.join(tmpDir, 'incoming', 'test-agent');
     fs.mkdirSync(logDir, { recursive: true });
     const logFile = path.join(logDir, 'audit-2026-07-03.jsonl');
     const validLine = JSON.stringify(makeEvent(1));
@@ -212,12 +213,10 @@ test('ingestSince records overlong line errors without inserting the row', () =>
       db,
       cursorStore,
       config: {
+        rootDir: tmpDir,
         dbPath,
-        agents: {
-          'test-agent': {
-            logDir: path.relative(path.dirname(dbPath), logDir),
-            pattern: 'audit-*.jsonl',
-          },
+        ingest: {
+          spoolDir: 'incoming',
         },
         limits: {
           maxLineBytes: 64 * 1024,
@@ -243,7 +242,7 @@ test('ingestSince skips an overlong no-newline capped chunk without wedging the 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-no-newline-overlong-'));
   let db;
   try {
-    const logDir = path.join(tmpDir, 'logs');
+    const logDir = path.join(tmpDir, 'incoming', 'test-agent');
     fs.mkdirSync(logDir, { recursive: true });
     const logFile = path.join(logDir, 'audit-2026-07-03.jsonl');
     const overlongUnterminatedLine = '{"ts":"' + 'x'.repeat(128) + '"}';
@@ -256,12 +255,10 @@ test('ingestSince skips an overlong no-newline capped chunk without wedging the 
       db,
       cursorStore,
       config: {
+        rootDir: tmpDir,
         dbPath,
-        agents: {
-          'test-agent': {
-            logDir: path.relative(path.dirname(dbPath), logDir),
-            pattern: 'audit-*.jsonl',
-          },
+        ingest: {
+          spoolDir: 'incoming',
         },
         limits: {
           maxLineBytes: 64,

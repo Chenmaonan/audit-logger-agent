@@ -34,6 +34,36 @@ export const EVENT_STAGE_MAP = Object.freeze({
 
 export const VALID_EVENTS = Object.freeze(Object.keys(EVENT_STAGE_MAP));
 
+const EVENT_ALIAS_PATTERN = /^[a-z0-9]+([./_-][a-z0-9]+)*$/;
+
+function eventSignature(event) {
+  if (typeof event !== 'string' || !EVENT_ALIAS_PATTERN.test(event)) return null;
+  return JSON.stringify(event.split(/[./_-]/));
+}
+
+const EVENT_SIGNATURE_TO_CANONICAL = Object.freeze((() => {
+  const signatureToCanonical = Object.create(null);
+  const ambiguousSignatures = new Set();
+
+  for (const canonicalEvent of VALID_EVENTS) {
+    const signature = eventSignature(canonicalEvent);
+    if (signature == null) continue;
+
+    if (signatureToCanonical[signature] && signatureToCanonical[signature] !== canonicalEvent) {
+      ambiguousSignatures.add(signature);
+      continue;
+    }
+
+    signatureToCanonical[signature] = canonicalEvent;
+  }
+
+  for (const signature of ambiguousSignatures) {
+    delete signatureToCanonical[signature];
+  }
+
+  return signatureToCanonical;
+})());
+
 export const CANONICAL_STATUS_CODES = Object.freeze([
   'OK',
   'CANCELLED',
@@ -61,8 +91,18 @@ const LEGACY_STATUS_MAP = Object.freeze({
   cancelled: 'CANCELLED',
 });
 
+export function normalizeEventId(event) {
+  if (typeof event !== 'string') return null;
+  if (Object.hasOwn(EVENT_STAGE_MAP, event)) return event;
+
+  const signature = eventSignature(event);
+  if (signature == null) return null;
+
+  return EVENT_SIGNATURE_TO_CANONICAL[signature] ?? null;
+}
+
 export function isValidEvent(event) {
-  return VALID_EVENTS.includes(event);
+  return normalizeEventId(event) != null;
 }
 
 export function isCanonicalStatus(status) {
@@ -75,5 +115,6 @@ export function normalizeCanonicalStatus(status) {
 }
 
 export function stageForEvent(event) {
-  return EVENT_STAGE_MAP[event] ?? null;
+  const canonicalEvent = normalizeEventId(event);
+  return canonicalEvent ? EVENT_STAGE_MAP[canonicalEvent] : null;
 }

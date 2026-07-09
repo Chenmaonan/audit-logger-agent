@@ -39,10 +39,23 @@ try {
     ? path.resolve(process.env.AUDIT_LOGGER_ROOT)
     : path.resolve(__dirname, '..');
   const config = loadAppConfig(rootDir);
-  const dbPath = path.resolve(rootDir, config.dbPath);
-  const runtimeConfig = { ...config, dbPath, rootDir };
+  const paths = config.paths;
+  const runtimeConfig = {
+    ...config,
+    rootDir: paths.rootDir,
+    dbPath: paths.dbPath,
+    ingest: {
+      ...(config.ingest ?? {}),
+      http: { ...(config.ingest?.http ?? {}) },
+      spoolDir: paths.spoolDir,
+    },
+    capturesDir: paths.capturesDir,
+    tmpDir: paths.tmpDir,
+    logDir: paths.logDir,
+    paths,
+  };
 
-  db = openDb(dbPath);
+  db = openDb(paths.dbPath);
   ensureRuntimeSchema(db);
   ensureReviewSchema(db);
 

@@ -9,6 +9,7 @@ import { ensureReviewSchema } from '../../src/db/reviewSchema.js';
 import { createIngestCursorStore } from '../../src/auditReview/ingestCursorStore.js';
 import { createAuditIngestService } from '../../src/auditReview/ingestService.js';
 import { createHttpApp } from '../../src/adapters/http/app.js';
+import { resolveSpoolDir } from '../../src/adapters/http/ingestRoute.js';
 
 function makeEvent(overrides = {}) {
   return {
@@ -65,7 +66,12 @@ function readSpool(config, agentId, date = '2026-07-06') {
   return fs.readFileSync(file, 'utf-8');
 }
 
-test('POST /v1/ingest accepts one JSON event, spools it, and ingestSince imports it', async () => {
+test('resolveSpoolDir defaults to the normalized spool layout', () => {
+  const rootDir = path.join(os.tmpdir(), 'audit-http-ingest-defaults');
+  assert.equal(resolveSpoolDir({ rootDir }), path.join(rootDir, 'data', 'spool', 'incoming'));
+});
+
+test('POST /v1/ingest accepts one JSON event, stores it immediately, and ingestSince dedupes it', async () => {
   await withIngestServer(async ({ baseUrl, config, ingestService, db }) => {
     const response = await fetch(`${baseUrl}/v1/ingest`, {
       method: 'POST',
@@ -78,7 +84,7 @@ test('POST /v1/ingest accepts one JSON event, spools it, and ingestSince imports
     assert.match(readSpool(config, 'remote-agent'), /json-single/);
 
     const ingestResult = ingestService.ingestSince({ sinceDate: '2026-07-06' });
-    assert.equal(ingestResult.inserted, 1);
+    assert.equal(ingestResult.inserted, 0);
     assert.equal(
       db.prepare('SELECT COUNT(*) AS count FROM audit_events WHERE trace_id = ?').get('json-single').count,
       1
@@ -86,7 +92,56 @@ test('POST /v1/ingest accepts one JSON event, spools it, and ingestSince imports
   });
 });
 
-test('POST /v1/ingest accepts JSON event batches', async () => {
+test('POST /v1/ingest makes accepted events immediately queryable', async () => {
+  await withIngestServer(async ({ baseUrl, config, db }) => {
+    const response = await fetch(`${baseUrl}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(makeEvent({ trace_id: 'query-immediate', span_id: 'span-query-immediate' })),
+    });
+
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), { accepted: 1, rejected: 0, errors: [] });
+    assert.match(readSpool(config, 'remote-agent'), /query-immediate/);
+
+    const queryResponse = await fetch(`${baseUrl}/query?trace_id=query-immediate&limit=5`);
+    assert.equal(queryResponse.status, 200);
+    const queryBody = await queryResponse.json();
+    assert.equal(queryBody.count, 1);
+    assert.equal(queryBody.results[0].trace_id, 'query-immediate');
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS count FROM audit_events WHERE trace_id = ?').get('query-immediate').count,
+      1
+    );
+  });
+});
+
+test('POST /v1/ingest canonicalizes alias events for DB while preserving raw upstream event', async () => {
+  await withIngestServer(async ({ baseUrl, config, db }) => {
+    const response = await fetch(`${baseUrl}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(makeEvent({
+        trace_id: 'alias-event',
+        span_id: 'span-alias-event',
+        event: 'tool/end',
+      })),
+    });
+
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), { accepted: 1, rejected: 0, errors: [] });
+
+    const spool = readSpool(config, 'remote-agent');
+    assert.match(spool, /"event":"tool\/end"/);
+    assert.doesNotMatch(spool, /"event":"tool\.end"/);
+
+    const row = db.prepare('SELECT event, raw_json FROM audit_events WHERE trace_id = ?').get('alias-event');
+    assert.equal(row.event, 'tool.end');
+    assert.equal(JSON.parse(row.raw_json).event, 'tool/end');
+  });
+});
+
+test('POST /v1/ingest accepts JSON event batches and stores them immediately', async () => {
   await withIngestServer(async ({ baseUrl, config, ingestService, db }) => {
     const response = await fetch(`${baseUrl}/v1/ingest`, {
       method: 'POST',
@@ -105,12 +160,12 @@ test('POST /v1/ingest accepts JSON event batches', async () => {
     assert.match(readSpool(config, 'remote-agent'), /batch-2/);
 
     const ingestResult = ingestService.ingestSince({ sinceDate: '2026-07-06' });
-    assert.equal(ingestResult.inserted, 2);
+    assert.equal(ingestResult.inserted, 0);
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM audit_events').get().count, 2);
   });
 });
 
-test('POST /v1/ingest accepts NDJSON bodies', async () => {
+test('POST /v1/ingest accepts NDJSON bodies and stores them immediately', async () => {
   await withIngestServer(async ({ baseUrl, config, ingestService, db }) => {
     const body = [
       JSON.stringify(makeEvent({ trace_id: 'ndjson-1', span_id: 'span-ndjson-1' })),
@@ -129,12 +184,12 @@ test('POST /v1/ingest accepts NDJSON bodies', async () => {
     assert.match(readSpool(config, 'remote-agent'), /ndjson-2/);
 
     const ingestResult = ingestService.ingestSince({ sinceDate: '2026-07-06' });
-    assert.equal(ingestResult.inserted, 2);
+    assert.equal(ingestResult.inserted, 0);
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM audit_events').get().count, 2);
   });
 });
 
-test('POST /v1/ingest accepts entity and llm_intent fields and imports them', async () => {
+test('POST /v1/ingest accepts entity and llm_intent fields and stores them immediately', async () => {
   await withIngestServer(async ({ baseUrl, ingestService, db }) => {
     const response = await fetch(`${baseUrl}/v1/ingest`, {
       method: 'POST',
@@ -151,7 +206,7 @@ test('POST /v1/ingest accepts entity and llm_intent fields and imports them', as
     assert.deepEqual(await response.json(), { accepted: 1, rejected: 0, errors: [] });
 
     const ingestResult = ingestService.ingestSince({ sinceDate: '2026-07-06' });
-    assert.equal(ingestResult.inserted, 1);
+    assert.equal(ingestResult.inserted, 0);
     const row = db.prepare('SELECT entity_type, entity_id, llm_intent_json FROM audit_events WHERE trace_id = ?').get('entity-intent');
     assert.equal(row.entity_type, 'database');
     assert.equal(row.entity_id, 'db-1');
@@ -176,6 +231,31 @@ test('POST /v1/ingest rejects legacy audit fields', async () => {
     assert.equal(body.accepted, 0);
     assert.equal(body.rejected, 1);
     assert.ok(body.errors.some((error) => /product_id|error\.code/.test(error.error)));
+    assert.equal(fs.existsSync(config.ingest.spoolDir), false);
+  });
+});
+
+test('POST /v1/ingest rejects unknown alias events without writing DB or spool', async () => {
+  await withIngestServer(async ({ baseUrl, config, db }) => {
+    const response = await fetch(`${baseUrl}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(makeEvent({
+        trace_id: 'unknown-alias',
+        span_id: 'span-unknown-alias',
+        event: 'tool/not-a-stage',
+      })),
+    });
+
+    assert.equal(response.status, 202);
+    const body = await response.json();
+    assert.equal(body.accepted, 0);
+    assert.equal(body.rejected, 1);
+    assert.ok(body.errors.some((error) => /invalid event/.test(error.error)));
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS count FROM audit_events WHERE trace_id = ?').get('unknown-alias').count,
+      0
+    );
     assert.equal(fs.existsSync(config.ingest.spoolDir), false);
   });
 });
@@ -291,7 +371,7 @@ test('POST /v1/ingest reposting the same row ingests once through existing dedup
     }
 
     const ingestResult = ingestService.ingestSince({ sinceDate: '2026-07-06' });
-    assert.equal(ingestResult.inserted, 1);
+    assert.equal(ingestResult.inserted, 0);
     assert.equal(
       db.prepare('SELECT COUNT(*) AS count FROM audit_events WHERE trace_id = ?').get('dedupe').count,
       1

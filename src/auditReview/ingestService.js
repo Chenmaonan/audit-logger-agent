@@ -15,6 +15,7 @@ import path from 'path';
 import { scanLogFiles } from '../../scripts/lib/indexer.js';
 import { parseNdjson, normalizeEntry } from '../../scripts/lib/parser.js';
 import { insertEvents } from '../../scripts/lib/db.js';
+import { getRuntimePaths } from '../app/paths.js';
 
 const DEFAULT_MAX_LINE_BYTES = 64 * 1024;
 const DEFAULT_MAX_CHUNK_BYTES = 16 * 1024 * 1024;
@@ -124,14 +125,6 @@ function isSafeSpoolAgentDir(name) {
     && /^[A-Za-z0-9._-]+$/.test(name);
 }
 
-function resolveSpoolDir(config) {
-  const spoolDir = config.ingest?.spoolDir;
-  if (!spoolDir) return null;
-  if (path.isAbsolute(spoolDir)) return spoolDir;
-  const baseDir = config.rootDir ?? process.cwd();
-  return path.resolve(baseDir, spoolDir);
-}
-
 /**
  * Create the audit ingest service.
  *
@@ -146,7 +139,7 @@ export function createAuditIngestService({ db, config, cursorStore, now = () => 
   if (!config) throw new Error('createAuditIngestService: config is required');
   if (!cursorStore) throw new Error('createAuditIngestService: cursorStore is required');
 
-  const dbDir = path.dirname(config.dbPath);
+  const paths = getRuntimePaths(config);
   const limits = {
     maxLineBytes: positiveInteger(config.limits?.maxLineBytes, DEFAULT_MAX_LINE_BYTES),
     maxChunkBytes: positiveInteger(config.limits?.maxChunkBytes, DEFAULT_MAX_CHUNK_BYTES),
@@ -154,17 +147,7 @@ export function createAuditIngestService({ db, config, cursorStore, now = () => 
 
   function ingestSources() {
     const sources = [];
-    const agents = config.agents || {};
-    for (const [agentId, agentConfig] of Object.entries(agents)) {
-      if (!agentConfig) continue;
-      sources.push({
-        agentId,
-        logDir: path.resolve(dbDir, agentConfig.logDir),
-        pattern: agentConfig.pattern,
-      });
-    }
-
-    const spoolDir = resolveSpoolDir(config);
+    const spoolDir = paths.spoolDir;
     if (spoolDir && fs.existsSync(spoolDir)) {
       for (const dirent of fs.readdirSync(spoolDir, { withFileTypes: true })) {
         if (!dirent.isDirectory() || !isSafeSpoolAgentDir(dirent.name)) continue;
