@@ -230,9 +230,9 @@ function parseErrorFindings(parseErrors, reviewId, riskPolicyVersion, reviewerVe
       entity: null,
       entity_type: null,
       entity_id: null,
-      title: '鏃ュ織瑙ｆ瀽澶辫触',
-      summary: `${errors.length} 鏉¤В鏋愰敊璇紝娑夊強 ${uniqueFiles.size} 涓枃浠躲€傛牱渚? ${samples.join('; ')}`,
-      recommendation: '妫€鏌ユ棩蹇楁牸寮忔槸鍚︾鍚?agent-audit-log v1.0 瑙勮寖',
+      title: '日志解析失败',
+      summary: `${errors.length} 条解析错误，涉及 ${uniqueFiles.size} 个文件。样例：${samples.join('; ')}`,
+      recommendation: '检查日志格式是否符合 agent-audit-log v1.0 规范',
       requires_action: 0,
       evidence_event_ids: [],
       evidence_event_ids_json: '[]',
@@ -407,7 +407,7 @@ export function createAuditReviewScheduler({
     // 1. Acquire lease lock.
     const acquired = lockStore.acquire({ lockName: LOCK_NAME, ownerId, leaseMinutes: LEASE_MINUTES });
     if (!acquired.acquired) {
-      // Another run holds the lease 鈥?record a skipped run and return.
+      // Another run holds the lease - record a skipped run and return.
       const reviewId = reviewIdFor(now());
       reviewStore.createRun({
         reviewId,

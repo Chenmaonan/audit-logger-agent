@@ -54,6 +54,8 @@ async function waitFor(predicate, { timeoutMs = 1000, intervalMs = 10 } = {}) {
   return predicate();
 }
 
+const MOJIBAKE_PATTERN = /(?:[涓楂椋闄浣淇鎴鍏椤瀵艰埅鐖璋鐩閾捐矾寤妯鏆棤鍙睍绀鐧诲綍璁块棶浠ょ墝鏇柊堕棿鎬昏澶氶潯佹嵁鏃瑙妫]{2,}|鈥\?|€�)/;
+
 test('audit review HTTP integration smoke test', async () => {
   // ------------------------------------------------------------------
   // 1. Build a real DB with runtime + review schema and seed audit_events
@@ -277,7 +279,10 @@ test('audit review HTTP integration smoke test', async () => {
       assert.equal(loginPage.status, 200);
       const html = await loginPage.text();
       assert.ok(html.includes('<form'));
+      assert.ok(html.includes('Dashboard 登录'));
+      assert.ok(html.includes('访问令牌'));
       assert.equal(html.includes('test-token-123'), false);
+      assert.doesNotMatch(html, MOJIBAKE_PATTERN);
     }
 
     let dashboardCookie;
@@ -457,15 +462,15 @@ test('audit review HTTP integration smoke test', async () => {
       assert.equal(res.headers.get('cache-control'), 'no-store');
       const html = await res.text();
       assert.ok(html.includes('<html'), 'dashboard html should contain <html');
-      assert.ok(
-        html.includes('Audit Review Overview') || html.includes('Review'),
-        'dashboard should contain Audit Review Overview or Review',
-      );
-      assert.equal(html.includes('Severity'), true, 'dashboard should contain Severity');
+      assert.ok(html.includes('审计审查总览'), 'dashboard should contain Chinese overview title');
+      assert.ok(html.includes('严重级别'), 'dashboard should contain Chinese severity label');
+      assert.equal(html.includes('Audit Review Overview'), false, 'dashboard should not contain English overview title');
+      assert.equal(html.includes('Severity'), false, 'dashboard should not contain English Severity');
       assert.equal(html.includes('Confidence'), false, 'dashboard should not contain English Confidence');
       assert.equal(html.includes('Data source'), false, 'dashboard should not contain Data source');
       assert.ok(html.includes('Trace ID'), 'dashboard should contain trace link column');
       assert.ok(html.includes('#trace_sequence'), 'dashboard should link trace ids to the finding trace sequence');
+      assert.doesNotMatch(html, MOJIBAKE_PATTERN);
     }
 
     // ------------------------------------------------------------------
@@ -477,8 +482,10 @@ test('audit review HTTP integration smoke test', async () => {
       assert.equal(res.headers.get('content-type'), 'text/html; charset=utf-8');
       const html = await res.text();
       assert.ok(html.includes('<html'), 'review detail html should contain <html');
+      assert.ok(html.includes('审查批次'), 'review detail should contain Chinese review title');
       assert.ok(html.includes('Trace ID'), 'review detail should contain trace link column');
       assert.ok(html.includes('#trace_sequence'), 'review detail should link trace ids to the finding trace sequence');
+      assert.doesNotMatch(html, MOJIBAKE_PATTERN);
     }
 
     // ------------------------------------------------------------------
@@ -491,15 +498,18 @@ test('audit review HTTP integration smoke test', async () => {
       const html = await res.text();
       assert.ok(html.includes('<html'), 'finding detail html should contain <html');
       assert.ok(html.includes('id="trace_sequence"'), 'finding detail should render trace sequence anchor');
-      assert.ok(html.includes('Tool call sequence'), 'finding detail should contain trace sequence section');
+      assert.ok(html.includes('工具调用顺序'), 'finding detail should contain Chinese trace sequence section');
       assert.equal(html.includes('id="trace_timeline"'), false, 'finding detail should not render old trace timeline table');
       assert.equal(html.includes('id="evidence_events"'), false, 'finding detail should not render old evidence table');
       assert.ok(html.includes('trace-del-1'), 'finding detail should contain the finding trace id');
       assert.ok(html.includes('db.delete'), 'finding detail should contain the trace tool call');
       assert.ok(html.includes('deleted 5 rows'), 'finding detail should contain the trace event summary');
-      assert.ok(html.includes('Raw log snippet'), 'finding detail should contain raw evidence log snippets');
+      assert.ok(html.includes('原始日志片段'), 'finding detail should contain Chinese raw evidence log snippets');
       assert.ok(html.includes('raw-log-pre'), 'finding detail should render raw snippets in preformatted blocks');
       assert.ok(html.includes('&quot;tool_name&quot;:&quot;db.delete&quot;'), 'raw snippet should preserve the original compact JSON field');
+      assert.equal(html.includes('Tool call sequence'), false, 'finding detail should not contain English trace sequence section');
+      assert.equal(html.includes('Raw log snippet'), false, 'finding detail should not contain English raw evidence label');
+      assert.doesNotMatch(html, MOJIBAKE_PATTERN);
       assert.equal(html.includes('置信度'), false, 'finding detail should not contain 置信度');
     }
 

@@ -248,3 +248,30 @@ test('renderDashboard includes focus ring and row hover CSS rules', () => {
   assert.ok(html.includes('outline: 2px solid var(--accent);'));
   assert.ok(html.includes('.data-table tbody tr:hover { background: var(--surface-muted); }'));
 });
+
+test('renderDashboard default UI text is readable Chinese without mojibake', () => {
+  const html = renderDashboard({
+    sections: [{
+      id: 'trace_sequence',
+      type: 'trace_sequence',
+      title: '工具调用顺序',
+      steps: [{
+        order: 1,
+        timestamp: '2026-07-10T08:15:38.000Z',
+        event: 'tool.end',
+        status: { text: '正常', tone: 'success' },
+        tool_name: 'db.delete',
+        span_id: 'span-1',
+        parent_span_id: 'parent-1',
+        duration_ms: '20 ms',
+        summary: '完成',
+      }],
+    }],
+  });
+
+  assert.ok(html.includes('审计看板'));
+  assert.ok(html.includes('更新时间'));
+  assert.ok(html.includes('父 Span parent-1'));
+  assert.ok(html.includes('audit-logger-agent 审计看板'));
+  assert.doesNotMatch(html, /(?:涓|楂|椋|闄|浣|淇|鎴|鍏|鈥|椤|瀵|艰|埅|鐖|璋|鐩|閾|捐|矾|寤|妯|鏆|棤|鍙|睍|绀|鐧|诲|綍|璁|块|棶|浠|ょ|墝|鏇|柊|堕|棿|鎬|昏||规||澶|氭|潯|佹|嵁)/);
+});

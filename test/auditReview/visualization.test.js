@@ -123,12 +123,12 @@ function createViz(storeOptions = {}, visualizationOptions = {}) {
 test('overviewPage returns linked review and finding sections', () => {
   const page = createViz().overviewPage();
 
-  assert.equal(page.page.title, 'Audit Review Overview');
-  assert.ok(page.summary_metrics.some((metric) => metric.label === 'Critical'));
+  assert.equal(page.page.title, '审计审查总览');
+  assert.ok(page.summary_metrics.some((metric) => metric.label === '严重'));
   assert.ok(page.page.page_actions.some((action) => action.href.includes('/dashboard/audit-reviews/')));
 
   const findingsSection = page.sections.find((section) => section.id === 'pending_findings');
-  assert.equal(findingsSection.title, 'Open findings');
+  assert.equal(findingsSection.title, '待处理风险发现');
   assert.ok(findingsSection.columns.some((column) => column.key === 'trace_id' && column.label === 'Trace ID'));
   assert.match(findingsSection.rows[0].title.href, /\/dashboard\/audit-findings\/f-critical/);
   assert.match(findingsSection.rows[0].trace_id.href, /#trace_sequence$/);
@@ -137,12 +137,35 @@ test('overviewPage returns linked review and finding sections', () => {
   assert.ok(page.sections.find((section) => section.id === 'reviews_without_findings'));
 });
 
+test('visualization view models use Chinese UI labels without mojibake', () => {
+  const viz = createViz();
+  const pages = [
+    viz.overviewPage(),
+    viz.reviewDetailPage('r-degraded'),
+    viz.findingDetailPage('f-critical'),
+  ];
+  const payload = JSON.stringify(pages);
+
+  assert.ok(payload.includes('审计审查总览'));
+  assert.ok(payload.includes('风险发现'));
+  assert.ok(payload.includes('审查批次'));
+  assert.ok(payload.includes('返回总览'));
+  assert.ok(payload.includes('工具调用顺序'));
+  assert.ok(payload.includes('原始日志片段'));
+  assert.equal(payload.includes('Audit Review Overview'), false);
+  assert.equal(payload.includes('Open findings'), false);
+  assert.equal(payload.includes('Back to overview'), false);
+  assert.equal(payload.includes('Tool call sequence'), false);
+  assert.equal(payload.includes('Raw log snippet'), false);
+  assert.doesNotMatch(payload, /(?:涓|楂|椋|闄|浣|淇|鎴|鍏|鈥|椤|瀵|艰|埅|鐖|璋|鐩|閾|捐|矾|寤|妯|鏆|棤|鍙|睍|绀|鐧|诲|綍|璁|块|棶|浠|ょ|墝|鏇|柊|堕|棿|鎬|昏||规||澶|氭|潯|佹|嵁)/);
+});
+
 test('reviewDetailPage shows degraded callout and linked finding rows', () => {
   const page = createViz().reviewDetailPage('r-degraded');
 
-  assert.equal(page.page.title, 'Review');
-  assert.ok(page.page.page_actions.some((action) => action.label === 'Back to overview'));
-  assert.ok(page.sections.find((section) => section.type === 'callout' && section.title === 'Degraded review'));
+  assert.equal(page.page.title, '审查批次');
+  assert.ok(page.page.page_actions.some((action) => action.label === '返回总览'));
+  assert.ok(page.sections.find((section) => section.type === 'callout' && section.title === '降级审查'));
 
   const findingsSection = page.sections.find((section) => section.id === 'review_findings');
   assert.match(findingsSection.rows[0].title.href, /\/dashboard\/audit-findings\/f-critical/);
@@ -152,33 +175,33 @@ test('reviewDetailPage shows degraded callout and linked finding rows', () => {
 test('findingDetailPage includes details, raw logs, links, and ordered trace sequence', () => {
   const page = createViz().findingDetailPage('f-critical');
 
-  assert.equal(page.page.breadcrumbs[0].label, 'Overview');
-  assert.ok(page.page.page_actions.some((action) => action.label === 'Back to overview'));
+  assert.equal(page.page.breadcrumbs[0].label, '总览');
+  assert.ok(page.page.page_actions.some((action) => action.label === '返回总览'));
   assert.ok(page.sections.find((section) => section.id === 'finding_summary'));
   assert.ok(page.sections.find((section) => section.id === 'recommendation'));
 
   const detail = page.sections.find((section) => section.id === 'finding_detail');
   const labels = detail.items.map((item) => item.label);
-  assert.ok(labels.includes('Finding ID'));
+  assert.ok(labels.includes('风险发现 ID'));
   assert.ok(labels.includes('Agent ID'));
   assert.ok(labels.includes('Trace ID'));
-  assert.ok(labels.includes('Entity'));
+  assert.ok(labels.includes('实体'));
 
   const raw = page.sections.find((section) => section.id === 'evidence_raw_logs');
-  assert.equal(raw.title, 'Raw log snippets (2)');
-  assert.deepEqual(raw.snippets.map((snippet) => snippet.label), ['Log ID 1', 'Log ID 2']);
+  assert.equal(raw.title, '原始日志片段（2 条）');
+  assert.deepEqual(raw.snippets.map((snippet) => snippet.label), ['日志 ID 1', '日志 ID 2']);
 
   const sequence = page.sections.find((section) => section.id === 'trace_sequence');
-  assert.equal(sequence.title, 'Tool call sequence (2 steps)');
+  assert.equal(sequence.title, '工具调用顺序（共 2 步）');
   assert.deepEqual(sequence.steps.map((step) => step.order), [1, 2]);
-  assert.deepEqual(sequence.steps.map((step) => step.status.text), ['OK', 'Internal']);
+  assert.deepEqual(sequence.steps.map((step) => step.status.text), ['正常', '内部错误']);
   assert.equal(sequence.steps[1].duration_ms, '640 ms');
 });
 
 test('findingDetailPage shows a trace fallback callout when no timeline events exist', () => {
   const page = createViz({ traceEvents: [] }).findingDetailPage('f-critical');
   const fallback = page.sections.find((section) => section.id === 'trace_sequence_empty');
-  assert.equal(fallback.title, 'Tool call sequence');
+  assert.equal(fallback.title, '工具调用顺序');
   assert.ok(fallback.body.includes('trace-critical-1'));
 });
 
@@ -202,7 +225,7 @@ test('findingDetailPageWithAnalysis calls LLM and inserts trace analysis', async
   assert.equal(calls[0].model, 'test-model');
   assert.ok(JSON.stringify(calls[0].input).includes('trace-critical-1'));
   const analysis = page.sections.find((section) => section.id === 'trace_llm_analysis');
-  assert.equal(analysis.title, 'LLM trace analysis');
+  assert.equal(analysis.title, 'LLM 链路分析');
   assert.equal(analysis.type, 'trace_analysis');
   assert.equal(analysis.purpose, 'delete database row');
 });
@@ -235,7 +258,7 @@ test('findingDetailPageWithAnalysis skips LLM when budget reservation fails', as
 
   const section = page.sections.find((item) => item.id === 'trace_llm_analysis');
   assert.equal(section.type, 'callout');
-  assert.ok(section.body.includes('llm_budget_exceeded'));
+  assert.ok(section.body.includes('LLM 预算已用尽'));
 });
 
 test('findingDetailPageWithAnalysis degrades when LLM analysis fails', async () => {
@@ -244,7 +267,7 @@ test('findingDetailPageWithAnalysis degrades when LLM analysis fails', async () 
 
   const section = page.sections.find((item) => item.id === 'trace_llm_analysis');
   assert.equal(section.type, 'callout');
-  assert.equal(section.title, 'LLM trace analysis unavailable');
+  assert.equal(section.title, 'LLM 链路分析不可用');
   assert.ok(section.body.includes('llm unavailable'));
 });
 
