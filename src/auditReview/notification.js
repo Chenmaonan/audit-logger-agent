@@ -92,6 +92,7 @@ export function buildFindingPayload({ finding, reviewId, run, dashboardUrl }) {
 
 export function createReviewNotifier({ outboxStore, config }) {
   const notifyConfig = defaultNotificationConfig(config);
+  const notificationsEnabled = notifyConfig.enabled !== false;
   const minSeverity = notifyConfig.minSeverity ?? 'medium';
   const sendEmptyReview = notifyConfig.sendEmptyReview ?? false;
   const callbackUrl = notifyConfig.callbackUrl;
@@ -99,6 +100,9 @@ export function createReviewNotifier({ outboxStore, config }) {
   const maxAttempts = notifyConfig.maxAttempts;
 
   function enqueue({ reviewId, run, review, dashboardUrl }) {
+    if (!notificationsEnabled) {
+      return { enqueued: false, reason: 'disabled' };
+    }
     const findings = review?.findings ?? [];
     if (findings.length === 0 && !sendEmptyReview) {
       return { enqueued: false, reason: 'empty' };
@@ -117,6 +121,9 @@ export function createReviewNotifier({ outboxStore, config }) {
   }
 
   function enqueueFinding({ finding, reviewId, run, dashboardUrl }) {
+    if (!notificationsEnabled) {
+      return { enqueued: false, reason: 'disabled' };
+    }
     const sev = finding.severity;
     if (!meetsMinSeverity(sev, 'high')) {
       return { enqueued: false, reason: 'below_high' };

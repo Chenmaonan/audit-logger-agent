@@ -32,69 +32,48 @@ test('config.json exposes retention defaults for runtime data and owned files', 
   );
 });
 
-test('README documents owned runtime paths and workspace-local exclusions', () => {
+test('README links human users to deployment and Agent integration guides', () => {
   const readme = readText('README.md');
 
   for (const required of [
-    'data/tmp/',
-    'data/captures/',
-    'logs/',
-    '.agents/',
-    '.claude/',
-    '.superpowers/',
-    'record.json',
-    'Typora_Hook_Log.txt',
-    'outside app self-cleanup scope',
+    'docs/dokploy-deployment.md',
+    'docs/agent-audit-log-integration-guide.md',
+    '/dashboard/login',
   ]) {
     assert.ok(readme.includes(required), `README should include ${required}`);
   }
+  assert.match(
+    readme,
+    /\$env:AUDIT_AGENT_DASHBOARD_TOKEN\s*=\s*'[^']+'/,
+    'README should set the Dashboard login token as a PowerShell environment variable',
+  );
+  assert.doesNotMatch(readme, /"AUDIT_AGENT_DASHBOARD_TOKEN"\s*:/);
 });
 
-test('README and gitignore keep legacy root callback files as migration-only compatibility', () => {
-  const readme = readText('README.md');
-  const gitignore = readText('.gitignore');
-
-  for (const required of [
-    '.callback-*.log',
-    'runtime path migration',
-    'not part of app self-cleanup',
-  ]) {
-    assert.ok(readme.includes(required), `README should include ${required}`);
-  }
-
-  for (const ignored of [
-    '.config',
-    'data/',
-    'logs/',
-    '.server.log',
-    '.server.err.log',
-    '.callback-*.log',
-    '.callback-*.err.log',
-    '.agents/',
-    '.claude/',
-    '.superpowers/',
-  ]) {
-    assert.ok(gitignore.includes(ignored), `.gitignore should include ${ignored}`);
-  }
-});
-
-test('README still documents long-running operations guidance', () => {
-  const readme = fs.readFileSync('README.md', 'utf-8');
+test('Dokploy deployment guide covers required deployment, security, and recovery steps', () => {
+  const guide = readText('docs/dokploy-deployment.md');
 
   for (const required of [
     'AUDIT_AGENT_LLM_API_KEY',
-    'chmod 600 .config',
-    'pm2 start',
-    'pm2 startup',
-    'systemd',
-    'Restart=always',
-    'logrotate',
-    '.server.log',
-    'sqlite3',
-    '.backup',
-    'WAL',
-    'node scripts/prune.js --dry-run',
+    'AUDIT_AGENT_LLM_MODEL',
+    'AUDIT_AGENT_LLM_BASE_URL',
+    'AUDIT_AGENT_LLM_TIMEOUT_MS',
+    'AUDIT_AGENT_DASHBOARD_TOKEN',
+    'compose.dokploy.yaml',
+    'Dockerfile',
+    '/app/data',
+    '/health',
+    'TLS',
+    '/v1/ingest',
+    'https://<域名>/dashboard/login',
+    'auditReview.visualization.baseUrl',
+    'callback',
+    '备份',
+    '恢复',
   ]) {
-    assert.ok(readme.includes(required), `README should include ${required}`);
+    assert.ok(guide.includes(required), `deployment guide should include ${required}`);
   }
+
+  assert.match(guide, /(严禁|不得)[^\n]*直接暴露[^\n]*服务/);
+  assert.match(guide, /限制[^\n]*未认证[^\n]*来源/);
 });

@@ -183,6 +183,31 @@ test('sendEmptyReview=true enqueues even when findings empty', () => {
   assert.equal(outbox.calls.length, 1);
 });
 
+test('notification enabled=false prevents review and finding delivery from entering the outbox', () => {
+  const outbox = makeFakeOutboxStore();
+  const notifier = createReviewNotifier({
+    outboxStore: outbox,
+    config: { auditReview: { notification: { enabled: false, callbackUrl: 'http://127.0.0.1:9999' } } },
+  });
+
+  const summaryResult = notifier.enqueue({
+    reviewId: 'r_disabled',
+    run: makeRun(),
+    review: makeReview(),
+    dashboardUrl: '/dashboard/audit-reviews/r_disabled',
+  });
+  const findingResult = notifier.enqueueFinding({
+    finding: makeReview().findings[0],
+    reviewId: 'r_disabled',
+    run: makeRun(),
+    dashboardUrl: '/dashboard/audit-reviews/r_disabled',
+  });
+
+  assert.deepEqual(summaryResult, { enqueued: false, reason: 'disabled' });
+  assert.deepEqual(findingResult, { enqueued: false, reason: 'disabled' });
+  assert.equal(outbox.calls.length, 0);
+});
+
 test('enqueueFinding enqueues high/critical findings individually', () => {
   const outbox = makeFakeOutboxStore();
   const notifier = createReviewNotifier({

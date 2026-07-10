@@ -1,5 +1,12 @@
 node_modules/
 
+# Published deployment templates. Keep these tracked even if broader local
+# ignore rules are added later; runtime data and secrets remain ignored below.
+!Dockerfile
+!.dockerignore
+!config.container.json
+!compose.dokploy.yaml
+
 # Normalized app-owned runtime storage and local SQLite artifacts
 /data/
 /logs/
@@ -36,6 +43,7 @@ docs/
 !docs/
 docs/*
 !docs/agent-audit-log-integration-guide.md
+!docs/dokploy-deployment.md
 v1.5/
 
 # OS/editor noise
