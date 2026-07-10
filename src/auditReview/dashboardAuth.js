@@ -1,5 +1,10 @@
 // src/auditReview/dashboardAuth.js
 // Access control for dashboard and audit review API.
+import crypto from 'crypto';
+
+const SESSION_COOKIE_NAME = 'audit_dashboard_session';
+const SESSION_COOKIE_PATH = '/dashboard';
+const SESSION_PURPOSE = 'audit-dashboard-session-v1';
 
 function isLoopback(remoteAddress) {
   if (!remoteAddress) return false;
@@ -24,6 +29,23 @@ function timingSafeEqualString(actual, expected) {
   return constantTimeEqualBuffer(a, b);
 }
 
+function cookieValue(req, name) {
+  const header = req?.headers?.cookie;
+  if (!header || typeof header !== 'string') return null;
+  for (const part of header.split(';')) {
+    const [key, ...rest] = part.trim().split('=');
+    if (key === name) return rest.join('=');
+  }
+  return null;
+}
+
+function isSecureRequest(req) {
+  if (req?.socket?.encrypted) return true;
+  const forwarded = req?.headers?.['x-forwarded-proto'];
+  if (typeof forwarded !== 'string') return false;
+  return forwarded.split(',', 1)[0].trim().toLowerCase() === 'https';
+}
+
 export function createDashboardAuth({ config, env }) {
   const httpConfig = config?.auditReview?.http ?? {};
   const envObj = env ?? process.env;
@@ -31,9 +53,6 @@ export function createDashboardAuth({ config, env }) {
   function token() {
     const envToken = envObj.AUDIT_AGENT_DASHBOARD_TOKEN;
     if (envToken && envToken.trim() !== '') return envToken;
-    if (httpConfig.dashboardToken && httpConfig.dashboardToken.trim() !== '') {
-      return httpConfig.dashboardToken;
-    }
     return null;
   }
 
@@ -65,6 +84,58 @@ export function createDashboardAuth({ config, env }) {
     return match ? match[1] : null;
   }
 
+  function authorizeLoginToken(provided) {
+    const configured = token();
+    if (!configured || !provided) {
+      return { ok: false, status: 401, code: 'missing_token' };
+    }
+    if (!timingSafeEqualString(provided, configured)) {
+      return { ok: false, status: 403, code: 'invalid_token' };
+    }
+    return { ok: true };
+  }
+
+  function sessionValue() {
+    const configured = token();
+    if (!configured) return null;
+    return crypto.createHmac('sha256', configured).update(SESSION_PURPOSE).digest('base64url');
+  }
+
+  function cookieAttributes(req, { clear = false } = {}) {
+    const attributes = [`Path=${SESSION_COOKIE_PATH}`, 'HttpOnly', 'SameSite=Lax'];
+    if (clear) attributes.push('Max-Age=0');
+    if (isSecureRequest(req)) attributes.push('Secure');
+    return attributes.join('; ');
+  }
+
+  function createSessionCookie(req) {
+    const value = sessionValue();
+    return value ? `${SESSION_COOKIE_NAME}=${value}; ${cookieAttributes(req)}` : null;
+  }
+
+  function clearSessionCookie(req) {
+    return `${SESSION_COOKIE_NAME}=; ${cookieAttributes(req, { clear: true })}`;
+  }
+
+  function authorizeApi(req) {
+    return authorizeLoginToken(extractBearerToken(req));
+  }
+
+  function authorizeDashboard(req) {
+    const bearer = extractBearerToken(req);
+    if (bearer) return authorizeLoginToken(bearer);
+
+    const expectedSession = sessionValue();
+    const providedSession = cookieValue(req, SESSION_COOKIE_NAME);
+    if (!expectedSession || !providedSession) {
+      return { ok: false, status: 401, code: 'missing_token' };
+    }
+    if (!timingSafeEqualString(providedSession, expectedSession)) {
+      return { ok: false, status: 403, code: 'invalid_token' };
+    }
+    return { ok: true };
+  }
+
   function authorize(req, { isWrite } = {}) {
     const remoteAddress = req?.socket?.remoteAddress ?? req?.remoteAddress;
     const loopback = isLoopback(remoteAddress);
@@ -75,18 +146,7 @@ export function createDashboardAuth({ config, env }) {
     }
 
     // Either non-loopback, or isWrite, or requireDashboardToken
-    const configured = token();
-    if (!configured) {
-      return { ok: false, status: 401, code: 'missing_token' };
-    }
-    const provided = extractBearerToken(req);
-    if (!provided) {
-      return { ok: false, status: 401, code: 'missing_token' };
-    }
-    if (!timingSafeEqualString(provided, configured)) {
-      return { ok: false, status: 403, code: 'invalid_token' };
-    }
-    return { ok: true };
+    return authorizeApi(req);
   }
 
   function corsHeaders(origin) {
@@ -109,6 +169,11 @@ export function createDashboardAuth({ config, env }) {
     shouldRequireToken,
     validateBoot,
     authorize,
+    authorizeApi,
+    authorizeDashboard,
+    authorizeLoginToken,
+    createSessionCookie,
+    clearSessionCookie,
     corsHeaders,
   };
 }

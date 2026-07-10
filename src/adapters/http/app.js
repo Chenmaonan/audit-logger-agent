@@ -155,6 +155,15 @@ function html(res, status, body, corsHeaders) {
   res.end(body);
 }
 
+function redirect(res, location, headers = {}) {
+  res.writeHead(303, {
+    location,
+    'cache-control': 'no-store',
+    ...headers,
+  });
+  res.end();
+}
+
 // Map dashboardAuth authorize failures to HTTP status + body.
 function mapAuthFailure(authResult) {
   if (authResult.ok) return null;
@@ -184,6 +193,39 @@ async function readJson(req, limitBytes = DEFAULT_MAX_BODY_BYTES) {
   }
   const raw = Buffer.concat(chunks).toString('utf-8');
   return raw ? JSON.parse(raw) : {};
+}
+
+async function readForm(req, limitBytes = DEFAULT_MAX_BODY_BYTES) {
+  const contentType = req.headers['content-type'] ?? '';
+  if (!/^application\/x-www-form-urlencoded(?:;|$)/i.test(contentType)) {
+    const error = new Error('Invalid login request');
+    error.code = 'invalid_form';
+    throw error;
+  }
+
+  const declared = Number(req.headers['content-length']);
+  if (Number.isFinite(declared) && declared > limitBytes) {
+    const error = new Error('Request body exceeds maxBodyBytes');
+    error.code = 'body_too_large';
+    throw error;
+  }
+
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > limitBytes) {
+      const error = new Error('Request body exceeds maxBodyBytes');
+      error.code = 'body_too_large';
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  return new URLSearchParams(Buffer.concat(chunks).toString('utf-8'));
+}
+
+function dashboardLoginPage() {
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>Dashboard 登录</title></head><body><main><h1>Dashboard 登录</h1><form method="post" action="/dashboard/login"><label>访问令牌 <input type="password" name="token" autocomplete="current-password" required></label><button type="submit">登录</button></form></main></body></html>`;
 }
 
 function parseUrl(req) {
@@ -247,6 +289,7 @@ function mapRuntimeError(error) {
   if (code === 'resume_conflict') return { status: 409, body: { error_code: code, error: error.message } };
   if (code === 'invalid_decision_response') return { status: 400, body: { error_code: code, error: error.message } };
   if (code === 'invalid_request') return { status: 400, body: { error_code: code, error: error.message } };
+  if (code === 'invalid_form') return { status: 400, body: { error_code: code, error: 'Invalid login request' } };
   return { status: 500, body: { error_code: 'internal_error', error: 'Internal server error' } };
 }
 
@@ -268,10 +311,32 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
     }
 
     try {
+      // ===================== Dashboard Browser Login =====================
+      if (hasReviewDeps && req.method === 'GET' && url.pathname === '/dashboard/login') {
+        html(res, 200, dashboardLoginPage(), reviewCors(req));
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'POST' && url.pathname === '/dashboard/login') {
+        const form = await readForm(req, maxBodyBytes(config));
+        const auth = dashboardAuth.authorizeLoginToken(form.get('token'));
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, reviewCors(req)); return; }
+        const cookie = dashboardAuth.createSessionCookie(req);
+        if (!cookie) { html(res, 401, '<h1>Unauthorized</h1>', reviewCors(req)); return; }
+        redirect(res, '/dashboard', { 'set-cookie': cookie });
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'POST' && url.pathname === '/dashboard/logout') {
+        redirect(res, '/dashboard/login', { 'set-cookie': dashboardAuth.clearSessionCookie(req) });
+        return;
+      }
+
       // ===================== Audit Review API (v1.4) =====================
       if (hasReviewDeps && req.method === 'GET' && url.pathname === '/v1/audit-reviews') {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeApi(req);
         const fail = mapAuthFailure(auth);
         if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
         const { limit, offset } = paginationFromUrl(url, { defaultLimit: 50, config });
@@ -282,7 +347,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/v1/audit-reviews/') && url.pathname !== '/v1/audit-reviews/run') {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeApi(req);
         const fail = mapAuthFailure(auth);
         if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
         const reviewId = decodeURIComponent(url.pathname.split('/').pop());
@@ -294,7 +359,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (hasReviewDeps && req.method === 'GET' && url.pathname === '/v1/audit-findings') {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeApi(req);
         const fail = mapAuthFailure(auth);
         if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
         const { limit, offset } = paginationFromUrl(url, { defaultLimit: 100, config });
@@ -311,7 +376,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/v1/audit-findings/')) {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeApi(req);
         const fail = mapAuthFailure(auth);
         if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
         const findingId = decodeURIComponent(url.pathname.split('/').pop());
@@ -323,7 +388,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (hasReviewDeps && req.method === 'POST' && url.pathname === '/v1/audit-reviews/run') {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: true });
+        const auth = dashboardAuth.authorizeApi(req);
         const fail = mapAuthFailure(auth);
         if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
         try {
@@ -342,7 +407,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
       // ===================== Dashboard Pages (v1.4) =====================
       if (hasReviewDeps && req.method === 'GET' && url.pathname === '/dashboard') {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeDashboard(req);
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
         const page = visualization.overviewPage();
@@ -352,7 +417,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/dashboard/audit-reviews/')) {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeDashboard(req);
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
         const reviewId = decodeURIComponent(url.pathname.split('/').pop());
@@ -365,7 +430,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/dashboard/audit-findings/')) {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeDashboard(req);
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
         const findingId = decodeURIComponent(url.pathname.split('/').pop());

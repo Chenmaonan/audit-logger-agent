@@ -259,13 +259,68 @@ test('audit review HTTP integration smoke test', async () => {
   await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
   const { port } = app.address();
   const baseUrl = `http://127.0.0.1:${port}`;
+  const bearerHeaders = { Authorization: 'Bearer test-token-123' };
 
   try {
+    // Browser login must not expose the shared token in form HTML or errors.
+    {
+      const loginPage = await fetch(`${baseUrl}/dashboard/login?token=test-token-123`);
+      assert.equal(loginPage.status, 200);
+      const html = await loginPage.text();
+      assert.ok(html.includes('<form'));
+      assert.equal(html.includes('test-token-123'), false);
+    }
+
+    let dashboardCookie;
+    {
+      const failedLogin = await fetch(`${baseUrl}/dashboard/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: 'token=wrong-token',
+      });
+      assert.equal(failedLogin.status, 403);
+      assert.equal((await failedLogin.text()).includes('test-token-123'), false);
+
+      const login = await fetch(`${baseUrl}/dashboard/login`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: 'token=test-token-123',
+      });
+      assert.equal(login.status, 303);
+      assert.equal(login.headers.get('location'), '/dashboard');
+      const setCookie = login.headers.get('set-cookie');
+      assert.match(setCookie, /HttpOnly/);
+      assert.match(setCookie, /SameSite=Lax/);
+      assert.equal(setCookie.includes('test-token-123'), false);
+      dashboardCookie = setCookie.split(';', 1)[0];
+    }
+
+    {
+      const dashboard = await fetch(`${baseUrl}/dashboard`, { headers: { cookie: dashboardCookie } });
+      assert.equal(dashboard.status, 200);
+      const apiWithCookie = await fetch(`${baseUrl}/v1/audit-reviews`, { headers: { cookie: dashboardCookie } });
+      assert.equal(apiWithCookie.status, 401);
+      const apiWithBearer = await fetch(`${baseUrl}/v1/audit-reviews`, { headers: bearerHeaders });
+      assert.equal(apiWithBearer.status, 200);
+    }
+
+    {
+      const logout = await fetch(`${baseUrl}/dashboard/logout`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: { cookie: dashboardCookie },
+      });
+      assert.equal(logout.status, 303);
+      assert.equal(logout.headers.get('location'), '/dashboard/login');
+      assert.match(logout.headers.get('set-cookie'), /Max-Age=0/);
+    }
+
     // ------------------------------------------------------------------
-    // Case 1: GET /v1/audit-reviews before any run -> 200 with empty results
+    // Case 1: GET /v1/audit-reviews before any run -> 200 with Bearer auth
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/v1/audit-reviews`);
+      const res = await fetch(`${baseUrl}/v1/audit-reviews`, { headers: bearerHeaders });
       assert.equal(res.status, 200, 'GET /v1/audit-reviews should be 200');
       const body = await res.json();
       assert.equal(body.count, 0, 'should have zero runs');
@@ -316,7 +371,7 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /v1/audit-reviews -> new run listed
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/v1/audit-reviews`);
+      const res = await fetch(`${baseUrl}/v1/audit-reviews`, { headers: bearerHeaders });
       assert.equal(res.status, 200);
       const body = await res.json();
       assert.ok(body.count >= 1, 'should list at least 1 run');
@@ -328,7 +383,7 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /v1/audit-reviews/:reviewId -> 200
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/v1/audit-reviews/${reviewId}`);
+      const res = await fetch(`${baseUrl}/v1/audit-reviews/${reviewId}`, { headers: bearerHeaders });
       assert.equal(res.status, 200, 'GET review by id should be 200');
       const body = await res.json();
       assert.equal(body.review_id, reviewId, 'review_id should match');
@@ -339,7 +394,7 @@ test('audit review HTTP integration smoke test', async () => {
     // ------------------------------------------------------------------
     let findingId;
     {
-      const res = await fetch(`${baseUrl}/v1/audit-findings`);
+      const res = await fetch(`${baseUrl}/v1/audit-findings`, { headers: bearerHeaders });
       assert.equal(res.status, 200);
       const body = await res.json();
       assert.ok(body.count >= 1, 'should have at least 1 finding');
@@ -351,7 +406,7 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /v1/audit-findings/:findingId -> 200
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/v1/audit-findings/${findingId}`);
+      const res = await fetch(`${baseUrl}/v1/audit-findings/${findingId}`, { headers: bearerHeaders });
       assert.equal(res.status, 200, 'GET finding by id should be 200');
       const body = await res.json();
       assert.equal(body.finding_id, findingId, 'finding_id should match');
@@ -379,7 +434,7 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /dashboard -> 200 text/html with 审计 or Severity
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/dashboard`);
+      const res = await fetch(`${baseUrl}/dashboard`, { headers: bearerHeaders });
       assert.equal(res.status, 200, 'GET /dashboard should be 200');
       assert.equal(
         res.headers.get('content-type'),
@@ -403,7 +458,7 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /dashboard/audit-reviews/:reviewId -> 200 html
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/dashboard/audit-reviews/${reviewId}`);
+      const res = await fetch(`${baseUrl}/dashboard/audit-reviews/${reviewId}`, { headers: bearerHeaders });
       assert.equal(res.status, 200, 'GET dashboard review detail should be 200');
       assert.equal(res.headers.get('content-type'), 'text/html; charset=utf-8');
       const html = await res.text();
@@ -416,7 +471,7 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /dashboard/audit-findings/:findingId -> 200 html
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/dashboard/audit-findings/${findingId}`);
+      const res = await fetch(`${baseUrl}/dashboard/audit-findings/${findingId}`, { headers: bearerHeaders });
       assert.equal(res.status, 200, 'GET dashboard finding detail should be 200');
       assert.equal(res.headers.get('content-type'), 'text/html; charset=utf-8');
       const html = await res.text();
@@ -438,7 +493,7 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /v1/audit-reviews/nonexistent -> 404
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/v1/audit-reviews/nonexistent`);
+      const res = await fetch(`${baseUrl}/v1/audit-reviews/nonexistent`, { headers: bearerHeaders });
       assert.equal(res.status, 404, 'GET nonexistent review should be 404');
       const body = await res.json();
       assert.equal(body.error_code, 'review_not_found', 'should be review_not_found');
@@ -448,7 +503,7 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /v1/audit-findings/nonexistent -> 404
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/v1/audit-findings/nonexistent`);
+      const res = await fetch(`${baseUrl}/v1/audit-findings/nonexistent`, { headers: bearerHeaders });
       assert.equal(res.status, 404, 'GET nonexistent finding should be 404');
       const body = await res.json();
       assert.equal(body.error_code, 'finding_not_found', 'should be finding_not_found');
@@ -459,7 +514,7 @@ test('audit review HTTP integration smoke test', async () => {
     // ------------------------------------------------------------------
     {
       const res = await fetch(`${baseUrl}/v1/audit-reviews`, {
-        headers: { Origin: 'http://evil.test' },
+        headers: { ...bearerHeaders, Origin: 'http://evil.test' },
       });
       assert.equal(res.status, 200);
       assert.notEqual(
@@ -474,7 +529,7 @@ test('audit review HTTP integration smoke test', async () => {
     // ------------------------------------------------------------------
     {
       const res = await fetch(`${baseUrl}/v1/audit-reviews`, {
-        headers: { Origin: 'http://127.0.0.1:9320' },
+        headers: { ...bearerHeaders, Origin: 'http://127.0.0.1:9320' },
       });
       assert.equal(res.status, 200);
       assert.equal(

@@ -127,3 +127,44 @@ test('isLoopback handles ::ffff:127.0.0.1', () => {
   assert.equal(auth.isLoopback('::ffff:127.0.0.1'), true);
   assert.equal(auth.isLoopback('10.0.0.1'), false);
 });
+
+test('dashboard session cookie authorizes HTML but cannot authorize audit APIs', () => {
+  const auth = createDashboardAuth({
+    config: { auditReview: { http: {} } },
+    env: { AUDIT_AGENT_DASHBOARD_TOKEN: 'secret-token' },
+  });
+  assert.equal(typeof auth.createSessionCookie, 'function');
+  assert.equal(typeof auth.authorizeDashboard, 'function');
+  assert.equal(typeof auth.authorizeApi, 'function');
+
+  const cookie = auth.createSessionCookie(makeReq({ remoteAddress: '127.0.0.1' }));
+  assert.match(cookie, /^audit_dashboard_session=[^;]+; Path=\/dashboard; HttpOnly; SameSite=Lax$/);
+  assert.equal(cookie.includes('secret-token'), false);
+  const cookieHeader = cookie.split(';', 1)[0];
+
+  assert.equal(
+    auth.authorizeDashboard(makeReq({ remoteAddress: '127.0.0.1', headers: { cookie: cookieHeader } })).ok,
+    true,
+  );
+  const apiAuth = auth.authorizeApi(makeReq({ remoteAddress: '127.0.0.1', headers: { cookie: cookieHeader } }));
+  assert.equal(apiAuth.ok, false);
+  assert.equal(apiAuth.code, 'missing_token');
+});
+
+test('audit APIs accept a valid Bearer token and no token is leaked by invalid login checks', () => {
+  const auth = createDashboardAuth({
+    config: { auditReview: { http: {} } },
+    env: { AUDIT_AGENT_DASHBOARD_TOKEN: 'secret-token' },
+  });
+
+  assert.equal(
+    auth.authorizeApi(makeReq({
+      remoteAddress: '127.0.0.1',
+      headers: { authorization: 'Bearer secret-token' },
+    })).ok,
+    true,
+  );
+  const invalid = auth.authorizeLoginToken('wrong-token');
+  assert.deepEqual(invalid, { ok: false, status: 403, code: 'invalid_token' });
+  assert.equal(JSON.stringify(invalid).includes('secret-token'), false);
+});
