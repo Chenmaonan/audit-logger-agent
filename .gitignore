@@ -33,6 +33,9 @@ Typora_Hook_Log.txt
 SKILL.md
 TODOS.md
 docs/
+!docs/
+docs/*
+!docs/agent-audit-log-integration-guide.md
 v1.5/
 test/
 !test/
