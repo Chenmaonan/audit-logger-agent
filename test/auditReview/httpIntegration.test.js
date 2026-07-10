@@ -299,6 +299,10 @@ test('audit review HTTP integration smoke test', async () => {
     {
       const dashboard = await fetch(`${baseUrl}/dashboard`, { headers: { cookie: dashboardCookie } });
       assert.equal(dashboard.status, 200);
+      assert.equal(dashboard.headers.get('cache-control'), 'no-store');
+      const dashboardWithSlash = await fetch(`${baseUrl}/dashboard/`, { headers: { cookie: dashboardCookie } });
+      assert.equal(dashboardWithSlash.status, 200);
+      assert.equal(dashboardWithSlash.headers.get('cache-control'), 'no-store');
       const apiWithCookie = await fetch(`${baseUrl}/v1/audit-reviews`, { headers: { cookie: dashboardCookie } });
       assert.equal(apiWithCookie.status, 401);
       const apiWithBearer = await fetch(`${baseUrl}/v1/audit-reviews`, { headers: bearerHeaders });
@@ -441,6 +445,7 @@ test('audit review HTTP integration smoke test', async () => {
         'text/html; charset=utf-8',
         'dashboard content-type should be text/html',
       );
+      assert.equal(res.headers.get('cache-control'), 'no-store');
       const html = await res.text();
       assert.ok(html.includes('<html'), 'dashboard html should contain <html');
       assert.ok(

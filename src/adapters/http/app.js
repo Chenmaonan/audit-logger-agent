@@ -147,6 +147,7 @@ function auditJson(res, status, data, corsHeaders) {
 function html(res, status, body, corsHeaders) {
   const headers = {
     'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'no-store',
     'access-control-allow-methods': 'GET, OPTIONS',
     'access-control-allow-headers': 'content-type, authorization',
   };
@@ -405,7 +406,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
       }
 
       // ===================== Dashboard Pages (v1.4) =====================
-      if (hasReviewDeps && req.method === 'GET' && url.pathname === '/dashboard') {
+      if (hasReviewDeps && req.method === 'GET' && (url.pathname === '/dashboard' || url.pathname === '/dashboard/')) {
         const cors = reviewCors(req);
         const auth = dashboardAuth.authorizeDashboard(req);
         const fail = mapAuthFailure(auth);
