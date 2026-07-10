@@ -36,20 +36,3 @@ export function ingestFile(db, filePath) {
 
   return { file: filePath, inserted, errors: [] };
 }
-
-export function ingestAll(db, config, since) {
-  const results = [];
-
-  for (const [agentId, agentConfig] of Object.entries(config.agents)) {
-    const logDir = path.resolve(config.dbPath, '..', agentConfig.logDir);
-    const files = scanLogFiles(logDir, agentConfig.pattern, since);
-
-    for (const file of files) {
-      const result = ingestFile(db, file);
-      result.agent_id = agentId;
-      results.push(result);
-    }
-  }
-
-  return results;
-}

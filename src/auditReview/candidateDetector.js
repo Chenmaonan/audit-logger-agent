@@ -11,10 +11,13 @@ const EVIDENCE_FIELDS = [
   'duration_ms',
   'trace_id',
   'span_id',
-  'product_id',
-  'error_code',
+  'entity_type',
+  'entity_id',
   'error_message',
   'result_summary',
+  'mapped_tool_type',
+  'mapping_status',
+  'mapping_reason',
 ];
 
 function matchGlob(name, pattern) {
@@ -44,7 +47,7 @@ function toEpochMs(ts) {
   return Number.isNaN(n) ? null : n;
 }
 
-function makeCandidate(row, category, reason) {
+function makeCandidate(row, category, reason, extras = {}) {
   return {
     event_id: row.id,
     ts: row.ts,
@@ -55,17 +58,23 @@ function makeCandidate(row, category, reason) {
     duration_ms: row.duration_ms,
     trace_id: row.trace_id,
     span_id: row.span_id,
-    product_id: row.product_id,
-    error_code: row.error_code,
+    entity_type: row.entity_type,
+    entity_id: row.entity_id,
     error_message: row.error_message,
     result_summary: row.result_summary,
+    mapped_tool_type: row.mapped_tool_type,
+    mapping_status: row.mapping_status,
+    mapping_reason: row.mapping_reason,
     category,
     reason,
+    ...extras,
   };
 }
 
 export function createCandidateDetector({ db, riskPolicy } = {}) {
   if (!db) throw new Error('createCandidateDetector: db is required');
+  const columns = new Set(db.prepare('PRAGMA table_info(audit_events)').all().map((row) => row.name));
+  const selectOrNull = (column) => columns.has(column) ? column : `NULL AS ${column}`;
   const policy = riskPolicy ?? {};
   const repeatWindowMs = (policy.repeatWindowMinutes ?? 10) * 60000;
   const repeatThreshold = policy.repeatThreshold ?? 5;
@@ -76,8 +85,9 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
 
   const selectSql = `
     SELECT id, ts, agent_id, trace_id, span_id, parent_span_id, event, tool_name,
-           status, result_summary, duration_ms, channel, user_id, product_id,
-           error_code, error_message
+           status, result_summary, duration_ms, channel, user_id, entity_type,
+           entity_id, error_message, ${selectOrNull('mapped_tool_type')},
+           ${selectOrNull('mapping_status')}, ${selectOrNull('mapping_reason')}
     FROM audit_events
     WHERE ts >= @from AND ts <= @to
     ORDER BY ts ASC
@@ -110,7 +120,7 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
     for (const row of rows) {
       const tsMs = toEpochMs(row.ts);
       if (tsMs == null) continue;
-      const key = `${row.agent_id}|${row.tool_name}|${row.product_id ?? ''}`;
+      const key = `${row.agent_id}|${row.tool_name}|${row.entity_type ?? ''}|${row.entity_id ?? ''}`;
       const bucket = repeatBuckets.get(key) ?? [];
       // Drop timestamps older than (tsMs - repeatWindowMs).
       const cutoff = tsMs - repeatWindowMs;
@@ -130,7 +140,7 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
             makeCandidate(
               anchor,
               'repeated_call',
-              `${kept.length} calls to same agent/tool/product within ${Math.round(repeatWindowMs / 60000)} min window`,
+              `${kept.length} calls to same agent/tool/entity within ${Math.round(repeatWindowMs / 60000)} min window`,
             ),
           );
         }
@@ -142,7 +152,7 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
     // We allow the same event_id to appear under multiple categories (e.g., a slow high-risk call).
     for (const row of rows) {
       // 1. failed_call
-      if (row.status === 'error' || row.status === 'timeout' || row.status === 'cancelled') {
+      if (row.status !== 'OK') {
         candidates.push(
           makeCandidate(row, 'failed_call', `status=${row.status}`),
         );
@@ -152,7 +162,7 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
       const highRisk = isHighRisk(row.tool_name, highRiskToolPatterns);
       if (highRisk) {
         candidates.push(
-          makeCandidate(row, 'high_risk_permission', `tool_name matches high-risk pattern`),
+          makeCandidate(row, 'high_risk_permission', `tool_name matches high-risk pattern`, { min_severity: 'high' }),
         );
         // 5. abnormal channel for high-risk tool
         if (trustedChannels.length > 0 && row.channel != null && !trustedChannels.includes(row.channel)) {

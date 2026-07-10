@@ -76,7 +76,7 @@ class Runtime {
   // immediately (async ACK). Execution continues in the background via executor.
   startRun(input) {
     const created = this.#runStore.createRun(input);
-    this.#auditLogger.log({ runId: created.run_id, event: 'run.start', status: 'ok', summary: 'Run created' })
+    this.#auditLogger.log({ runId: created.run_id, event: 'run.start', status: 'OK', summary: 'Run created' })
       .catch(() => {});
     this.#executor(() => this.#planAndExecute(created.run_id).catch((error) => {
       // Defensive: #planAndExecute converges its own failures, but guard
@@ -108,7 +108,7 @@ class Runtime {
         this.#runStore.transitionRun(runId, 'running');
         const waitingRun = this.#runStore.transitionRun(runId, 'waiting_user');
         this.#eventPublisher.enqueueRunEvent(waitingRun, 'decision_request', createDecisionPayload(waitingRun, decisionId, decision.decision));
-        await this.#auditLogger.log({ runId, event: 'run.waiting_user', status: 'ok', summary: 'Run waiting for user input' });
+        await this.#auditLogger.log({ runId, event: 'run.waiting_user', status: 'OK', summary: 'Run waiting for user input' });
         return waitingRun;
       }
 
@@ -156,13 +156,13 @@ class Runtime {
     try {
       planning = await this.#planner.resumeFromDecision(waiting.context_json, body.response);
     } catch (error) {
-      await this.#auditLogger.log({ runId, event: 'run.resume', status: 'error', summary: error.message }).catch(() => {});
+      await this.#auditLogger.log({ runId, event: 'run.resume', status: 'INTERNAL', summary: error.message }).catch(() => {});
       throw error;
     }
 
     this.#waitStore.resolveWaitingState(body.decision_id);
     this.#runStore.transitionRun(runId, 'running', { plan: planning.plan });
-    await this.#auditLogger.log({ runId, event: 'run.resume', status: 'ok', summary: 'Run resumed from user decision' });
+    await this.#auditLogger.log({ runId, event: 'run.resume', status: 'OK', summary: 'Run resumed from user decision' });
 
     try {
       return await this.#executePlan(runId, planning.plan);
@@ -219,7 +219,7 @@ class Runtime {
     const finalResult = await this.#planner.synthesizeFinalResult({ runId, toolResults });
     const completedRun = this.#runStore.transitionRun(runId, 'completed', { result: finalResult, currentStepIndex: plan.steps.length });
     this.#eventPublisher.enqueueRunEvent(completedRun, 'final_result', createFinalResultPayload(completedRun, finalResult));
-    await this.#auditLogger.log({ runId, event: 'run.final_result', status: 'ok', summary: finalResult.summary });
+    await this.#auditLogger.log({ runId, event: 'run.final_result', status: 'OK', summary: finalResult.summary });
     return completedRun;
   }
 
@@ -251,7 +251,7 @@ class Runtime {
       }
 
       this.#eventPublisher.enqueueRunEvent(failedRun, 'final_result', createFailedFinalResultPayload(failedRun, error));
-      await this.#auditLogger.log({ runId, event: 'run.failed', status: 'error', summary: errorMessage }).catch(() => {});
+      await this.#auditLogger.log({ runId, event: 'run.failed', status: 'INTERNAL', summary: errorMessage }).catch(() => {});
     } catch {
       // Best-effort failure convergence during teardown; never surface.
     }

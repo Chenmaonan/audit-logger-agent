@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS audit_review_findings (
   agent_id TEXT,
   tool_name TEXT,
   trace_id TEXT,
-  product_id TEXT,
+  entity_type TEXT,
+  entity_id TEXT,
   title TEXT NOT NULL,
   summary TEXT NOT NULL,
   recommendation TEXT,
@@ -47,9 +48,18 @@ CREATE TABLE IF NOT EXISTS audit_review_findings (
   snoozed_until TEXT,
   acknowledged_at TEXT,
   acknowledged_by TEXT,
+  llm_analysis_json TEXT,
+  analysis_generated_at TEXT,
   risk_policy_version TEXT NOT NULL,
   prompt_version TEXT,
   reviewer_version TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_llm_usage (
+  day TEXT PRIMARY KEY,
+  calls INTEGER NOT NULL DEFAULT 0,
+  est_tokens INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS audit_review_locks (
@@ -82,7 +92,22 @@ CREATE INDEX IF NOT EXISTS idx_audit_review_findings_severity
 ON audit_review_findings(severity, created_at);
 `;
 
+function tableColumns(db, tableName) {
+  return new Set(db.prepare(`PRAGMA table_info(${tableName})`).all().map((row) => row.name));
+}
+
+function addColumnIfMissing(db, tableName, columnName, definition) {
+  const columns = tableColumns(db, tableName);
+  if (!columns.has(columnName)) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  }
+}
+
 export function ensureReviewSchema(db) {
   db.exec(REVIEW_TABLES);
+  addColumnIfMissing(db, 'audit_review_findings', 'entity_type', 'TEXT');
+  addColumnIfMissing(db, 'audit_review_findings', 'entity_id', 'TEXT');
+  addColumnIfMissing(db, 'audit_review_findings', 'llm_analysis_json', 'TEXT');
+  addColumnIfMissing(db, 'audit_review_findings', 'analysis_generated_at', 'TEXT');
   db.exec(REVIEW_INDEXES);
 }

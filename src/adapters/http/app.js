@@ -1,7 +1,125 @@
 // src/adapters/http/app.js
 import http from 'http';
-import { queryEvents, dailySummary, errorReport, toolUsageStats } from '../../../scripts/lib/db.js';
+import fs from 'fs';
+import {
+  queryEvents,
+  dailySummary,
+  errorReport,
+  toolUsageStats,
+  reportDateForNow,
+  reportTimezoneOffsetMinutes,
+} from '../../../scripts/lib/db.js';
 import { renderDashboard } from '../../auditReview/dashboardTemplate.js';
+import { handleIngestRoute, isHttpIngestEnabled } from './ingestRoute.js';
+
+const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
+const DEFAULT_MAX_QUERY_LIMIT = 1000;
+
+function positiveInteger(value, defaultValue) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) return defaultValue;
+  return Math.floor(parsed);
+}
+
+function maxBodyBytes(config = {}) {
+  return positiveInteger(config.limits?.maxBodyBytes, DEFAULT_MAX_BODY_BYTES);
+}
+
+function maxQueryLimit(config = {}) {
+  return positiveInteger(config.limits?.maxQueryLimit, DEFAULT_MAX_QUERY_LIMIT);
+}
+
+function clampLimit(value, defaultValue, maxValue) {
+  if (value == null) return defaultValue;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return defaultValue;
+  const integer = Math.floor(parsed);
+  if (integer < 1) return 1;
+  return Math.min(integer, maxValue);
+}
+
+function clampOffset(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return Math.floor(parsed);
+}
+
+function paginationFromUrl(url, { defaultLimit, config }) {
+  return {
+    limit: clampLimit(url.searchParams.get('limit'), defaultLimit, maxQueryLimit(config)),
+    offset: clampOffset(url.searchParams.get('offset')),
+  };
+}
+
+function dbWritableProbe(db) {
+  try {
+    db.exec('BEGIN IMMEDIATE; ROLLBACK;');
+    return { writable: true };
+  } catch (error) {
+    return { writable: false, error: error.message };
+  }
+}
+
+function isMissingTableError(error) {
+  return /no such table/i.test(error?.message ?? '');
+}
+
+function latestReview(db) {
+  try {
+    return db.prepare(`
+      SELECT review_id, status, started_at, finished_at
+      FROM audit_review_runs
+      ORDER BY COALESCE(finished_at, started_at) DESC
+      LIMIT 1
+    `).get() ?? null;
+  } catch (error) {
+    if (isMissingTableError(error)) return null;
+    return { error: error.message };
+  }
+}
+
+function outboxCounts(db) {
+  try {
+    const row = db.prepare(`
+      SELECT
+        SUM(CASE WHEN delivery_status = 'pending' THEN 1 ELSE 0 END) AS pending,
+        SUM(CASE WHEN delivery_status = 'dead_letter' THEN 1 ELSE 0 END) AS dead_letter
+      FROM agent_outbox_events
+    `).get();
+    return {
+      pending: row?.pending ?? 0,
+      dead_letter: row?.dead_letter ?? 0,
+    };
+  } catch (error) {
+    if (isMissingTableError(error)) return { pending: 0, dead_letter: 0 };
+    return { pending: null, dead_letter: null, error: error.message };
+  }
+}
+
+function safeFileSize(filePath) {
+  try {
+    return fs.statSync(filePath).size;
+  } catch (error) {
+    if (error.code === 'ENOENT') return 0;
+    return null;
+  }
+}
+
+function diskUsageEstimate(dbPath) {
+  const dbBytes = safeFileSize(dbPath);
+  const walBytes = safeFileSize(`${dbPath}-wal`);
+  const shmBytes = safeFileSize(`${dbPath}-shm`);
+  const sizes = [dbBytes, walBytes, shmBytes];
+  const total = sizes.every((size) => typeof size === 'number')
+    ? sizes.reduce((sum, size) => sum + size, 0)
+    : null;
+  return {
+    db_bytes: dbBytes,
+    wal_bytes: walBytes,
+    shm_bytes: shmBytes,
+    total_bytes: total,
+  };
+}
 
 function json(res, status, data) {
   res.writeHead(status, {
@@ -45,9 +163,25 @@ function mapAuthFailure(authResult) {
   return { status, body: { error_code: code, error: 'Unauthorized' } };
 }
 
-async function readJson(req) {
+async function readJson(req, limitBytes = DEFAULT_MAX_BODY_BYTES) {
+  const declared = Number(req.headers['content-length']);
+  if (Number.isFinite(declared) && declared > limitBytes) {
+    const error = new Error('Request body exceeds maxBodyBytes');
+    error.code = 'body_too_large';
+    throw error;
+  }
+
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > limitBytes) {
+      const error = new Error('Request body exceeds maxBodyBytes');
+      error.code = 'body_too_large';
+      throw error;
+    }
+    chunks.push(chunk);
+  }
   const raw = Buffer.concat(chunks).toString('utf-8');
   return raw ? JSON.parse(raw) : {};
 }
@@ -108,6 +242,7 @@ function normalizeRunRequest(body, headers) {
 // Maps runtime-thrown errors (carrying a stable `code`) to HTTP status + body.
 function mapRuntimeError(error) {
   const code = error?.code;
+  if (code === 'body_too_large') return { status: 413, body: { error_code: 'payload_too_large', error: error.message } };
   if (code === 'run_not_found') return { status: 404, body: { error_code: code, error: error.message } };
   if (code === 'resume_conflict') return { status: 409, body: { error_code: code, error: error.message } };
   if (code === 'invalid_decision_response') return { status: 400, body: { error_code: code, error: error.message } };
@@ -115,7 +250,7 @@ function mapRuntimeError(error) {
   return { status: 500, body: { error_code: 'internal_error', error: 'Internal server error' } };
 }
 
-export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth } = {}) {
+export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth, toolSemanticMapper, now = () => new Date() } = {}) {
   // Helpers for audit-review routes. These are optional — if not provided
   // (e.g. in the existing runs-api test), the new routes return 503.
   const hasReviewDeps = !!(scheduler && reviewStore && visualization && dashboardAuth);
@@ -139,8 +274,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         const auth = dashboardAuth.authorize(req, { isWrite: false });
         const fail = mapAuthFailure(auth);
         if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
-        const limit = Number(url.searchParams.get('limit') ?? 50);
-        const offset = Number(url.searchParams.get('offset') ?? 0);
+        const { limit, offset } = paginationFromUrl(url, { defaultLimit: 50, config });
         const runs = reviewStore.listRuns({ limit, offset });
         auditJson(res, 200, { count: runs.length, results: runs }, cors);
         return;
@@ -163,8 +297,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         const auth = dashboardAuth.authorize(req, { isWrite: false });
         const fail = mapAuthFailure(auth);
         if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
-        const limit = Number(url.searchParams.get('limit') ?? 100);
-        const offset = Number(url.searchParams.get('offset') ?? 0);
+        const { limit, offset } = paginationFromUrl(url, { defaultLimit: 100, config });
         const severity = url.searchParams.get('severity') ?? undefined;
         const category = url.searchParams.get('category') ?? undefined;
         const agentId = url.searchParams.get('agent_id') ?? undefined;
@@ -247,21 +380,43 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       // ===================== Existing Routes (unchanged) =====================
       if (req.method === 'GET' && url.pathname === '/health') {
-        json(res, 200, { status: 'ok', dbPath: config.dbPath });
+        const dbProbe = dbWritableProbe(db);
+        const status = dbProbe.writable ? 'ok' : 'error';
+        json(res, dbProbe.writable ? 200 : 503, {
+          status,
+          checked_at: now().toISOString(),
+          dbPath: config.dbPath,
+          db: dbProbe,
+          latest_review: latestReview(db),
+          outbox: outboxCounts(db),
+          disk: diskUsageEstimate(config.dbPath),
+        });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/v1/ingest' && isHttpIngestEnabled(config)) {
+        await handleIngestRoute(req, res, { config, db, toolSemanticMapper });
         return;
       }
 
       if (req.method === 'GET' && url.pathname === '/query') {
         const filters = Object.fromEntries(url.searchParams.entries());
-        if (filters.limit) filters.limit = Number(filters.limit);
-        const results = queryEvents(db, filters);
+        const { limit, offset } = paginationFromUrl(url, { defaultLimit: 100, config });
+        filters.limit = limit;
+        filters.offset = offset;
+        const results = queryEvents(db, filters, { maxQueryLimit: maxQueryLimit(config) });
         json(res, 200, { count: results.length, results });
         return;
       }
 
       if (req.method === 'GET' && url.pathname === '/report/daily') {
-        const date = url.searchParams.get('date') ?? new Date().toISOString().slice(0, 10);
-        json(res, 200, { date, results: dailySummary(db, date) });
+        const timezoneOffsetMinutes = reportTimezoneOffsetMinutes(config);
+        const date = url.searchParams.get('date') ?? reportDateForNow(now(), timezoneOffsetMinutes);
+        json(res, 200, {
+          date,
+          timezone_offset_minutes: timezoneOffsetMinutes,
+          results: dailySummary(db, date, undefined, { timezoneOffsetMinutes }),
+        });
         return;
       }
 
@@ -282,7 +437,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
       }
 
       if (req.method === 'POST' && url.pathname === '/v1/runs') {
-        const body = await readJson(req);
+        const body = await readJson(req, maxBodyBytes(config));
         const normalized = normalizeRunRequest(body, req.headers);
         const validationErrors = validateCreateRunInput(normalized);
         if (validationErrors.length > 0) {
@@ -298,7 +453,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (req.method === 'POST' && url.pathname.startsWith('/v1/runs/') && url.pathname.endsWith('/resume')) {
         const runId = url.pathname.split('/')[3];
-        const body = await readJson(req);
+        const body = await readJson(req, maxBodyBytes(config));
         if (!body || !body.decision_id) {
           json(res, 400, { error_code: 'invalid_request', error: 'decision_id is required' });
           return;

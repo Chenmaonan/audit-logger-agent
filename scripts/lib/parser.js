@@ -1,9 +1,26 @@
-const REQUIRED_FIELDS = ['ts', 'agent_id', 'trace_id', 'span_id', 'event', 'tool_name', 'status', 'result_summary'];
-const VALID_EVENTS = ['tool.start', 'tool.end', 'tool.error', 'agent.start', 'agent.end', 'agent.error', 'run.start', 'run.resume', 'run.waiting_user', 'run.final_result', 'run.failed'];
-const VALID_STATUSES = ['ok', 'error', 'timeout', 'cancelled'];
+import {
+  CANONICAL_STATUS_CODES,
+  REQUIRED_FIELDS,
+  isCanonicalStatus,
+  normalizeEventId,
+} from './auditSpec.js';
+
+const DEFAULT_MAX_LINE_BYTES = 64 * 1024;
+
+function hasOwn(obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function isBlankOptional(value) {
+  return value == null || value === '';
+}
 
 export function validateLogEntry(entry, lineNumber) {
   const errors = [];
+
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    return [`line ${lineNumber}: entry must be an object`];
+  }
 
   for (const field of REQUIRED_FIELDS) {
     if (entry[field] == null || entry[field] === '') {
@@ -11,12 +28,12 @@ export function validateLogEntry(entry, lineNumber) {
     }
   }
 
-  if (entry.event && !VALID_EVENTS.includes(entry.event)) {
-    errors.push(`line ${lineNumber}: invalid event "${entry.event}"`);
+  if (entry.event && typeof entry.event !== 'string') {
+    errors.push(`line ${lineNumber}: event must be a string`);
   }
 
-  if (entry.status && !VALID_STATUSES.includes(entry.status)) {
-    errors.push(`line ${lineNumber}: invalid status "${entry.status}"`);
+  if (entry.status && !isCanonicalStatus(entry.status)) {
+    errors.push(`line ${lineNumber}: invalid status "${entry.status}"; expected one of ${CANONICAL_STATUS_CODES.join(', ')}`);
   }
 
   if (entry.ts && isNaN(Date.parse(entry.ts))) {
@@ -27,8 +44,50 @@ export function validateLogEntry(entry, lineNumber) {
     errors.push(`line ${lineNumber}: result_summary exceeds 200 chars (${entry.result_summary.length})`);
   }
 
-  if (entry.error && typeof entry.error !== 'object') {
+  if (hasOwn(entry, 'product_id')) {
+    errors.push(`line ${lineNumber}: product_id is not allowed; use entity.type and entity.id`);
+  }
+
+  if (!isBlankOptional(entry.parent_span_id) && typeof entry.parent_span_id !== 'string') {
+    errors.push(`line ${lineNumber}: parent_span_id must be a string when present`);
+  }
+
+  if (!isBlankOptional(entry.user_id) && typeof entry.user_id !== 'string') {
+    errors.push(`line ${lineNumber}: user_id must be a string when present`);
+  }
+
+  if (entry.error && (typeof entry.error !== 'object' || Array.isArray(entry.error))) {
     errors.push(`line ${lineNumber}: error field must be an object`);
+  }
+
+  if (entry.error && hasOwn(entry.error, 'code')) {
+    errors.push(`line ${lineNumber}: error.code is not allowed; use status for canonical failure code and error.message for details`);
+  }
+
+  if (entry.entity != null) {
+    if (typeof entry.entity !== 'object' || Array.isArray(entry.entity)) {
+      errors.push(`line ${lineNumber}: entity must be an object`);
+    } else {
+      if (typeof entry.entity.type !== 'string' || entry.entity.type === '') {
+        errors.push(`line ${lineNumber}: entity.type must be a non-empty string`);
+      }
+      if (typeof entry.entity.id !== 'string' || entry.entity.id === '') {
+        errors.push(`line ${lineNumber}: entity.id must be a non-empty string`);
+      }
+    }
+  }
+
+  if (entry.llm_intent != null) {
+    if (typeof entry.llm_intent !== 'object' || Array.isArray(entry.llm_intent)) {
+      errors.push(`line ${lineNumber}: llm_intent must be an object`);
+    } else {
+      if (typeof entry.llm_intent.input !== 'string') {
+        errors.push(`line ${lineNumber}: llm_intent.input must be a string`);
+      }
+      if (typeof entry.llm_intent.output !== 'string') {
+        errors.push(`line ${lineNumber}: llm_intent.output must be a string`);
+      }
+    }
   }
 
   if (entry.tags && !Array.isArray(entry.tags)) {
@@ -38,15 +97,23 @@ export function validateLogEntry(entry, lineNumber) {
   return errors;
 }
 
-export function parseNdjson(content) {
+export function parseNdjson(content, options = {}) {
+  const maxLineBytes = Number.isFinite(Number(options.maxLineBytes)) && Number(options.maxLineBytes) > 0
+    ? Math.floor(Number(options.maxLineBytes))
+    : DEFAULT_MAX_LINE_BYTES;
   const lines = content.split('\n').filter(line => line.trim() !== '');
   const entries = [];
   const errors = [];
 
   for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].endsWith('\r') ? lines[i].slice(0, -1) : lines[i];
+    const lineNumber = i + 1;
+    if (Buffer.byteLength(line, 'utf-8') > maxLineBytes) {
+      errors.push(`line ${lineNumber}: exceeds maxLineBytes (${maxLineBytes})`);
+      continue;
+    }
     try {
-      const entry = JSON.parse(lines[i]);
-      const lineNumber = i + 1;
+      const entry = JSON.parse(line);
       const validationErrors = validateLogEntry(entry, lineNumber);
       if (validationErrors.length > 0) {
         errors.push(...validationErrors);
@@ -63,21 +130,24 @@ export function parseNdjson(content) {
 
 export function normalizeEntry(entry) {
   const error = entry.error || null;
+  const entity = entry.entity || null;
+  const canonicalEvent = normalizeEventId(entry.event);
   return {
     ts: entry.ts,
     agent_id: entry.agent_id,
     trace_id: entry.trace_id,
     span_id: entry.span_id,
-    parent_span_id: entry.parent_span_id || null,
-    event: entry.event,
+    parent_span_id: entry.parent_span_id === '' ? null : (entry.parent_span_id ?? null),
+    event: canonicalEvent ?? 'unknown',
     tool_name: entry.tool_name,
     status: entry.status,
     result_summary: entry.result_summary,
     duration_ms: entry.duration_ms ?? null,
     channel: entry.channel || null,
-    user_id: entry.user_id || null,
-    product_id: entry.product_id || null,
-    error_code: error?.code || null,
+    user_id: entry.user_id === '' ? null : (entry.user_id ?? null),
+    entity_type: entity?.type ?? null,
+    entity_id: entity?.id ?? null,
+    llm_intent_json: entry.llm_intent ? JSON.stringify(entry.llm_intent) : null,
     error_message: error?.message || null,
     tags: entry.tags ? JSON.stringify(entry.tags) : null,
     raw_json: JSON.stringify(entry),

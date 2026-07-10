@@ -1,6 +1,7 @@
 // src/app/loadConfig.js
 import fs from 'fs';
 import path from 'path';
+import { normalizeAppConfig } from './paths.js';
 
 export function loadAppConfig(rootDir) {
   const configPath = path.join(rootDir, 'config.json');
@@ -8,8 +9,5 @@ export function loadAppConfig(rootDir) {
     throw new Error(`config.json not found at ${configPath}`);
   }
   const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-  return {
-    ...config,
-    planner: config.planner ?? {},
-  };
+  return normalizeAppConfig(config, rootDir);
 }

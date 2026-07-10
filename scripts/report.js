@@ -1,20 +1,22 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { openDb, dailySummary, errorReport, toolUsageStats } from './lib/db.js';
+import {
+  openDb,
+  dailySummary,
+  errorReport,
+  toolUsageStats,
+  reportDateForNow,
+  reportTimezoneOffsetMinutes,
+} from './lib/db.js';
+import { loadAppConfig } from '../src/app/loadConfig.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const configPath = path.resolve(__dirname, '..', 'config.json');
+const rootDir = path.resolve(__dirname, '..');
+const config = loadAppConfig(rootDir);
+const dbPath = config.paths.dbPath;
 
-if (!fs.existsSync(configPath)) {
-  console.error('config.json not found.');
-  process.exit(1);
-}
-
-const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-const dbPath = path.resolve(__dirname, '..', config.dbPath);
-
-if (!fs.existsSync(path.dirname(dbPath))) {
+if (!fs.existsSync(dbPath)) {
   console.error('No database found. Run ingest first.');
   process.exit(1);
 }
@@ -39,12 +41,13 @@ function parseArgs() {
 }
 
 const opts = parseArgs();
+const timezoneOffsetMinutes = reportTimezoneOffsetMinutes(config);
 
 switch (opts.type) {
   case 'daily': {
-    const date = opts.date || new Date().toISOString().slice(0, 10);
+    const date = opts.date || reportDateForNow(new Date(), timezoneOffsetMinutes);
     console.log(`Daily Summary — ${date}${opts.agent_id ? ` (agent: ${opts.agent_id})` : ''}\n`);
-    const rows = dailySummary(db, date, opts.agent_id);
+    const rows = dailySummary(db, date, opts.agent_id, { timezoneOffsetMinutes });
 
     if (rows.length === 0) {
       console.log('No events for this date.');
@@ -69,7 +72,8 @@ switch (opts.type) {
     } else {
       for (const r of rows) {
         console.log(`[${r.ts}] ${r.agent_id} | ${r.tool_name}`);
-        console.log(`  error: ${r.error_code} — ${r.error_message}`);
+        console.log(`  status: ${r.status}`);
+        if (r.error_message) console.log(`  error: ${r.error_message}`);
         console.log(`  summary: ${r.result_summary}`);
         console.log(`  trace: ${r.trace_id}`);
         console.log('');

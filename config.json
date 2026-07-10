@@ -1,14 +1,40 @@
 {
-  "dbPath": "data/audit.db",
-  "agents": {
-    "rental-price-agent": {
-      "logDir": "../../rental-price-agent-main/tasks/logs",
-      "pattern": "audit-*.jsonl"
+  "dbPath": "data/db/audit.db",
+  "agents": {},
+  "ingest": {
+    "http": {
+      "enabled": true,
+      "maxBodyBytes": 1048576,
+      "maxLineBytes": 65536
     },
-    "mt-agent": {
-      "logDir": "../../MT-agent-master/output/logs",
-      "pattern": "audit-*.jsonl"
-    }
+    "spoolDir": "data/spool/incoming"
+  },
+  "capturesDir": "data/captures",
+  "tmpDir": "data/tmp",
+  "logDir": "logs",
+  "limits": {
+    "maxLineBytes": 65536,
+    "maxChunkBytes": 16777216,
+    "maxQueryLimit": 1000,
+    "maxBodyBytes": 1048576
+  },
+  "report": {
+    "timezoneOffsetMinutes": 480
+  },
+  "retention": {
+    "enabled": true,
+    "runAtHour": 4,
+    "eventsDays": 90,
+    "runtimeRunsDays": 30,
+    "waitingStatesDays": 30,
+    "resolvedFindingsDays": 30,
+    "reviewRunsDays": 60,
+    "llmUsageDays": 90,
+    "outboxDays": 14,
+    "logFilesDays": 14,
+    "tmpFilesDays": 7,
+    "captureFilesDays": 30,
+    "vacuum": "incremental"
   },
   "auditReview": {
     "enabled": true,
@@ -47,9 +73,35 @@
         "mt-agent": []
       }
     },
+    "toolMapping": {
+      "version": "tool-semantic-mapping-v1",
+      "taxonomy": [
+        "read",
+        "write",
+        "update",
+        "delete",
+        "deploy",
+        "permission",
+        "credential",
+        "shell",
+        "browser",
+        "network",
+        "database",
+        "file",
+        "notification",
+        "llm",
+        "unknown"
+      ]
+    },
     "llmReview": {
       "promptVersion": "audit-review-prompt-v1",
       "reviewerVersion": "audit-reviewer-v1"
+    },
+    "llmBudget": {
+      "maxCallsPerDay": 500,
+      "maxTokensPerDay": 2000000,
+      "maxConcurrency": 2,
+      "cacheDetailAnalysis": true
     },
     "visualization": {
       "enabled": true,

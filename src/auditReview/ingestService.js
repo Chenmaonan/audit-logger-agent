@@ -15,26 +15,37 @@ import path from 'path';
 import { scanLogFiles } from '../../scripts/lib/indexer.js';
 import { parseNdjson, normalizeEntry } from '../../scripts/lib/parser.js';
 import { insertEvents } from '../../scripts/lib/db.js';
+import { getRuntimePaths } from '../app/paths.js';
+
+const DEFAULT_MAX_LINE_BYTES = 64 * 1024;
+const DEFAULT_MAX_CHUNK_BYTES = 16 * 1024 * 1024;
+
+function positiveInteger(value, defaultValue) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) return defaultValue;
+  return Math.floor(parsed);
+}
 
 /**
  * Read bytes [offsetBytes, end) from a file as a UTF-8 string.
  * Returns { chunk, size, mtimeMs }. Throws nothing for missing files;
  * caller should stat first.
  */
-export function readIncrementalChunk(filePath, offsetBytes = 0) {
+export function readIncrementalChunk(filePath, offsetBytes = 0, options = {}) {
   const stat = fs.statSync(filePath);
   const size = stat.size;
   const start = Math.max(0, offsetBytes);
   if (start >= size) {
     return { chunk: '', size, mtimeMs: stat.mtimeMs };
   }
+  const maxChunkBytes = positiveInteger(options.maxChunkBytes, DEFAULT_MAX_CHUNK_BYTES);
   // Use a Buffer so byte offsets are exact (no UTF-8 decode boundary issues for
   // ASCII NDJSON; for multi-byte chars split across the boundary this is still
   // safe because we only consume up to the last '\n', and JSON lines are whole
   // UTF-8 codepoint sequences terminated by '\n').
   const fd = fs.openSync(filePath, 'r');
   try {
-    const len = size - start;
+    const len = Math.min(size - start, maxChunkBytes);
     const buf = Buffer.allocUnsafe(len);
     fs.readSync(fd, buf, 0, len, start);
     return { chunk: buf.toString('utf-8'), size, mtimeMs: stat.mtimeMs };
@@ -56,21 +67,62 @@ function splitCompleteAndPartial(chunk) {
   }
   const endsWithNewline = chunk.endsWith('\n');
   if (endsWithNewline) {
-    return { completeText: chunk, partialBytes: 0, consumedBytes: chunk.length };
+    return {
+      completeText: chunk,
+      partialBytes: 0,
+      consumedBytes: Buffer.byteLength(chunk, 'utf-8'),
+    };
   }
   const lastNewline = chunk.lastIndexOf('\n');
   if (lastNewline === -1) {
     // No newline at all -> everything is partial.
-    return { completeText: '', partialBytes: chunk.length, consumedBytes: 0 };
+    return { completeText: '', partialBytes: Buffer.byteLength(chunk, 'utf-8'), consumedBytes: 0 };
   }
   // completeText includes the trailing newline at `lastNewline`.
   const completeText = chunk.slice(0, lastNewline + 1);
-  const partialBytes = chunk.length - (lastNewline + 1);
-  return { completeText, partialBytes, consumedBytes: lastNewline + 1 };
+  const partialText = chunk.slice(lastNewline + 1);
+  const partialBytes = Buffer.byteLength(partialText, 'utf-8');
+  return {
+    completeText,
+    partialBytes,
+    consumedBytes: Buffer.byteLength(completeText, 'utf-8'),
+  };
+}
+
+function skipUntilLineBoundary(filePath, offsetBytes, maxChunkBytes) {
+  const stat = fs.statSync(filePath);
+  const fd = fs.openSync(filePath, 'r');
+  let pos = Math.max(0, offsetBytes);
+  let consumedBytes = 0;
+  try {
+    while (pos < stat.size) {
+      const len = Math.min(stat.size - pos, maxChunkBytes);
+      const buf = Buffer.allocUnsafe(len);
+      fs.readSync(fd, buf, 0, len, pos);
+      const newlineIndex = buf.indexOf(0x0a);
+      if (newlineIndex !== -1) {
+        return { consumedBytes: consumedBytes + newlineIndex + 1, foundNewline: true };
+      }
+      pos += len;
+      consumedBytes += len;
+    }
+    return { consumedBytes, foundNewline: false };
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function basename(p) {
   return path.basename(p);
+}
+
+function isSafeSpoolAgentDir(name) {
+  return typeof name === 'string'
+    && name.length > 0
+    && !name.includes('..')
+    && !name.includes('/')
+    && !name.includes('\\')
+    && /^[A-Za-z0-9._-]+$/.test(name);
 }
 
 /**
@@ -87,7 +139,27 @@ export function createAuditIngestService({ db, config, cursorStore, now = () => 
   if (!config) throw new Error('createAuditIngestService: config is required');
   if (!cursorStore) throw new Error('createAuditIngestService: cursorStore is required');
 
-  const dbDir = path.dirname(config.dbPath);
+  const paths = getRuntimePaths(config);
+  const limits = {
+    maxLineBytes: positiveInteger(config.limits?.maxLineBytes, DEFAULT_MAX_LINE_BYTES),
+    maxChunkBytes: positiveInteger(config.limits?.maxChunkBytes, DEFAULT_MAX_CHUNK_BYTES),
+  };
+
+  function ingestSources() {
+    const sources = [];
+    const spoolDir = paths.spoolDir;
+    if (spoolDir && fs.existsSync(spoolDir)) {
+      for (const dirent of fs.readdirSync(spoolDir, { withFileTypes: true })) {
+        if (!dirent.isDirectory() || !isSafeSpoolAgentDir(dirent.name)) continue;
+        sources.push({
+          agentId: dirent.name,
+          logDir: path.join(spoolDir, dirent.name),
+          pattern: 'audit-*.jsonl',
+        });
+      }
+    }
+    return sources;
+  }
 
   /**
    * Ingest new audit-log lines for every configured agent.
@@ -103,11 +175,8 @@ export function createAuditIngestService({ db, config, cursorStore, now = () => 
     let cursorUpdates = 0;
     const parseErrors = [];
 
-    const agents = config.agents || {};
-
-    for (const [agentId, agentConfig] of Object.entries(agents)) {
-      if (!agentConfig) continue;
-      const logDir = path.resolve(dbDir, agentConfig.logDir);
+    for (const source of ingestSources()) {
+      const { agentId, logDir, pattern } = source;
       if (!fs.existsSync(logDir)) {
         // Gracefully skip — missing log directory is not a fatal error.
         continue;
@@ -115,7 +184,7 @@ export function createAuditIngestService({ db, config, cursorStore, now = () => 
 
       let files;
       try {
-        files = scanLogFiles(logDir, agentConfig.pattern, sinceDate);
+        files = scanLogFiles(logDir, pattern, sinceDate);
       } catch {
         // scanLogFiles already guards existsSync but be defensive.
         continue;
@@ -136,7 +205,8 @@ export function createAuditIngestService({ db, config, cursorStore, now = () => 
         const cursor = cursorStore.get({ agentId, filePath: absPath });
         let offsetBytes;
         if (cursor) {
-          if (cursor.file_size_bytes === size && cursor.file_mtime_ms === mtimeMs) {
+          const cursorOffset = cursor.offset_bytes || 0;
+          if (cursor.file_size_bytes === size && cursor.file_mtime_ms === mtimeMs && cursorOffset >= size) {
             // No change since last round.
             scannedFiles++;
             continue;
@@ -146,7 +216,7 @@ export function createAuditIngestService({ db, config, cursorStore, now = () => 
             offsetBytes = 0;
           } else {
             // Appended — resume from cursor offset.
-            offsetBytes = cursor.offset_bytes || 0;
+            offsetBytes = cursorOffset;
           }
         } else {
           offsetBytes = 0;
@@ -154,13 +224,15 @@ export function createAuditIngestService({ db, config, cursorStore, now = () => 
 
         scannedFiles++;
 
-        const { chunk } = readIncrementalChunk(absPath, offsetBytes);
+        const { chunk } = readIncrementalChunk(absPath, offsetBytes, { maxChunkBytes: limits.maxChunkBytes });
+        const chunkBytes = Buffer.byteLength(chunk, 'utf-8');
         const { completeText, partialBytes, consumedBytes } = splitCompleteAndPartial(chunk);
 
         let fileParseErrors = [];
         let fileInserted = 0;
+        let skippedBytes = 0;
         if (completeText.length > 0) {
-          const { entries, errors } = parseNdjson(completeText);
+          const { entries, errors } = parseNdjson(completeText, { maxLineBytes: limits.maxLineBytes });
           fileParseErrors = errors.map((e) => ({
             agent_id: agentId,
             file: basename(absPath),
@@ -173,11 +245,31 @@ export function createAuditIngestService({ db, config, cursorStore, now = () => 
           }
         }
 
+        const mustSkipOverlongPartial = partialBytes > limits.maxLineBytes
+          || (consumedBytes === 0 && chunkBytes >= limits.maxChunkBytes);
+        if (partialBytes > 0 && mustSkipOverlongPartial) {
+          const skip = skipUntilLineBoundary(
+            absPath,
+            offsetBytes + consumedBytes,
+            limits.maxChunkBytes
+          );
+          skippedBytes = skip.consumedBytes;
+          const limitName = partialBytes > limits.maxLineBytes ? 'maxLineBytes' : 'maxChunkBytes';
+          const limitValue = partialBytes > limits.maxLineBytes ? limits.maxLineBytes : limits.maxChunkBytes;
+          const terminator = skip.foundNewline ? 'overlong line' : 'unterminated line';
+          fileParseErrors.push({
+            agent_id: agentId,
+            file: basename(absPath),
+            line: '?',
+            error: `${terminator} exceeds ${limitName} (${limitValue})`,
+          });
+        }
+
         inserted += fileInserted;
         parseErrors.push(...fileParseErrors);
 
         // New offset: bytes consumed (complete lines) relative to start of file.
-        const newOffset = offsetBytes + consumedBytes;
+        const newOffset = offsetBytes + consumedBytes + skippedBytes;
         const lastError = fileParseErrors.length > 0
           ? `${fileParseErrors.length} parse error(s) in ${basename(absPath)}`
           : null;

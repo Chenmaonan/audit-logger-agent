@@ -1,5 +1,7 @@
 // scripts/server.js
+import fs from 'fs';
 import path from 'path';
+import util from 'util';
 import { fileURLToPath } from 'url';
 import { openDb } from './lib/db.js';
 import { ensureRuntimeSchema } from '../src/db/runtimeSchema.js';
@@ -17,6 +19,7 @@ import { createRuntimeAuditLogger } from '../src/observability/runtimeAudit.js';
 import { createHttpApp } from '../src/adapters/http/app.js';
 import { recoverInflightRuns } from '../src/agent/recovery.js';
 import { loadAppConfig } from '../src/app/loadConfig.js';
+import { ensureRuntimeLayout, migrateLegacyRuntimeArtifacts } from '../src/app/paths.js';
 import { loadOpenAIConfig } from '../src/llm/openaiConfig.js';
 import { createOpenAIResponsesClient } from '../src/llm/openaiResponsesClient.js';
 import { ensureReviewSchema } from '../src/db/reviewSchema.js';
@@ -26,16 +29,90 @@ import { createIngestCursorStore } from '../src/auditReview/ingestCursorStore.js
 import { createAuditIngestService } from '../src/auditReview/ingestService.js';
 import { createCandidateDetector } from '../src/auditReview/candidateDetector.js';
 import { createLlmReviewer } from '../src/auditReview/llmReviewer.js';
+import { createToolSemanticMapper } from '../src/auditReview/toolSemanticMapper.js';
 import { createReviewNotifier } from '../src/auditReview/notification.js';
 import { createVisualization } from '../src/auditReview/visualization.js';
 import { createDashboardAuth } from '../src/auditReview/dashboardAuth.js';
 import { createAuditReviewScheduler } from '../src/auditReview/scheduler.js';
+import { createRetentionScheduler, createRetentionService } from '../src/auditReview/retention.js';
+import { listenHttpServer, resolveServerBindHost } from '../src/adapters/http/serverListen.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
+
+function installProcessFileLogging(paths) {
+  const writeTargets = {
+    log: paths.serverLogPath,
+    info: paths.serverLogPath,
+    warn: paths.serverErrLogPath,
+    error: paths.serverErrLogPath,
+  };
+  const originals = {
+    log: console.log.bind(console),
+    info: console.info.bind(console),
+    warn: console.warn.bind(console),
+    error: console.error.bind(console),
+  };
+
+  function append(filePath, args) {
+    const line = `${new Date().toISOString()} ${util.format(...args)}\n`;
+    try {
+      fs.appendFileSync(filePath, line, 'utf-8');
+    } catch (error) {
+      process.stderr.write(`[audit-logger-agent] failed to write ${filePath}: ${error.message}\n`);
+    }
+  }
+
+  console.log = (...args) => {
+    append(writeTargets.log, args);
+    originals.log(...args);
+  };
+  console.info = (...args) => {
+    append(writeTargets.info, args);
+    originals.info(...args);
+  };
+  console.warn = (...args) => {
+    append(writeTargets.warn, args);
+    originals.warn(...args);
+  };
+  console.error = (...args) => {
+    append(writeTargets.error, args);
+    originals.error(...args);
+  };
+}
+
 const config = loadAppConfig(rootDir);
-const dbPath = path.resolve(rootDir, config.dbPath);
-const db = openDb(dbPath);
+const paths = ensureRuntimeLayout(config);
+const migration = migrateLegacyRuntimeArtifacts(paths);
+installProcessFileLogging(paths);
+if (migration.moved.length > 0) {
+  console.log(`Migrated ${migration.moved.length} legacy runtime artifact(s) to normalized paths.`);
+  for (const item of migration.moved) {
+    console.log(`  ${path.relative(rootDir, item.from)} -> ${path.relative(rootDir, item.to)}`);
+  }
+}
+if (migration.skipped.length > 0) {
+  console.warn(`Skipped ${migration.skipped.length} legacy runtime artifact(s) during migration.`);
+  for (const item of migration.skipped) {
+    console.warn(`  ${path.relative(rootDir, item.from)} -> ${path.relative(rootDir, item.to)} (${item.error})`);
+  }
+}
+
+const runtimeConfig = {
+  ...config,
+  rootDir,
+  dbPath: paths.dbPath,
+  ingest: {
+    ...(config.ingest ?? {}),
+    http: { ...(config.ingest?.http ?? {}) },
+    spoolDir: paths.spoolDir,
+  },
+  capturesDir: paths.capturesDir,
+  tmpDir: paths.tmpDir,
+  logDir: paths.logDir,
+  paths,
+};
+const db = openDb(paths.dbPath);
 ensureRuntimeSchema(db);
 ensureReviewSchema(db);
 
@@ -46,11 +123,12 @@ const registry = createToolRegistry();
 registry.register(buildAuditQueryTool({ db }));
 registry.register(buildReportTool({ db }));
 
-const openAIConfig = loadOpenAIConfig({ env: process.env, appConfig: config });
+const openAIConfig = loadOpenAIConfig({ env: process.env, appConfig: runtimeConfig, projectRoot: rootDir });
 const llmClient = createOpenAIResponsesClient({
   apiKey: openAIConfig.apiKey,
   baseURL: openAIConfig.baseURL,
   timeoutMs: openAIConfig.timeoutMs,
+  maxConcurrency: openAIConfig.maxConcurrency,
 });
 
 const planner = createPlanner({
@@ -92,35 +170,55 @@ try {
 const reviewStore = createReviewStore(db);
 const lockStore = createLockStore(db);
 const cursorStore = createIngestCursorStore(db);
-const ingestService = createAuditIngestService({ db, config, cursorStore, now: () => new Date() });
-const detector = createCandidateDetector({ db, riskPolicy: config.auditReview?.riskPolicy ?? {} });
+const ingestService = createAuditIngestService({ db, config: runtimeConfig, cursorStore, now: () => new Date() });
+const detector = createCandidateDetector({ db, riskPolicy: runtimeConfig.auditReview?.riskPolicy ?? {} });
+const toolSemanticMapper = createToolSemanticMapper({
+  db,
+  llmClient,
+  model: openAIConfig.model,
+  taxonomy: runtimeConfig.auditReview?.toolMapping?.taxonomy,
+  mappingVersion: runtimeConfig.auditReview?.toolMapping?.version,
+});
 const llmReviewer = createLlmReviewer({
   llmClient,
   model: openAIConfig.model,
-  promptVersion: config.auditReview?.llmReview?.promptVersion,
-  reviewerVersion: config.auditReview?.llmReview?.reviewerVersion,
+  promptVersion: runtimeConfig.auditReview?.llmReview?.promptVersion,
+  reviewerVersion: runtimeConfig.auditReview?.llmReview?.reviewerVersion,
 });
-const reviewNotifier = createReviewNotifier({ outboxStore, config });
-const reviewVisualization = createVisualization({ reviewStore, config, llmClient, model: openAIConfig.model });
-const dashboardAuth = createDashboardAuth({ config, env: process.env });
+const reviewNotifier = createReviewNotifier({ outboxStore, config: runtimeConfig });
+const reviewVisualization = createVisualization({ reviewStore, config: runtimeConfig, llmClient, model: openAIConfig.model });
+const dashboardAuth = createDashboardAuth({ config: runtimeConfig, env: process.env });
 const scheduler = createAuditReviewScheduler({
   db,
-  config,
+  config: runtimeConfig,
   reviewStore,
   lockStore,
   ingestService,
   cursorStore,
   detector,
   llmReviewer,
+  toolSemanticMapper,
   notifier: reviewNotifier,
   visualization: reviewVisualization,
   auditLogger: reviewAuditLogger,
   llmModel: openAIConfig.model,
   now: () => new Date(),
 });
+const retentionService = createRetentionService({ db, config: runtimeConfig, cursorStore, now: () => new Date() });
+const retentionScheduler = createRetentionScheduler({
+  retentionService,
+  config: runtimeConfig,
+  onRun: (result) => {
+    console.log(`Retention cleanup completed: ${JSON.stringify(result.deleted)}`);
+  },
+  onError: (error) => {
+    console.error(`Retention cleanup failed: ${error.message}`);
+  },
+});
 
 // v1.4: validate dashboard auth boot config (throws if non-loopback without token).
-dashboardAuth.validateBoot({ bindHost: config.auditReview?.http?.bindHost ?? '127.0.0.1' });
+const bindHost = resolveServerBindHost(runtimeConfig);
+dashboardAuth.validateBoot({ bindHost });
 
 // v1.4: recover stale review runs on startup.
 try {
@@ -130,20 +228,26 @@ try {
 }
 
 // v1.4: start the periodic scheduler if enabled.
-if (config.auditReview?.enabled !== false) {
+if (runtimeConfig.auditReview?.enabled !== false) {
   scheduler.start();
   console.log('Audit review scheduler started.');
 }
 
+if (runtimeConfig.retention?.enabled !== false) {
+  retentionScheduler.start();
+  console.log(`Retention scheduler started for hour ${runtimeConfig.retention?.runAtHour ?? 4}.`);
+}
+
 const app = createHttpApp({
   db,
-  config: { ...config, dbPath },
+  config: runtimeConfig,
   runStore,
   runtime,
   scheduler,
   reviewStore,
   visualization: reviewVisualization,
   dashboardAuth,
+  toolSemanticMapper,
 });
 const portIndex = process.argv.indexOf('--port');
 const portArg = portIndex >= 0 ? Number(process.argv[portIndex + 1]) : 9320;
@@ -157,12 +261,17 @@ const flushInterval = setInterval(async () => {
   }
 }, 1000);
 
-app.listen(port, '127.0.0.1', () => {
-  console.log(`Agent API on http://127.0.0.1:${port}`);
+listenHttpServer(app, {
+  port,
+  bindHost,
+  onListening: (url) => {
+    console.log(`Agent API on ${url}`);
+  },
 });
 
 process.on('SIGINT', () => {
   scheduler.stop();
+  retentionScheduler.stop();
   clearInterval(flushInterval);
   db.close();
   process.exit(0);
