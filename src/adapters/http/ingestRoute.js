@@ -139,7 +139,7 @@ function appendAcceptedEvents(config, events) {
   }
 }
 
-export async function handleIngestRoute(req, res, { config = {}, db, toolSemanticMapper } = {}) {
+export async function handleIngestRoute(req, res, { config = {}, db, toolSemanticMapper, onAcceptedBatch } = {}) {
   const type = contentType(req);
   const limitBytes = maxBodyBytes(config);
   const lineLimitBytes = maxLineBytes(config);
@@ -195,6 +195,11 @@ export async function handleIngestRoute(req, res, { config = {}, db, toolSemanti
           .mapPendingEvents({ limit: Math.max(accepted.length, 1) })
           .catch(() => {});
       }
+    }
+    if (typeof onAcceptedBatch === 'function') {
+      Promise.resolve()
+        .then(() => onAcceptedBatch({ accepted: accepted.length }))
+        .catch(() => {});
     }
   }
 

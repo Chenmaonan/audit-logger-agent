@@ -260,6 +260,12 @@ export function createAuditReviewScheduler({
   auditLogger,
   llmModel: llmModelOpt,
   now = () => new Date(),
+  timerApi = {
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
+    setInterval: globalThis.setInterval,
+    clearInterval: globalThis.clearInterval,
+  },
 } = {}) {
   if (!db) throw new Error('createAuditReviewScheduler: db is required');
   if (!config) throw new Error('createAuditReviewScheduler: config is required');
@@ -289,14 +295,48 @@ export function createAuditReviewScheduler({
   const llmModel = llmModelOpt ?? config.planner?.model ?? config.auditReview?.llmReview?.model ?? null;
   const llmBudget = llmBudgetFromConfig(config);
 
-  let intervalTimer = null;
+  let scheduledTimer = null;
   let refreshTimer = null;
+  let started = false;
+  let reviewChain = Promise.resolve();
 
   function clearRefreshTimer() {
     if (refreshTimer) {
-      clearInterval(refreshTimer);
+      timerApi.clearInterval(refreshTimer);
       refreshTimer = null;
     }
+  }
+
+  function clearScheduledTimer() {
+    if (scheduledTimer) {
+      timerApi.clearTimeout(scheduledTimer);
+      scheduledTimer = null;
+    }
+  }
+
+  function scheduleNextScheduledRun(delayMs = intervalMinutes * 60000) {
+    clearScheduledTimer();
+    if (!started) return;
+    scheduledTimer = timerApi.setTimeout(() => {
+      scheduledTimer = null;
+      enqueueReview('scheduled', { rescheduleAfterReview: true }).catch(() => {});
+    }, delayMs);
+  }
+
+  function enqueueReview(triggerType, { rescheduleAfterReview = false } = {}) {
+    reviewChain = reviewChain
+      .catch(() => {})
+      .then(async () => {
+        if (rescheduleAfterReview) clearScheduledTimer();
+        try {
+          return await runOnce({ triggerType });
+        } finally {
+          if (rescheduleAfterReview && started) {
+            scheduleNextScheduledRun();
+          }
+        }
+      });
+    return reviewChain;
   }
 
   async function logAudit(event, status, summary, toolName) {
@@ -416,7 +456,7 @@ export function createAuditReviewScheduler({
     );
 
     // 4. Lease refresh timer.
-    refreshTimer = setInterval(() => {
+    refreshTimer = timerApi.setInterval(() => {
       try {
         lockStore.refresh({ lockName: LOCK_NAME, ownerId, leaseMinutes: LEASE_MINUTES });
       } catch {
@@ -738,32 +778,27 @@ export function createAuditReviewScheduler({
   }
 
   function start() {
-    if (intervalTimer) return;
+    if (started) return;
+    started = true;
     const delayMs = initialDelaySeconds * 1000;
-    intervalTimer = setInterval(() => {
-      runOnce({ triggerType: 'scheduled' }).catch((err) => {
-        // Prevent unhandled rejection; the cycle already logs internally.
-        void err;
-      });
-    }, intervalMinutes * 60000);
-    // Schedule an initial run after the delay.
-    setTimeout(() => {
-      runOnce({ triggerType: 'scheduled' }).catch(() => {});
-    }, delayMs);
+    scheduleNextScheduledRun(delayMs);
+  }
+
+  function runAfterIngest() {
+    return enqueueReview('ingest', { rescheduleAfterReview: true });
   }
 
   function stop() {
+    started = false;
     clearRefreshTimer();
-    if (intervalTimer) {
-      clearInterval(intervalTimer);
-      intervalTimer = null;
-    }
+    clearScheduledTimer();
   }
 
   return {
     start,
     stop,
     runOnce,
+    runAfterIngest,
     recoverStaleRuns,
   };
 }

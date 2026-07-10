@@ -45,6 +45,15 @@ function makeUpstreamEvent(overrides = {}) {
   };
 }
 
+async function waitFor(predicate, { timeoutMs = 1000, intervalMs = 10 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return predicate();
+}
+
 test('audit review HTTP integration smoke test', async () => {
   // ------------------------------------------------------------------
   // 1. Build a real DB with runtime + review schema and seed audit_events
@@ -778,14 +787,15 @@ test('audit review ingests all events and sends mapped tool semantics to detecto
     assert.ok(spooled.includes('"event":"tool_end"'));
     assert.ok(spooled.includes(unknownTraceId));
 
-    const runResponse = await fetch(`${baseUrl}/v1/audit-reviews/run`, {
-      method: 'POST',
-      headers: { Authorization: 'Bearer test-token-123' },
-    });
-    assert.equal(runResponse.status, 202);
+    const sawCombinedAutoReview = await waitFor(() =>
+      capturedPayloads.some((payload) =>
+        payload.candidates.some((candidate) => candidate.trace_id === aliasTraceId) &&
+        payload.candidates.some((candidate) => candidate.trace_id === unknownTraceId)));
+    assert.equal(sawCombinedAutoReview, true);
 
-    assert.equal(capturedPayloads.length, 1);
-    const [payload] = capturedPayloads;
+    const payload = capturedPayloads.find((candidatePayload) =>
+      candidatePayload.candidates.some((candidate) => candidate.trace_id === aliasTraceId) &&
+      candidatePayload.candidates.some((candidate) => candidate.trace_id === unknownTraceId));
     assert.equal(payload.candidates.length, 2);
     assert.equal(payload.candidates[0].trace_id, aliasTraceId);
     assert.equal(payload.candidates[0].tool_name, 'db.delete');
@@ -793,6 +803,75 @@ test('audit review ingests all events and sends mapped tool semantics to detecto
     assert.equal(payload.candidates[0].mapped_tool_type, 'delete');
     assert.ok(payload.candidates.some((candidate) => candidate.trace_id === unknownTraceId));
     assert.ok(payload.candidates.every((candidate) => candidate.mapped_tool_type === 'delete'));
+  } finally {
+    app.close();
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('POST /v1/ingest triggers an audit review only when a batch is accepted', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-review-ingest-trigger-'));
+  const dbPath = path.join(tmpDir, 'test.db');
+  const db = openDb(dbPath);
+  ensureRuntimeSchema(db);
+  ensureReviewSchema(db);
+
+  const triggerCalls = [];
+  const app = createHttpApp({
+    db,
+    config: {
+      dbPath,
+      ingest: {
+        http: {
+          enabled: true,
+          maxBodyBytes: 1024 * 1024,
+          maxLineBytes: 64 * 1024,
+        },
+        spoolDir: path.join(tmpDir, 'incoming'),
+      },
+    },
+    scheduler: {
+      runAfterIngest() {
+        triggerCalls.push(Date.now());
+        return Promise.resolve({ status: 'completed' });
+      },
+    },
+  });
+
+  await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
+  const { port } = app.address();
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    const acceptedResponse = await fetch(`${baseUrl}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(makeUpstreamEvent({
+        ts: '2026-07-10T08:15:38.000Z',
+        trace_id: 'trace-trigger-review',
+      })),
+    });
+    assert.equal(acceptedResponse.status, 202);
+    assert.deepEqual(await acceptedResponse.json(), { accepted: 1, rejected: 0, errors: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(triggerCalls.length, 1);
+
+    const rejectedResponse = await fetch(`${baseUrl}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        ts: '2026-07-10T08:15:39.000Z',
+        agent_id: 'agent-test',
+        trace_id: 'trace-rejected',
+      }),
+    });
+    assert.equal(rejectedResponse.status, 202);
+    const rejectedBody = await rejectedResponse.json();
+    assert.equal(rejectedBody.accepted, 0);
+    assert.equal(rejectedBody.rejected, 1);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(triggerCalls.length, 1);
   } finally {
     app.close();
     db.close();

@@ -360,6 +360,57 @@ test('scheduler.runOnce happy path: creates completed run, persists findings, re
   db.close();
 });
 
+test('scheduler.runAfterIngest runs an immediate review and resets the scheduled timer', async () => {
+  const db = makeDb();
+  insertEvent(db, 1, {
+    ts: '2026-07-03T10:29:00.000Z',
+    tool_name: 'some.query',
+    status: 'INTERNAL',
+    event: 'tool.end',
+  });
+
+  const deps = buildRealDeps(db);
+  let timerId = 0;
+  const timeoutCalls = [];
+  const clearedTimeouts = [];
+  const timerApi = {
+    setTimeout(callback, delayMs) {
+      const handle = { id: ++timerId, callback, delayMs };
+      timeoutCalls.push(handle);
+      return handle;
+    },
+    clearTimeout(handle) {
+      if (handle) clearedTimeouts.push(handle);
+    },
+    setInterval() {
+      return { id: ++timerId, interval: true };
+    },
+    clearInterval() {},
+  };
+  const scheduler = createAuditReviewScheduler({
+    db,
+    ...deps,
+    now: () => new Date('2026-07-03T10:30:00.000Z'),
+    timerApi,
+  });
+
+  scheduler.start();
+  assert.equal(timeoutCalls.length, 1);
+  assert.equal(timeoutCalls[0].delayMs, 30_000);
+
+  const result = await scheduler.runAfterIngest();
+
+  assert.equal(result.status, 'completed');
+  const runs = deps.reviewStore.listRuns({ limit: 10 });
+  assert.equal(runs[0].trigger_type, 'ingest');
+  assert.equal(timeoutCalls.length, 2);
+  assert.equal(timeoutCalls[1].delayMs, 30 * 60 * 1000);
+  assert.equal(clearedTimeouts[0], timeoutCalls[0]);
+
+  scheduler.stop();
+  db.close();
+});
+
 test('scheduler.runOnce with LLM failing: status completed_degraded, still inserts rule-based findings, lock released', async () => {
   const db = makeDb();
   insertEvent(db, 1, {

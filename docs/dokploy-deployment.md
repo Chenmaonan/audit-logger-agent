@@ -11,6 +11,8 @@
 
 容器固定读取 `/app/config.container.json`，并监听 `0.0.0.0:9320`。这些值已在 Compose 环境变量中配置，通常不需要在 Dokploy 覆盖。
 
+审查调度会在每个 `/v1/ingest` 成功接收至少一条事件后立即触发一次；该次审查完成后，下一次定时审查会重新按 `auditReview.intervalMinutes`（默认 30 分钟）计时。
+
 ## 2. 配置环境变量和 Secret
 
 在 Dokploy 的 Environment/Secret 中设置以下变量，不要把真实值提交到仓库：
@@ -19,7 +21,7 @@
 | --- | --- | --- |
 | `AUDIT_AGENT_LLM_API_KEY` | 是 | OpenAI-compatible LLM 的 API Key |
 | `AUDIT_AGENT_LLM_MODEL` | 是 | 审查与语义映射使用的模型名 |
-| `AUDIT_AGENT_LLM_BASE_URL` | 否 | LLM API 地址；未设置时 Compose 使用 `https://api.openai.com/v1` |
+| `AUDIT_AGENT_LLM_BASE_URL` | 是 | OpenAI-compatible LLM API 地址，例如 `https://api.openai.com/v1` 或实际模型服务地址 |
 | `AUDIT_AGENT_LLM_TIMEOUT_MS` | 否 | LLM 请求超时毫秒数；未设置时为 `30000` |
 | `AUDIT_AGENT_DASHBOARD_TOKEN` | 是 | Dashboard 登录和 `/v1/audit-*` Bearer 鉴权的共享密钥 |
 

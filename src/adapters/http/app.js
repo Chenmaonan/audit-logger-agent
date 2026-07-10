@@ -461,7 +461,14 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
       }
 
       if (req.method === 'POST' && url.pathname === '/v1/ingest' && isHttpIngestEnabled(config)) {
-        await handleIngestRoute(req, res, { config, db, toolSemanticMapper });
+        await handleIngestRoute(req, res, {
+          config,
+          db,
+          toolSemanticMapper,
+          onAcceptedBatch: typeof scheduler?.runAfterIngest === 'function'
+            ? () => scheduler.runAfterIngest()
+            : undefined,
+        });
         return;
       }
 
