@@ -4,7 +4,9 @@ import path from 'path';
 import { normalizeAppConfig } from './paths.js';
 
 export function loadAppConfig(rootDir, { env = process.env } = {}) {
-  const configuredPath = env.AUDIT_AGENT_CONFIG_PATH;
+  const configuredPath = typeof env.AUDIT_AGENT_CONFIG_PATH === 'string'
+    ? env.AUDIT_AGENT_CONFIG_PATH.trim()
+    : '';
   const configPath = configuredPath && configuredPath.trim() !== ''
     ? (path.isAbsolute(configuredPath) ? configuredPath : path.resolve(rootDir, configuredPath))
     : path.join(rootDir, 'config.json');

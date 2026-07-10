@@ -10,10 +10,13 @@ import { getRuntimePaths, migrateLegacyRuntimeArtifacts } from '../../src/app/pa
 
 test('server entrypoint resolves configured auditReview.http.bindHost', () => {
   assert.equal(
-    resolveServerBindHost({ auditReview: { http: { bindHost: '0.0.0.0' } } }),
+    resolveServerBindHost(
+      { auditReview: { http: { bindHost: '0.0.0.0' } } },
+      { args: [], env: {} },
+    ),
     '0.0.0.0',
   );
-  assert.equal(resolveServerBindHost({ auditReview: { http: {} } }), '127.0.0.1');
+  assert.equal(resolveServerBindHost({ auditReview: { http: {} } }, { args: [], env: {} }), '127.0.0.1');
 });
 
 test('server entrypoint prioritizes --bind, environment, config, then loopback', () => {
@@ -41,7 +44,7 @@ test('loadAppConfig resolves AUDIT_AGENT_CONFIG_PATH from the project root', () 
     fs.writeFileSync(path.join(tmpDir, 'config.json'), JSON.stringify({ marker: 'default' }), 'utf-8');
     fs.writeFileSync(path.join(tmpDir, 'deploy', 'config.json'), JSON.stringify({ marker: 'custom' }), 'utf-8');
 
-    const config = loadAppConfig(tmpDir, { env: { AUDIT_AGENT_CONFIG_PATH: 'deploy/config.json' } });
+    const config = loadAppConfig(tmpDir, { env: { AUDIT_AGENT_CONFIG_PATH: '  deploy/config.json  ' } });
 
     assert.equal(config.marker, 'custom');
     assert.equal(config.rootDir, tmpDir);
@@ -92,6 +95,65 @@ test('graceful shutdown continues when error reporting itself fails', async () =
   await shutdown('SIGTERM');
 
   assert.deepEqual(calls, ['exit:0']);
+});
+
+test('graceful shutdown continues after flush, HTTP close, and SQLite close failures', async () => {
+  const calls = [];
+  const errors = [];
+  const shutdown = serverEntrypoint.createGracefulShutdown({
+    eventPublisher: { flushPending: async () => { throw new Error('flush failed'); } },
+    server: { close: (done) => done(new Error('close failed')) },
+    db: { close: () => { throw new Error('db failed'); } },
+    logError: (message) => errors.push(message),
+    exit: (code) => calls.push(`exit:${code}`),
+  });
+
+  await shutdown('SIGTERM');
+
+  assert.deepEqual(calls, ['exit:0']);
+  assert.deepEqual(errors, [
+    'Graceful shutdown event publisher flush failed: flush failed',
+    'Graceful shutdown HTTP server close failed: close failed',
+    'Graceful shutdown SQLite close failed: db failed',
+  ]);
+});
+
+test('graceful shutdown times out hung flush and HTTP close before closing SQLite', async () => {
+  const calls = [];
+  const errors = [];
+  const immediateTimeout = (callback) => {
+    callback();
+    return 'timeout';
+  };
+  const shutdown = serverEntrypoint.createGracefulShutdown({
+    eventPublisher: { flushPending: () => { calls.push('flush'); return new Promise(() => {}); } },
+    server: { close: () => { calls.push('server.close'); } },
+    db: { close: () => calls.push('db.close') },
+    setTimeoutFn: immediateTimeout,
+    clearTimeoutFn: (timer) => calls.push(`clearTimeout:${timer}`),
+    shutdownTimeoutMs: 1,
+    logError: (message) => errors.push(message),
+    exit: (code) => calls.push(`exit:${code}`),
+  });
+
+  const result = await Promise.race([
+    shutdown('SIGTERM').then(() => 'completed'),
+    new Promise((resolve) => setTimeout(() => resolve('timed out'), 50)),
+  ]);
+
+  assert.equal(result, 'completed');
+  assert.deepEqual(calls, [
+    'flush',
+    'clearTimeout:timeout',
+    'server.close',
+    'clearTimeout:timeout',
+    'db.close',
+    'exit:0',
+  ]);
+  assert.deepEqual(errors, [
+    'Graceful shutdown event publisher flush timed out after 1ms',
+    'Graceful shutdown HTTP server close timed out after 1ms',
+  ]);
 });
 
 test('server script retains the HTTP server and registers both shutdown signals', () => {
