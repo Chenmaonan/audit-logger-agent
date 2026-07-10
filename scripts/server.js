@@ -35,7 +35,7 @@ import { createVisualization } from '../src/auditReview/visualization.js';
 import { createDashboardAuth } from '../src/auditReview/dashboardAuth.js';
 import { createAuditReviewScheduler } from '../src/auditReview/scheduler.js';
 import { createRetentionScheduler, createRetentionService } from '../src/auditReview/retention.js';
-import { listenHttpServer, resolveServerBindHost } from '../src/adapters/http/serverListen.js';
+import { createGracefulShutdown, listenHttpServer, resolveServerBindHost } from '../src/adapters/http/serverListen.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -261,7 +261,7 @@ const flushInterval = setInterval(async () => {
   }
 }, 1000);
 
-listenHttpServer(app, {
+const server = listenHttpServer(app, {
   port,
   bindHost,
   onListening: (url) => {
@@ -269,10 +269,18 @@ listenHttpServer(app, {
   },
 });
 
-process.on('SIGINT', () => {
-  scheduler.stop();
-  retentionScheduler.stop();
-  clearInterval(flushInterval);
-  db.close();
-  process.exit(0);
+const shutdown = createGracefulShutdown({
+  scheduler,
+  retentionScheduler,
+  flushInterval,
+  eventPublisher,
+  server,
+  db,
+  logError: (message) => console.error(message),
 });
+const handleShutdown = (signal) => {
+  void shutdown(signal);
+};
+
+process.on('SIGINT', handleShutdown);
+process.on('SIGTERM', handleShutdown);

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import * as serverEntrypoint from '../../src/adapters/http/serverListen.js';
 import { resolveServerBindHost, listenHttpServer } from '../../src/adapters/http/serverListen.js';
 import { loadAppConfig } from '../../src/app/loadConfig.js';
 import { getRuntimePaths, migrateLegacyRuntimeArtifacts } from '../../src/app/paths.js';
@@ -13,6 +14,93 @@ test('server entrypoint resolves configured auditReview.http.bindHost', () => {
     '0.0.0.0',
   );
   assert.equal(resolveServerBindHost({ auditReview: { http: {} } }), '127.0.0.1');
+});
+
+test('server entrypoint prioritizes --bind, environment, config, then loopback', () => {
+  const config = { auditReview: { http: { bindHost: '127.0.0.8' } } };
+
+  assert.equal(
+    resolveServerBindHost(config, {
+      args: ['node', 'scripts/server.js', '--bind', '0.0.0.0'],
+      env: { AUDIT_AGENT_BIND_HOST: '127.0.0.7' },
+    }),
+    '0.0.0.0',
+  );
+  assert.equal(
+    resolveServerBindHost(config, { args: [], env: { AUDIT_AGENT_BIND_HOST: '127.0.0.7' } }),
+    '127.0.0.7',
+  );
+  assert.equal(resolveServerBindHost(config, { args: [], env: {} }), '127.0.0.8');
+  assert.equal(resolveServerBindHost({}, { args: [], env: {} }), '127.0.0.1');
+});
+
+test('loadAppConfig resolves AUDIT_AGENT_CONFIG_PATH from the project root', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-config-env-'));
+  try {
+    fs.mkdirSync(path.join(tmpDir, 'deploy'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'config.json'), JSON.stringify({ marker: 'default' }), 'utf-8');
+    fs.writeFileSync(path.join(tmpDir, 'deploy', 'config.json'), JSON.stringify({ marker: 'custom' }), 'utf-8');
+
+    const config = loadAppConfig(tmpDir, { env: { AUDIT_AGENT_CONFIG_PATH: 'deploy/config.json' } });
+
+    assert.equal(config.marker, 'custom');
+    assert.equal(config.rootDir, tmpDir);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('graceful shutdown releases resources once and exits despite cleanup errors', async () => {
+  assert.equal(typeof serverEntrypoint.createGracefulShutdown, 'function');
+
+  const calls = [];
+  const errors = [];
+  const shutdown = serverEntrypoint.createGracefulShutdown({
+    scheduler: { stop: () => calls.push('scheduler.stop') },
+    retentionScheduler: { stop: () => { calls.push('retention.stop'); throw new Error('retention failed'); } },
+    flushInterval: 'timer',
+    clearIntervalFn: (timer) => calls.push(`clear:${timer}`),
+    eventPublisher: { flushPending: async (limit) => calls.push(`flush:${limit}`) },
+    server: { close: (done) => { calls.push('server.close'); done(); } },
+    db: { close: () => calls.push('db.close') },
+    logError: (message) => errors.push(message),
+    exit: (code) => calls.push(`exit:${code}`),
+  });
+
+  await Promise.all([shutdown('SIGTERM'), shutdown('SIGINT')]);
+
+  assert.deepEqual(calls, [
+    'scheduler.stop',
+    'retention.stop',
+    'clear:timer',
+    'flush:20',
+    'server.close',
+    'db.close',
+    'exit:0',
+  ]);
+  assert.equal(errors.length, 1);
+});
+
+test('graceful shutdown continues when error reporting itself fails', async () => {
+  const calls = [];
+  const shutdown = serverEntrypoint.createGracefulShutdown({
+    scheduler: { stop: () => { throw new Error('scheduler failed'); } },
+    logError: () => { throw new Error('logger failed'); },
+    exit: (code) => calls.push(`exit:${code}`),
+  });
+
+  await shutdown('SIGTERM');
+
+  assert.deepEqual(calls, ['exit:0']);
+});
+
+test('server script retains the HTTP server and registers both shutdown signals', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'scripts', 'server.js'), 'utf-8');
+
+  assert.match(source, /const server = listenHttpServer\(app,/);
+  assert.match(source, /createGracefulShutdown\(\{/);
+  assert.match(source, /process\.on\('SIGINT', handleShutdown\)/);
+  assert.match(source, /process\.on\('SIGTERM', handleShutdown\)/);
 });
 
 test('server entrypoint starts app on the resolved bind host', async () => {
