@@ -226,7 +226,7 @@ const retentionScheduler = createRetentionScheduler({
 
 // v1.4: validate dashboard auth boot config (throws if non-loopback without token).
 const bindHost = resolveServerBindHost(runtimeConfig);
-dashboardAuth.validateBoot({ bindHost });
+dashboardAuth.validateBoot({ bindHost, allowDashboardSessions: !!dashboardAccessStore });
 
 // v1.4: recover stale review runs on startup.
 try {

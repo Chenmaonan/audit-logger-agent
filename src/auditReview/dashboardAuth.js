@@ -49,12 +49,13 @@ export function createDashboardAuth({ config, env }) {
     return true;
   }
 
-  function validateBoot({ bindHost }) {
+  function validateBoot({ bindHost, allowDashboardSessions = false } = {}) {
+    if (allowDashboardSessions) return;
     if (shouldRequireToken({ bindHost })) {
       const t = token();
       if (!t) {
         throw new Error(
-          'AUDIT_AGENT_DASHBOARD_TOKEN must be configured when binding to a non-loopback address'
+          'AUDIT_AGENT_DASHBOARD_TOKEN must be configured when binding to a non-loopback address without dashboard session auth'
         );
       }
     }
