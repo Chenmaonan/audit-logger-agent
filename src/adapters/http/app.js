@@ -281,15 +281,28 @@ function safeAttachmentFilename(snapshot) {
   });
 }
 
-function dashboardSessionCookie(sessionId) {
-  return [
+function requestUsesHttps(req) {
+  const forwardedProto = req?.headers?.['x-forwarded-proto'];
+  if (typeof forwardedProto === 'string') {
+    return forwardedProto.split(',')[0].trim().toLowerCase() === 'https';
+  }
+  const forwarded = req?.headers?.forwarded;
+  if (typeof forwarded === 'string' && /\bproto=https\b/i.test(forwarded)) {
+    return true;
+  }
+  return req?.socket?.encrypted === true;
+}
+
+function dashboardSessionCookie(sessionId, req) {
+  const parts = [
     `dashboard_session=${sessionId}`,
     'HttpOnly',
-    'Secure',
     'SameSite=Lax',
     'Path=/',
     'Max-Age=86400',
-  ].join('; ');
+  ];
+  if (requestUsesHttps(req)) parts.splice(2, 0, 'Secure');
+  return parts.join('; ');
 }
 
 function issueAutomaticDashboardSession({
@@ -495,7 +508,7 @@ export function createHttpApp({
           expiresAt: new Date(now().getTime() + 24 * 60 * 60 * 1000).toISOString(),
         });
         redirect(res, 302, '/dashboard/agents', {
-          'set-cookie': dashboardSessionCookie(sessionId),
+          'set-cookie': dashboardSessionCookie(sessionId, req),
         });
         return;
       }
@@ -516,7 +529,7 @@ export function createHttpApp({
           });
           if (sessionId) {
             redirect(res, 302, '/dashboard/agents', {
-              'set-cookie': dashboardSessionCookie(sessionId),
+              'set-cookie': dashboardSessionCookie(sessionId, req),
             });
             return;
           }
@@ -554,7 +567,7 @@ export function createHttpApp({
           });
           if (sessionId) {
             redirect(res, 302, '/dashboard/agents', {
-              'set-cookie': dashboardSessionCookie(sessionId),
+              'set-cookie': dashboardSessionCookie(sessionId, req),
             });
             return;
           }

@@ -41,7 +41,7 @@
     },
     "http": {
       "bindHost": "0.0.0.0",
-      "requireDashboardToken": true,
+      "requireDashboardToken": false,
       "allowedOrigins": ["*"]
     },
     "riskPolicy": {

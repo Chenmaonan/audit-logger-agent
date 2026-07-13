@@ -9,7 +9,7 @@ services:
       AUDIT_LOGGER_ROOT: /app
       AUDIT_AGENT_LLM_API_KEY: ${AUDIT_AGENT_LLM_API_KEY:?AUDIT_AGENT_LLM_API_KEY is required}
       AUDIT_AGENT_LLM_MODEL: ${AUDIT_AGENT_LLM_MODEL:?AUDIT_AGENT_LLM_MODEL is required}
-      AUDIT_AGENT_LLM_BASE_URL: ${AUDIT_AGENT_LLM_BASE_URL:-https://api.openai.com/v1}
+      AUDIT_AGENT_LLM_BASE_URL: ${AUDIT_AGENT_LLM_BASE_URL}
       AUDIT_AGENT_LLM_TIMEOUT_MS: ${AUDIT_AGENT_LLM_TIMEOUT_MS:-30000}
     volumes:
       - ./config.container.json:/app/config.json:ro

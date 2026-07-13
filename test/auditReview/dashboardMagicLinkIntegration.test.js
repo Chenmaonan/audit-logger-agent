@@ -223,7 +223,7 @@ test('magic link creates a scoped dashboard session and snapshot routes enforce 
     const setCookie = openResponse.headers.get('set-cookie');
     assert.match(setCookie, /^dashboard_session=[^;]+;/);
     assert.match(setCookie, /HttpOnly/i);
-    assert.match(setCookie, /Secure/i);
+    assert.equal(/Secure/i.test(setCookie), false);
     assert.match(setCookie, /SameSite=Lax/i);
     assert.match(setCookie, /Path=\//i);
     assert.match(setCookie, /Max-Age=86400/i);
@@ -385,7 +385,7 @@ test('dashboard automatically issues a 24h read-only session for new visitors', 
     const setCookie = openResponse.headers.get('set-cookie');
     assert.match(setCookie, /^dashboard_session=[^;]+;/);
     assert.match(setCookie, /HttpOnly/i);
-    assert.match(setCookie, /Secure/i);
+    assert.equal(/Secure/i.test(setCookie), false);
     assert.match(setCookie, /SameSite=Lax/i);
     assert.match(setCookie, /Max-Age=86400/i);
 
@@ -464,5 +464,21 @@ test('automatic dashboard sessions honor configured public agent allowlist', asy
         },
       },
     },
+  });
+});
+
+test('dashboard session cookies are secure when forwarded protocol is https', async () => {
+  await withDashboardServer(async ({ baseUrl }) => {
+    const openResponse = await fetch(`${baseUrl}/dashboard`, {
+      redirect: 'manual',
+      headers: { 'x-forwarded-proto': 'https' },
+    });
+    assert.equal(openResponse.status, 302);
+    const setCookie = openResponse.headers.get('set-cookie');
+    assert.match(setCookie, /^dashboard_session=[^;]+;/);
+    assert.match(setCookie, /HttpOnly/i);
+    assert.match(setCookie, /Secure/i);
+    assert.match(setCookie, /SameSite=Lax/i);
+    assert.match(setCookie, /Max-Age=86400/i);
   });
 });
