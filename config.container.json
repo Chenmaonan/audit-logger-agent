@@ -1,0 +1,105 @@
+{
+  "dbPath": "data/db/audit.db",
+  "agents": {},
+  "ingest": {
+    "http": {
+      "enabled": true,
+      "maxBodyBytes": 1048576,
+      "maxLineBytes": 65536
+    },
+    "spoolDir": "data/spool/incoming"
+  },
+  "capturesDir": "data/captures",
+  "tmpDir": "data/tmp",
+  "logDir": "logs",
+  "limits": {
+    "maxLineBytes": 65536,
+    "maxChunkBytes": 16777216,
+    "maxQueryLimit": 1000,
+    "maxBodyBytes": 1048576
+  },
+  "report": {
+    "timezoneOffsetMinutes": 480
+  },
+  "retention": {
+    "enabled": true,
+    "runAtHour": 4,
+    "eventsDays": 90,
+    "vacuum": "incremental"
+  },
+  "auditReview": {
+    "enabled": true,
+    "intervalMinutes": 30,
+    "initialDelaySeconds": 30,
+    "lookbackOverlapMinutes": 5,
+    "maxEventsPerReview": 500,
+    "notification": {
+      "mode": "callback",
+      "callbackUrl": "http://127.0.0.1:9999/audit-review-events",
+      "minSeverity": "medium",
+      "sendEmptyReview": false
+    },
+    "http": {
+      "bindHost": "0.0.0.0",
+      "requireDashboardToken": true,
+      "allowedOrigins": ["*"]
+    },
+    "riskPolicy": {
+      "version": "risk-policy-v1",
+      "repeatWindowMinutes": 10,
+      "repeatThreshold": 5,
+      "slowCallDurationMs": 30000,
+      "highRiskToolPatterns": [
+        "*delete*",
+        "*write*",
+        "*update*",
+        "*deploy*",
+        "*permission*",
+        "*credential*",
+        "shell.*",
+        "browser.runScript"
+      ],
+      "agentToolAllowlists": {
+        "rental-price-agent": [],
+        "mt-agent": []
+      }
+    },
+    "toolMapping": {
+      "version": "tool-semantic-mapping-v1",
+      "taxonomy": [
+        "read",
+        "write",
+        "update",
+        "delete",
+        "deploy",
+        "permission",
+        "credential",
+        "shell",
+        "browser",
+        "network",
+        "database",
+        "file",
+        "notification",
+        "llm",
+        "unknown"
+      ]
+    },
+    "llmReview": {
+      "promptVersion": "audit-review-prompt-v1",
+      "reviewerVersion": "audit-reviewer-v1"
+    },
+    "llmBudget": {
+      "maxCallsPerDay": 500,
+      "maxTokensPerDay": 2000000,
+      "maxConcurrency": 2,
+      "cacheDetailAnalysis": true
+    },
+    "visualization": {
+      "enabled": true,
+      "baseUrl": "http://audit:9320",
+      "dashboardPath": "/dashboard",
+      "template": "audit-review-dashboard-v1",
+      "attachDashboardUrlToFeishu": true
+    }
+  }
+}

@@ -1,0 +1,30 @@
+services:
+  audit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      AUDIT_LOGGER_ROOT: /app
+      AUDIT_AGENT_LLM_API_KEY: ${AUDIT_AGENT_LLM_API_KEY:?AUDIT_AGENT_LLM_API_KEY is required}
+      AUDIT_AGENT_LLM_MODEL: ${AUDIT_AGENT_LLM_MODEL:?AUDIT_AGENT_LLM_MODEL is required}
+      AUDIT_AGENT_LLM_BASE_URL: ${AUDIT_AGENT_LLM_BASE_URL:-https://api.openai.com/v1}
+      AUDIT_AGENT_LLM_TIMEOUT_MS: ${AUDIT_AGENT_LLM_TIMEOUT_MS:-30000}
+      AUDIT_AGENT_DASHBOARD_TOKEN: ${AUDIT_AGENT_DASHBOARD_TOKEN:?AUDIT_AGENT_DASHBOARD_TOKEN is required}
+    volumes:
+      - ./config.container.json:/app/config.json:ro
+      - audit-data:/app/data
+      - audit-logs:/app/logs
+    expose:
+      - "9320"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://127.0.0.1:9320/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  audit-data:
+  audit-logs:
