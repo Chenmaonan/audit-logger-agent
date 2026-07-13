@@ -1,20 +1,22 @@
+name: audit-logger-agent
+
 services:
-  audit:
+  audit-logger-agent:
     build:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    init: true
     environment:
       NODE_ENV: production
-      AUDIT_LOGGER_ROOT: /app
+      AUDIT_AGENT_CONFIG_PATH: /app/config.container.json
+      AUDIT_AGENT_BIND_HOST: 0.0.0.0
       AUDIT_AGENT_LLM_API_KEY: ${AUDIT_AGENT_LLM_API_KEY:?AUDIT_AGENT_LLM_API_KEY is required}
       AUDIT_AGENT_LLM_MODEL: ${AUDIT_AGENT_LLM_MODEL:?AUDIT_AGENT_LLM_MODEL is required}
       AUDIT_AGENT_LLM_BASE_URL: ${AUDIT_AGENT_LLM_BASE_URL}
       AUDIT_AGENT_LLM_TIMEOUT_MS: ${AUDIT_AGENT_LLM_TIMEOUT_MS:-30000}
     volumes:
-      - ./config.container.json:/app/config.json:ro
       - audit-data:/app/data
-      - audit-logs:/app/logs
     expose:
       - "9320"
     healthcheck:
@@ -26,4 +28,3 @@ services:
 
 volumes:
   audit-data:
-  audit-logs:

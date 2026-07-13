@@ -15,6 +15,24 @@ test('server entrypoint resolves configured auditReview.http.bindHost', () => {
   assert.equal(resolveServerBindHost({ auditReview: { http: {} } }), '127.0.0.1');
 });
 
+test('server entrypoint prioritizes --bind, environment, config, then loopback', () => {
+  const config = { auditReview: { http: { bindHost: '127.0.0.8' } } };
+
+  assert.equal(
+    resolveServerBindHost(config, {
+      args: ['node', 'scripts/server.js', '--bind', '0.0.0.0'],
+      env: { AUDIT_AGENT_BIND_HOST: '127.0.0.7' },
+    }),
+    '0.0.0.0',
+  );
+  assert.equal(
+    resolveServerBindHost(config, { args: [], env: { AUDIT_AGENT_BIND_HOST: '127.0.0.7' } }),
+    '127.0.0.7',
+  );
+  assert.equal(resolveServerBindHost(config, { args: [], env: {} }), '127.0.0.8');
+  assert.equal(resolveServerBindHost({}, { args: [], env: {} }), '127.0.0.1');
+});
+
 test('server entrypoint starts app on the resolved bind host', async () => {
   const listenCalls = [];
   const app = {
@@ -56,6 +74,22 @@ test('loadAppConfig fills the normalized runtime path defaults', () => {
     assert.equal(config.paths.capturesDir, path.join(tmpDir, 'data', 'captures'));
     assert.equal(config.paths.tmpDir, path.join(tmpDir, 'data', 'tmp'));
     assert.equal(config.paths.logDir, path.join(tmpDir, 'logs'));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('loadAppConfig resolves AUDIT_AGENT_CONFIG_PATH from the project root', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-config-env-'));
+  try {
+    fs.mkdirSync(path.join(tmpDir, 'deploy'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'config.json'), JSON.stringify({ marker: 'default' }), 'utf-8');
+    fs.writeFileSync(path.join(tmpDir, 'deploy', 'config.json'), JSON.stringify({ marker: 'custom' }), 'utf-8');
+
+    const config = loadAppConfig(tmpDir, { env: { AUDIT_AGENT_CONFIG_PATH: '  deploy/config.json  ' } });
+
+    assert.equal(config.marker, 'custom');
+    assert.equal(config.rootDir, tmpDir);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
