@@ -26,8 +26,6 @@ COPY --chown=node:node src ./src
 
 RUN mkdir -p /app/data && chown node:node /app/data
 
-USER node
-
 EXPOSE 9320
 
 CMD ["node", "scripts/server.js", "--bind", "0.0.0.0", "--port", "9320"]
