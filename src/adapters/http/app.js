@@ -223,6 +223,18 @@ function scopedAgentIds(auth, { config, reviewStore, dashboardSnapshotStore, now
   return [...ids].sort();
 }
 
+function publicDashboardAgentIds({ config, reviewStore, dashboardSnapshotStore, nowIso }) {
+  const configured = config?.auditReview?.http?.publicDashboardAgentIds;
+  if (Array.isArray(configured)) {
+    return [...new Set(configured.map(String).filter((value) => value.trim() !== ''))];
+  }
+  return scopedAgentIds(null, { config, reviewStore, dashboardSnapshotStore, nowIso });
+}
+
+function canAutoIssueDashboardSession(auth) {
+  return !auth?.ok && (auth?.code === 'missing_session' || auth?.code === 'invalid_session');
+}
+
 function hasFiniteAgentScope(auth) {
   return auth?.type === 'session' && Array.isArray(auth.allowedAgentIds);
 }
@@ -278,6 +290,29 @@ function dashboardSessionCookie(sessionId) {
     'Path=/',
     'Max-Age=86400',
   ].join('; ');
+}
+
+function issueAutomaticDashboardSession({
+  dashboardAccessStore,
+  config,
+  reviewStore,
+  dashboardSnapshotStore,
+  now,
+}) {
+  if (!dashboardAccessStore) return null;
+  const nowDate = now();
+  const nowIso = nowDate.toISOString();
+  dashboardAccessStore.deleteExpiredAccess?.(nowIso);
+  const sessionId = dashboardAccessStore.createSession({
+    allowedAgentIds: publicDashboardAgentIds({
+      config,
+      reviewStore,
+      dashboardSnapshotStore,
+      nowIso,
+    }),
+    expiresAt: new Date(nowDate.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+  });
+  return sessionId;
 }
 
 function parseUrl(req) {
@@ -471,6 +506,21 @@ export function createHttpApp({
           accessStore: dashboardAccessStore,
           now: now().toISOString(),
         });
+        if (canAutoIssueDashboardSession(auth)) {
+          const sessionId = issueAutomaticDashboardSession({
+            dashboardAccessStore,
+            config,
+            reviewStore,
+            dashboardSnapshotStore,
+            now,
+          });
+          if (sessionId) {
+            redirect(res, 302, '/dashboard/agents', {
+              'set-cookie': dashboardSessionCookie(sessionId),
+            });
+            return;
+          }
+        }
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
         if (!dashboardAccessStore) {
@@ -494,6 +544,21 @@ export function createHttpApp({
           accessStore: dashboardAccessStore,
           now: now().toISOString(),
         });
+        if (canAutoIssueDashboardSession(auth)) {
+          const sessionId = issueAutomaticDashboardSession({
+            dashboardAccessStore,
+            config,
+            reviewStore,
+            dashboardSnapshotStore,
+            now,
+          });
+          if (sessionId) {
+            redirect(res, 302, '/dashboard/agents', {
+              'set-cookie': dashboardSessionCookie(sessionId),
+            });
+            return;
+          }
+        }
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
         const nowIso = now().toISOString();

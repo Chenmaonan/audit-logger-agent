@@ -11,7 +11,7 @@
 - 生成日常汇总、错误报表和工具使用统计。
 - 对异常、慢调用、高风险工具和不完整链路执行周期审查，生成 Finding。
 - 提供 Dashboard 查看审查批次、Finding、证据和快照。
-- Dashboard 安全能力包括 magic link 登录、24h session、Agent 选择、24h snapshot 和下载 HTML。
+- Dashboard 安全能力包括自动 24h 只读 session、Agent 选择、24h snapshot 和下载 HTML；可通过 `auditReview.http.publicDashboardAgentIds` 预留公开访问白名单。
 
 ## 快速启动
 

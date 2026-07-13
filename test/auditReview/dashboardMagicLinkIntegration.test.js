@@ -17,7 +17,7 @@ import { createVisualization } from '../../src/auditReview/visualization.js';
 const TEST_NOW = new Date('2026-07-10T10:00:00.000Z');
 const FUTURE_EXPIRES_AT = new Date(TEST_NOW.getTime() + 24 * 60 * 60 * 1000).toISOString();
 
-async function withDashboardServer(fn) {
+async function withDashboardServer(fn, { configOverrides = {} } = {}) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-dashboard-magic-'));
   const dbPath = path.join(tmpDir, 'audit.db');
   const db = openDb(dbPath);
@@ -31,12 +31,15 @@ async function withDashboardServer(fn) {
       http: {
         requireDashboardToken: true,
         allowedOrigins: [],
+        ...(configOverrides.auditReview?.http ?? {}),
       },
       visualization: {
         baseUrl: 'http://127.0.0.1:9320',
         dashboardPath: '/dashboard',
+        ...(configOverrides.auditReview?.visualization ?? {}),
       },
     },
+    ...Object.fromEntries(Object.entries(configOverrides).filter(([key]) => key !== 'auditReview')),
   };
   const reviewStore = createReviewStore(db);
   const dashboardAccessStore = createDashboardAccessStore(db);
@@ -328,5 +331,138 @@ test('magic link creates a scoped dashboard session and snapshot routes enforce 
       headers: { authorization: 'Bearer api-token' },
     });
     assert.equal(bearerApi.status, 200);
+  });
+});
+
+test('dashboard automatically issues a 24h read-only session for new visitors', async () => {
+  await withDashboardServer(async ({
+    baseUrl,
+    tmpDir,
+    dashboardSnapshotStore,
+  }) => {
+    const agentAFile = createSnapshotFile(
+      tmpDir,
+      'auto-agent-a.html',
+      '<!doctype html><html lang="zh-CN"><body>agent-a snapshot</body></html>',
+    );
+    const agentBFile = createSnapshotFile(
+      tmpDir,
+      'auto-agent-b.html',
+      '<!doctype html><html lang="zh-CN"><body>agent-b snapshot</body></html>',
+    );
+
+    dashboardSnapshotStore.createSnapshotMetadata({
+      snapshotId: 'auto-snap-agent-a',
+      reviewId: 'auto-review-a',
+      agentId: 'agent-a',
+      generatedAt: '2026-07-10T09:00:00.000Z',
+      expiresAt: FUTURE_EXPIRES_AT,
+      filePath: agentAFile,
+      sha256: 'sha-auto-a',
+      byteSize: 64,
+      title: 'Agent A 快照',
+      status: 'completed',
+      findingCount: 1,
+    });
+    dashboardSnapshotStore.createSnapshotMetadata({
+      snapshotId: 'auto-snap-agent-b',
+      reviewId: 'auto-review-b',
+      agentId: 'agent-b',
+      generatedAt: '2026-07-10T09:00:00.000Z',
+      expiresAt: FUTURE_EXPIRES_AT,
+      filePath: agentBFile,
+      sha256: 'sha-auto-b',
+      byteSize: 64,
+      title: 'Agent B 快照',
+      status: 'completed',
+      findingCount: 1,
+    });
+
+    const openResponse = await fetch(`${baseUrl}/dashboard`, { redirect: 'manual' });
+    assert.equal(openResponse.status, 302);
+    assert.equal(openResponse.headers.get('location'), '/dashboard/agents');
+    assert.equal(openResponse.headers.get('referrer-policy'), 'no-referrer');
+    const setCookie = openResponse.headers.get('set-cookie');
+    assert.match(setCookie, /^dashboard_session=[^;]+;/);
+    assert.match(setCookie, /HttpOnly/i);
+    assert.match(setCookie, /Secure/i);
+    assert.match(setCookie, /SameSite=Lax/i);
+    assert.match(setCookie, /Max-Age=86400/i);
+
+    const cookie = setCookie.split(';')[0];
+    const agentsResponse = await fetch(`${baseUrl}/dashboard/agents`, { headers: { cookie } });
+    assert.equal(agentsResponse.status, 200);
+    const html = await agentsResponse.text();
+    assert.ok(html.includes('agent-a'));
+    assert.ok(html.includes('agent-b'));
+  });
+});
+
+test('automatic dashboard sessions honor configured public agent allowlist', async () => {
+  await withDashboardServer(async ({
+    baseUrl,
+    tmpDir,
+    dashboardSnapshotStore,
+  }) => {
+    const agentAFile = createSnapshotFile(
+      tmpDir,
+      'allow-agent-a.html',
+      '<!doctype html><html lang="zh-CN"><body>agent-a snapshot</body></html>',
+    );
+    const agentBFile = createSnapshotFile(
+      tmpDir,
+      'allow-agent-b.html',
+      '<!doctype html><html lang="zh-CN"><body>agent-b snapshot</body></html>',
+    );
+
+    dashboardSnapshotStore.createSnapshotMetadata({
+      snapshotId: 'allow-snap-agent-a',
+      reviewId: 'allow-review-a',
+      agentId: 'agent-a',
+      generatedAt: '2026-07-10T09:00:00.000Z',
+      expiresAt: FUTURE_EXPIRES_AT,
+      filePath: agentAFile,
+      sha256: 'sha-allow-a',
+      byteSize: 64,
+      title: 'Agent A 快照',
+      status: 'completed',
+      findingCount: 1,
+    });
+    dashboardSnapshotStore.createSnapshotMetadata({
+      snapshotId: 'allow-snap-agent-b',
+      reviewId: 'allow-review-b',
+      agentId: 'agent-b',
+      generatedAt: '2026-07-10T09:00:00.000Z',
+      expiresAt: FUTURE_EXPIRES_AT,
+      filePath: agentBFile,
+      sha256: 'sha-allow-b',
+      byteSize: 64,
+      title: 'Agent B 快照',
+      status: 'completed',
+      findingCount: 1,
+    });
+
+    const openResponse = await fetch(`${baseUrl}/dashboard`, { redirect: 'manual' });
+    assert.equal(openResponse.status, 302);
+    const cookie = openResponse.headers.get('set-cookie').split(';')[0];
+
+    const agentsResponse = await fetch(`${baseUrl}/dashboard/agents`, { headers: { cookie } });
+    assert.equal(agentsResponse.status, 200);
+    const html = await agentsResponse.text();
+    assert.ok(html.includes('agent-a'));
+    assert.equal(html.includes('agent-b'), false);
+
+    const forbiddenLatest = await fetch(`${baseUrl}/dashboard/agents/agent-b/latest`, {
+      headers: { cookie },
+    });
+    assert.equal(forbiddenLatest.status, 403);
+  }, {
+    configOverrides: {
+      auditReview: {
+        http: {
+          publicDashboardAgentIds: ['agent-a'],
+        },
+      },
+    },
   });
 });
