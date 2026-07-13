@@ -33,6 +33,9 @@ import { createToolSemanticMapper } from '../src/auditReview/toolSemanticMapper.
 import { createReviewNotifier } from '../src/auditReview/notification.js';
 import { createVisualization } from '../src/auditReview/visualization.js';
 import { createDashboardAuth } from '../src/auditReview/dashboardAuth.js';
+import { createDashboardAccessStore } from '../src/auditReview/dashboardAccessStore.js';
+import { createDashboardSnapshotStore } from '../src/auditReview/dashboardSnapshotStore.js';
+import { createLogBatchStore } from '../src/auditReview/logBatchStore.js';
 import { createAuditReviewScheduler } from '../src/auditReview/scheduler.js';
 import { createRetentionScheduler, createRetentionService } from '../src/auditReview/retention.js';
 import { listenHttpServer, resolveServerBindHost } from '../src/adapters/http/serverListen.js';
@@ -170,6 +173,9 @@ try {
 const reviewStore = createReviewStore(db);
 const lockStore = createLockStore(db);
 const cursorStore = createIngestCursorStore(db);
+const dashboardAccessStore = createDashboardAccessStore(db);
+const dashboardSnapshotStore = createDashboardSnapshotStore(db);
+const logBatchStore = createLogBatchStore(db);
 const ingestService = createAuditIngestService({ db, config: runtimeConfig, cursorStore, now: () => new Date() });
 const detector = createCandidateDetector({ db, riskPolicy: runtimeConfig.auditReview?.riskPolicy ?? {} });
 const toolSemanticMapper = createToolSemanticMapper({
@@ -200,6 +206,8 @@ const scheduler = createAuditReviewScheduler({
   toolSemanticMapper,
   notifier: reviewNotifier,
   visualization: reviewVisualization,
+  dashboardSnapshotStore,
+  logBatchStore,
   auditLogger: reviewAuditLogger,
   llmModel: openAIConfig.model,
   now: () => new Date(),
@@ -247,6 +255,9 @@ const app = createHttpApp({
   reviewStore,
   visualization: reviewVisualization,
   dashboardAuth,
+  dashboardAccessStore,
+  dashboardSnapshotStore,
+  logBatchStore,
   toolSemanticMapper,
 });
 const portIndex = process.argv.indexOf('--port');

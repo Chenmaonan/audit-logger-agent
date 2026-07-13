@@ -8,6 +8,7 @@ import { openDb } from '../../scripts/lib/db.js';
 import { ensureReviewSchema } from '../../src/db/reviewSchema.js';
 import { createIngestCursorStore } from '../../src/auditReview/ingestCursorStore.js';
 import { createAuditIngestService } from '../../src/auditReview/ingestService.js';
+import { createLogBatchStore } from '../../src/auditReview/logBatchStore.js';
 import { createHttpApp } from '../../src/adapters/http/app.js';
 import { resolveSpoolDir } from '../../src/adapters/http/ingestRoute.js';
 
@@ -42,7 +43,8 @@ async function withIngestServer(fn, configOverrides = {}) {
   };
   const cursorStore = createIngestCursorStore(db);
   const ingestService = createAuditIngestService({ db, config, cursorStore });
-  const server = createHttpApp({ db, config });
+  const logBatchStore = createLogBatchStore(db);
+  const server = createHttpApp({ db, config, logBatchStore });
 
   try {
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -53,6 +55,7 @@ async function withIngestServer(fn, configOverrides = {}) {
       db,
       config,
       ingestService,
+      logBatchStore,
     });
   } finally {
     await new Promise((resolve) => server.close(resolve));
@@ -89,6 +92,56 @@ test('POST /v1/ingest accepts one JSON event, stores it immediately, and ingestS
       db.prepare('SELECT COUNT(*) AS count FROM audit_events WHERE trace_id = ?').get('json-single').count,
       1
     );
+  });
+});
+
+test('POST /v1/ingest treats dashboard session cookie as no ingest authorization', async () => {
+  await withIngestServer(async ({ baseUrl, db }) => {
+    const anonymousResponse = await fetch(`${baseUrl}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(makeEvent({ trace_id: 'anonymous-ingest', span_id: 'span-anonymous-ingest' })),
+    });
+    const anonymousBody = await anonymousResponse.json();
+
+    const cookieOnlyResponse = await fetch(`${baseUrl}/v1/ingest`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie: 'dashboard_session=not-an-ingest-token',
+      },
+      body: JSON.stringify(makeEvent({ trace_id: 'cookie-only-ingest', span_id: 'span-cookie-only-ingest' })),
+    });
+    const cookieOnlyBody = await cookieOnlyResponse.json();
+
+    assert.equal(cookieOnlyResponse.status, anonymousResponse.status);
+    assert.deepEqual(cookieOnlyBody, anonymousBody);
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS count FROM audit_events WHERE trace_id IN (?, ?)').get(
+        'anonymous-ingest',
+        'cookie-only-ingest',
+      ).count,
+      2,
+    );
+  });
+});
+
+test('POST /v1/ingest assigns accepted events to the current open batch', async () => {
+  await withIngestServer(async ({ baseUrl, db, logBatchStore }) => {
+    const response = await fetch(`${baseUrl}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(makeEvent({ trace_id: 'batched-event', span_id: 'span-batched-event' })),
+    });
+
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), { accepted: 1, rejected: 0, errors: [] });
+
+    const row = db.prepare('SELECT batch_id FROM audit_events WHERE trace_id = ?').get('batched-event');
+    assert.ok(row.batch_id, 'accepted event should have a batch_id');
+    const [openBatch] = logBatchStore.listBatches({ agentId: 'remote-agent', status: 'open' });
+    assert.ok(openBatch, 'open batch should exist for the event agent');
+    assert.equal(row.batch_id, openBatch.batch_id);
   });
 });
 

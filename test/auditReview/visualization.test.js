@@ -2,6 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createVisualization } from '../../src/auditReview/visualization.js';
 
+const MOJIBAKE_RE = /[鏃鈥瀹鎵閾澶楂浣淇鎴鍏鐖璋椋寤妯鏆鍔鏇鐪鎬]/;
+
+function assertNoMojibake(value) {
+  assert.doesNotMatch(JSON.stringify(value), MOJIBAKE_RE);
+}
+
 function finding(overrides = {}) {
   return {
     finding_id: 'f-critical',
@@ -79,6 +85,7 @@ function fakeStore(overrides = {}) {
     listFindings({ reviewId, severity, status } = {}) {
       let rows = [critical];
       if (reviewId && reviewId !== critical.review_id) rows = [];
+      if (arguments[0]?.agentId) rows = rows.filter((row) => row.agent_id === arguments[0].agentId);
       if (severity) rows = rows.filter((row) => row.severity === severity);
       if (status) rows = rows.filter((row) => row.status === status);
       return rows;
@@ -272,4 +279,89 @@ test('visualization view models remain server-renderable data only', () => {
 
   assert.equal(payload.includes('fetch('), false);
   assert.equal(payload.includes('<script'), false);
+});
+
+test('agentSelectorPage shows allowed agents with latest and history links', () => {
+  const page = createViz().agentSelectorPage({
+    allowedAgentIds: ['agent-1', 'agent-2'],
+    snapshots: [
+      { agent_id: 'agent-1', agent_name: 'Agent One', created_at: '2026-07-03T10:31:00.000Z' },
+    ],
+  });
+
+  assert.equal(page.page.title, '选择 Agent');
+  assert.ok(page.page.breadcrumbs.some((crumb) => crumb.label === 'Agent'));
+
+  const agents = page.sections.find((section) => section.id === 'agent_selector');
+  assert.equal(agents.title, '可选 Agent');
+  assert.equal(agents.rows.length, 2);
+  assert.equal(agents.rows[0].agent_id.text, 'agent-1');
+  assert.equal(agents.rows[0].latest.href, '/dashboard/agents/agent-1/latest');
+  assert.equal(agents.rows[0].history.href, '/dashboard/agents/agent-1/history');
+  assert.equal(agents.rows[0].latest_snapshot.text, '2026-07-03T10:31:00.000Z');
+
+  const payload = JSON.stringify(page);
+  assert.equal(payload.includes('fetch('), false);
+  assert.equal(payload.includes('<script'), false);
+  assert.doesNotMatch(payload, /Bearer|cookie|magic token|é|�|Ã|Â|鈥|涓|鎬|瀹/);
+});
+
+test('agentLatestPage shows latest agent findings or a Chinese empty callout', () => {
+  const withData = createViz().agentLatestPage('agent-1');
+  assert.equal(withData.page.title, 'Agent 最新审查');
+  assert.ok(withData.page.page_actions.some((action) => action.label === '查看历史'));
+
+  const findings = withData.sections.find((section) => section.id === 'agent_latest_findings');
+  assert.equal(findings.title, '最近发现');
+  assert.equal(findings.rows[0].agent_name, 'Agent One');
+  assert.equal(findings.rows[0].trace_id.text, 'trace-critical-1');
+
+  const empty = createViz({ finding: { agent_id: 'agent-other' } }).agentLatestPage('agent-1');
+  const callout = empty.sections.find((section) => section.id === 'agent_latest_empty');
+  assert.equal(callout.title, '暂无数据');
+  assert.match(callout.body, /暂未找到该 Agent 的审查发现/);
+  assert.doesNotMatch(JSON.stringify([withData, empty]), /é|�|Ã|Â|鈥|涓|鎬|瀹/);
+});
+
+test('agentHistoryPage lists last 24h snapshots with view and download links', () => {
+  const page = createViz().agentHistoryPage('agent-1', [
+    {
+      snapshot_id: 'snap-1',
+      review_id: 'r-degraded',
+      agent_id: 'agent-1',
+      agent_name: 'Agent One',
+      created_at: '2026-07-03T10:31:00.000Z',
+      finding_count: 1,
+      html_href: '/dashboard/agents/agent-1/snapshots/snap-1.html',
+      download_href: '/dashboard/agents/agent-1/snapshots/snap-1.html?download=1',
+    },
+  ]);
+
+  assert.equal(page.page.title, 'Agent 历史快照');
+  assert.ok(page.page.page_actions.some((action) => action.label === '最新审查'));
+
+  const history = page.sections.find((section) => section.id === 'agent_history');
+  assert.equal(history.title, '过去 24h 快照');
+  assert.equal(history.rows[0].view.href, '/dashboard/agents/agent-1/snapshots/snap-1.html');
+  assert.equal(history.rows[0].download.href, '/dashboard/agents/agent-1/snapshots/snap-1.html?download=1');
+  assert.equal(history.rows[0].download.download, true);
+  assert.doesNotMatch(JSON.stringify(page), /Bearer|cookie|magic token|é|�|Ã|Â|鈥|涓|鎬|瀹/);
+});
+
+test('snapshotDetailPage returns a snapshot view model with download action', () => {
+  const page = createViz().snapshotDetailPage({
+    snapshot_id: 'snap-1',
+    review_id: 'r-degraded',
+    agent_id: 'agent-1',
+    agent_name: 'Agent One',
+    created_at: '2026-07-03T10:31:00.000Z',
+    finding_count: 1,
+    html_href: '/dashboard/agents/agent-1/snapshots/snap-1.html',
+    download_href: '/dashboard/agents/agent-1/snapshots/snap-1.html?download=1',
+  });
+
+  assert.equal(page.page.title, '快照详情');
+  assert.ok(page.page.page_actions.some((action) => action.label === '下载 HTML' && action.download === true));
+  assert.ok(page.sections.find((section) => section.id === 'snapshot_metadata'));
+  assert.doesNotMatch(JSON.stringify(page), /Bearer|cookie|magic token|é|�|Ã|Â|鈥|涓|鎬|瀹/);
 });

@@ -139,7 +139,56 @@ function appendAcceptedEvents(config, events) {
   }
 }
 
-export async function handleIngestRoute(req, res, { config = {}, db, toolSemanticMapper } = {}) {
+function hasAuditEventColumn(db, columnName) {
+  try {
+    return db.prepare('PRAGMA table_info(audit_events)').all().some((row) => row.name === columnName);
+  } catch {
+    return false;
+  }
+}
+
+function assignBatchIds(accepted, logBatchStore) {
+  if (!logBatchStore) return;
+  const batchesByAgent = new Map();
+  for (const item of accepted) {
+    const agentId = item.normalizedEvent.agent_id;
+    if (!batchesByAgent.has(agentId)) {
+      batchesByAgent.set(agentId, logBatchStore.getOrCreateOpenBatch(agentId));
+    }
+    item.batchId = batchesByAgent.get(agentId)?.batch_id ?? null;
+  }
+}
+
+function updateInsertedBatchIds(db, accepted, normalizedRows) {
+  if (!db || accepted.length === 0 || !hasAuditEventColumn(db, 'batch_id')) return;
+  const stmt = db.prepare(`
+    UPDATE audit_events
+    SET batch_id = @batch_id
+    WHERE batch_id IS NULL
+      AND ts = @ts
+      AND agent_id = @agent_id
+      AND trace_id = @trace_id
+      AND span_id = @span_id
+      AND raw_json = @raw_json
+  `);
+  const updateMany = db.transaction((items) => {
+    for (const item of items) {
+      if (!item.batchId) continue;
+      const row = normalizedRows[item.index];
+      stmt.run({
+        batch_id: item.batchId,
+        ts: row.ts,
+        agent_id: row.agent_id,
+        trace_id: row.trace_id,
+        span_id: row.span_id,
+        raw_json: row.raw_json,
+      });
+    }
+  });
+  updateMany(accepted.map((item, index) => ({ ...item, index })));
+}
+
+export async function handleIngestRoute(req, res, { config = {}, db, toolSemanticMapper, logBatchStore } = {}) {
   const type = contentType(req);
   const limitBytes = maxBodyBytes(config);
   const lineLimitBytes = maxLineBytes(config);
@@ -188,13 +237,17 @@ export async function handleIngestRoute(req, res, { config = {}, db, toolSemanti
   if (accepted.length > 0) {
     appendAcceptedEvents(config, accepted.map((item) => item.originalEvent));
     if (db) {
-      insertEvents(db, accepted.map((item) => normalizeEntry(item.normalizedEvent)));
+      assignBatchIds(accepted, logBatchStore);
+      const normalizedRows = accepted.map((item) => normalizeEntry(item.normalizedEvent));
+      insertEvents(db, normalizedRows);
+      updateInsertedBatchIds(db, accepted, normalizedRows);
       if (toolSemanticMapper) {
-        try {
-          await toolSemanticMapper.mapPendingEvents({ limit: Math.max(accepted.length, 1) });
-        } catch {
-          // Ingest must keep accepting logs even if semantic mapping is degraded.
-        }
+        // Fire-and-forget: ingest must respond immediately. Tool semantic mapping
+        // (which may call the LLM) must not block the ingest response. Mapping
+        // failures degrade to `unknown` and never drop logs.
+        toolSemanticMapper
+          .mapPendingEvents({ limit: Math.max(accepted.length, 1) })
+          .catch(() => {});
       }
     }
   }

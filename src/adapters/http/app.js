@@ -1,6 +1,7 @@
 // src/adapters/http/app.js
 import http from 'http';
 import fs from 'fs';
+import path from 'path';
 import {
   queryEvents,
   dailySummary,
@@ -10,6 +11,7 @@ import {
   reportTimezoneOffsetMinutes,
 } from '../../../scripts/lib/db.js';
 import { renderDashboard } from '../../auditReview/dashboardTemplate.js';
+import { snapshotFilename } from '../../auditReview/dashboardSnapshot.js';
 import { handleIngestRoute, isHttpIngestEnabled } from './ingestRoute.js';
 
 const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
@@ -149,9 +151,28 @@ function html(res, status, body, corsHeaders) {
     'content-type': 'text/html; charset=utf-8',
     'access-control-allow-methods': 'GET, OPTIONS',
     'access-control-allow-headers': 'content-type, authorization',
+    'referrer-policy': 'no-referrer',
   };
   Object.assign(headers, corsHeaders ?? {});
   res.writeHead(status, headers);
+  res.end(body);
+}
+
+function redirect(res, status, location, headers = {}) {
+  res.writeHead(status, {
+    location,
+    'referrer-policy': 'no-referrer',
+    ...headers,
+  });
+  res.end();
+}
+
+function rawHtml(res, status, body, headers = {}) {
+  res.writeHead(status, {
+    'content-type': 'text/html; charset=utf-8',
+    'referrer-policy': 'no-referrer',
+    ...headers,
+  });
   res.end(body);
 }
 
@@ -184,6 +205,79 @@ async function readJson(req, limitBytes = DEFAULT_MAX_BODY_BYTES) {
   }
   const raw = Buffer.concat(chunks).toString('utf-8');
   return raw ? JSON.parse(raw) : {};
+}
+
+function scopedAgentIds(auth, { config, reviewStore, dashboardSnapshotStore, nowIso }) {
+  if (Array.isArray(auth?.allowedAgentIds)) return auth.allowedAgentIds;
+  const ids = new Set(Object.keys(config?.agents ?? {}));
+  try {
+    for (const snapshot of dashboardSnapshotStore?.listSnapshots?.({ unexpiredAt: nowIso }) ?? []) {
+      if (snapshot.agentId) ids.add(snapshot.agentId);
+    }
+  } catch {}
+  try {
+    for (const finding of reviewStore?.listFindings?.({ limit: 1000 }) ?? []) {
+      if (finding.agent_id) ids.add(finding.agent_id);
+    }
+  } catch {}
+  return [...ids].sort();
+}
+
+function hasFiniteAgentScope(auth) {
+  return auth?.type === 'session' && Array.isArray(auth.allowedAgentIds);
+}
+
+function isReviewAllowedForSession(auth, reviewStore, reviewId) {
+  if (!hasFiniteAgentScope(auth)) return true;
+  const findings = reviewStore.listFindings({ limit: 1000, reviewId });
+  if (!Array.isArray(findings) || findings.length === 0) return false;
+  return findings.some((finding) => {
+    if (!finding?.agent_id) return false;
+    return auth.allowedAgentIds.includes(String(finding.agent_id));
+  });
+}
+
+function isSnapshotAllowed(auth, dashboardAuth, snapshot) {
+  if (!hasFiniteAgentScope(auth)) return true;
+  if (!snapshot?.agentId) return false;
+  return dashboardAuth.isAgentAllowed(auth, snapshot.agentId);
+}
+
+function snapshotViewModel(snapshot) {
+  if (!snapshot) return null;
+  return {
+    snapshot_id: snapshot.snapshotId,
+    review_id: snapshot.reviewId,
+    agent_id: snapshot.agentId,
+    created_at: snapshot.generatedAt,
+    expires_at: snapshot.expiresAt,
+    file_path: snapshot.filePath,
+    title: snapshot.title,
+    status: snapshot.status,
+    finding_count: snapshot.findingCount,
+    severity_counts: snapshot.severityCounts,
+    html_href: `/dashboard/snapshots/${encodeURIComponent(snapshot.snapshotId)}`,
+    download_href: `/dashboard/snapshots/${encodeURIComponent(snapshot.snapshotId)}/download`,
+  };
+}
+
+function safeAttachmentFilename(snapshot) {
+  return snapshotFilename({
+    agentId: snapshot.agentId,
+    reviewId: snapshot.reviewId,
+    createdAt: snapshot.generatedAt,
+  });
+}
+
+function dashboardSessionCookie(sessionId) {
+  return [
+    `dashboard_session=${sessionId}`,
+    'HttpOnly',
+    'Secure',
+    'SameSite=Lax',
+    'Path=/',
+    'Max-Age=86400',
+  ].join('; ');
 }
 
 function parseUrl(req) {
@@ -250,7 +344,21 @@ function mapRuntimeError(error) {
   return { status: 500, body: { error_code: 'internal_error', error: 'Internal server error' } };
 }
 
-export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth, toolSemanticMapper, now = () => new Date() } = {}) {
+export function createHttpApp({
+  db,
+  config,
+  runStore,
+  runtime,
+  scheduler,
+  reviewStore,
+  visualization,
+  dashboardAuth,
+  dashboardAccessStore,
+  dashboardSnapshotStore,
+  logBatchStore,
+  toolSemanticMapper,
+  now = () => new Date(),
+} = {}) {
   // Helpers for audit-review routes. These are optional — if not provided
   // (e.g. in the existing runs-api test), the new routes return 503.
   const hasReviewDeps = !!(scheduler && reviewStore && visualization && dashboardAuth);
@@ -340,24 +448,151 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
       }
 
       // ===================== Dashboard Pages (v1.4) =====================
+      if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/dashboard/open/')) {
+        const token = decodeURIComponent(url.pathname.split('/').pop() ?? '');
+        const access = dashboardAccessStore?.consumeMagicToken?.(token, { now: now().toISOString() });
+        if (!access) {
+          rawHtml(res, 404, '<h1>Not found</h1>');
+          return;
+        }
+        const sessionId = dashboardAccessStore.createSession({
+          allowedAgentIds: access.allowedAgentIds,
+          expiresAt: new Date(now().getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        });
+        redirect(res, 302, '/dashboard/agents', {
+          'set-cookie': dashboardSessionCookie(sessionId),
+        });
+        return;
+      }
+
       if (hasReviewDeps && req.method === 'GET' && url.pathname === '/dashboard') {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeDashboard(req, {
+          accessStore: dashboardAccessStore,
+          now: now().toISOString(),
+        });
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
-        const page = visualization.overviewPage();
+        if (!dashboardAccessStore) {
+          const page = visualization.overviewPage();
+          html(res, 200, renderDashboard(page), cors);
+          return;
+        }
+        const nowIso = now().toISOString();
+        const snapshots = (dashboardSnapshotStore?.listSnapshots?.({ unexpiredAt: nowIso }) ?? []).map(snapshotViewModel);
+        const page = visualization.agentSelectorPage({
+          allowedAgentIds: scopedAgentIds(auth, { config, reviewStore, dashboardSnapshotStore, nowIso }),
+          snapshots,
+        });
         html(res, 200, renderDashboard(page), cors);
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'GET' && url.pathname === '/dashboard/agents') {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeDashboard(req, {
+          accessStore: dashboardAccessStore,
+          now: now().toISOString(),
+        });
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
+        const nowIso = now().toISOString();
+        const snapshots = (dashboardSnapshotStore?.listSnapshots?.({ unexpiredAt: nowIso }) ?? []).map(snapshotViewModel);
+        const page = visualization.agentSelectorPage({
+          allowedAgentIds: scopedAgentIds(auth, { config, reviewStore, dashboardSnapshotStore, nowIso }),
+          snapshots,
+        });
+        html(res, 200, renderDashboard(page), cors);
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'GET' && /^\/dashboard\/agents\/[^/]+\/latest$/.test(url.pathname)) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeDashboard(req, {
+          accessStore: dashboardAccessStore,
+          now: now().toISOString(),
+        });
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
+        const agentId = decodeURIComponent(url.pathname.split('/')[3]);
+        if (!dashboardAuth.isAgentAllowed(auth, agentId)) {
+          html(res, 403, '<h1>Forbidden</h1>', cors);
+          return;
+        }
+        html(res, 200, renderDashboard(visualization.agentLatestPage(agentId)), cors);
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'GET' && /^\/dashboard\/agents\/[^/]+\/history$/.test(url.pathname)) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeDashboard(req, {
+          accessStore: dashboardAccessStore,
+          now: now().toISOString(),
+        });
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
+        const agentId = decodeURIComponent(url.pathname.split('/')[3]);
+        if (!dashboardAuth.isAgentAllowed(auth, agentId)) {
+          html(res, 403, '<h1>Forbidden</h1>', cors);
+          return;
+        }
+        const snapshots = (dashboardSnapshotStore?.listSnapshots?.({
+          agentId,
+          unexpiredAt: now().toISOString(),
+        }) ?? []).map(snapshotViewModel);
+        html(res, 200, renderDashboard(visualization.agentHistoryPage(agentId, snapshots)), cors);
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'GET' && /^\/dashboard\/snapshots\/[^/]+(?:\/download)?$/.test(url.pathname)) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeDashboard(req, {
+          accessStore: dashboardAccessStore,
+          now: now().toISOString(),
+        });
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
+        const parts = url.pathname.split('/');
+        const snapshotId = decodeURIComponent(parts[3]);
+        const isDownload = parts[4] === 'download';
+        const snapshot = dashboardSnapshotStore?.getSnapshot?.(snapshotId);
+        if (!snapshot) {
+          html(res, 404, '<h1>Snapshot not found</h1>', cors);
+          return;
+        }
+        if (!isSnapshotAllowed(auth, dashboardAuth, snapshot)) {
+          html(res, 403, '<h1>Forbidden</h1>', cors);
+          return;
+        }
+        let body;
+        try {
+          body = fs.readFileSync(snapshot.filePath, 'utf-8');
+        } catch {
+          html(res, 404, '<h1>Snapshot file not found</h1>', cors);
+          return;
+        }
+        const extra = isDownload
+          ? { 'content-disposition': `attachment; filename="${path.basename(safeAttachmentFilename(snapshot))}"` }
+          : {};
+        rawHtml(res, 200, body, { ...cors, ...extra });
         return;
       }
 
       if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/dashboard/audit-reviews/')) {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeDashboard(req, {
+          accessStore: dashboardAccessStore,
+          now: now().toISOString(),
+        });
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
         const reviewId = decodeURIComponent(url.pathname.split('/').pop());
         const run = reviewStore.getRun(reviewId);
         if (!run) { html(res, 404, '<h1>Review not found</h1>', cors); return; }
+        if (!isReviewAllowedForSession(auth, reviewStore, reviewId)) {
+          html(res, 403, '<h1>Forbidden</h1>', cors);
+          return;
+        }
         const page = visualization.reviewDetailPage(reviewId);
         html(res, 200, renderDashboard(page), cors);
         return;
@@ -365,12 +600,19 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/dashboard/audit-findings/')) {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeDashboard(req, {
+          accessStore: dashboardAccessStore,
+          now: now().toISOString(),
+        });
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
         const findingId = decodeURIComponent(url.pathname.split('/').pop());
         const finding = reviewStore.getFinding(findingId);
         if (!finding) { html(res, 404, '<h1>Finding not found</h1>', cors); return; }
+        if (finding.agent_id && !dashboardAuth.isAgentAllowed(auth, finding.agent_id)) {
+          html(res, 403, '<h1>Forbidden</h1>', cors);
+          return;
+        }
         const page = typeof visualization.findingDetailPageWithAnalysis === 'function'
           ? await visualization.findingDetailPageWithAnalysis(findingId)
           : visualization.findingDetailPage(findingId);
@@ -395,7 +637,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
       }
 
       if (req.method === 'POST' && url.pathname === '/v1/ingest' && isHttpIngestEnabled(config)) {
-        await handleIngestRoute(req, res, { config, db, toolSemanticMapper });
+        await handleIngestRoute(req, res, { config, db, toolSemanticMapper, logBatchStore });
         return;
       }
 

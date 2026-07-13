@@ -1,14 +1,14 @@
 // src/auditReview/dashboardTemplate.js
 // Renders a complete, self-contained HTML dashboard from a direct-data view model.
-// No browser-side fetch — the template receives fully-populated sections and renders them directly.
+// No browser-side fetch - the template receives fully-populated sections and renders them directly.
 
 const SEVERITY_TONES = {
-  critical: { color: '#B42318', bg: '#fdecea', label: '严重' },
-  high: { color: '#C2410C', bg: '#fff1e8', label: '高风险' },
-  medium: { color: '#B7791F', bg: '#fff8e1', label: '中风险' },
-  low: { color: '#475569', bg: '#f1f5f9', label: '低风险' },
-  neutral: { color: '#475467', bg: '#f5f7fa', label: '信息' },
-  success: { color: '#15803D', bg: '#ecfdf5', label: '成功' },
+  critical: { color: '#B42318', bg: '#fdecea', label: '\u4e25\u91cd' },
+  high: { color: '#C2410C', bg: '#fff1e8', label: '\u9ad8\u98ce\u9669' },
+  medium: { color: '#B7791F', bg: '#fff8e1', label: '\u4e2d\u98ce\u9669' },
+  low: { color: '#475569', bg: '#f1f5f9', label: '\u4f4e\u98ce\u9669' },
+  neutral: { color: '#475467', bg: '#f5f7fa', label: '\u4fe1\u606f' },
+  success: { color: '#15803D', bg: '#ecfdf5', label: '\u6210\u529f' },
 };
 
 function escapeHtml(str) {
@@ -59,20 +59,26 @@ function renderSecondaryText(secondary) {
   return hasValue(secondary) ? `<div class="cell-secondary">${escapeHtml(secondary)}</div>` : '';
 }
 
-function renderTextValue(text, { href, mono, tone } = {}) {
+function renderDownloadAttr(download) {
+  if (!download) return '';
+  if (download === true) return ' download';
+  return ` download="${escapeHtml(download)}"`;
+}
+
+function renderTextValue(text, { href, mono, tone, download } = {}) {
   const escapedText = escapeHtml(text ?? '');
 
   if (tone) {
     const tag = renderStatusTag(text, tone);
     if (href) {
-      return `<a href="${escapeHtml(href)}" class="cell-link">${tag}</a>`;
+      return `<a href="${escapeHtml(href)}" class="cell-link"${renderDownloadAttr(download)}>${tag}</a>`;
     }
     return tag;
   }
 
   const className = mono ? 'cell-link mono' : 'cell-link';
   if (href) {
-    return `<a href="${escapeHtml(href)}" class="${className}">${escapedText}</a>`;
+    return `<a href="${escapeHtml(href)}" class="${className}"${renderDownloadAttr(download)}>${escapedText}</a>`;
   }
 
   const valueClass = mono ? 'cell-primary mono' : 'cell-primary';
@@ -128,7 +134,7 @@ function renderFilterBar(filters) {
   const selects = filters.map((f) => {
     const id = escapeHtml(f.id ?? '');
     const label = escapeHtml(f.label ?? f.id ?? '');
-    return `<div class="filter-item"><label for="filter-${id}">${label}</label><select id="filter-${id}" name="${id}" disabled><option value="">全部</option></select></div>`;
+    return `<div class="filter-item"><label for="filter-${id}">${label}</label><select id="filter-${id}" name="${id}" disabled><option value="">\u5168\u90e8</option></select></div>`;
   }).join('\n');
   return `<div class="filter-bar">${selects}</div>`;
 }
@@ -145,9 +151,9 @@ function renderBreadcrumbs(breadcrumbs) {
     }
 
     return `<span class="breadcrumb-current"${isLast ? ' aria-current="page"' : ''}>${label}</span>`;
-  }).join('<span class="breadcrumb-separator" aria-hidden="true">›</span>');
+  }).join('<span class="breadcrumb-separator" aria-hidden="true">/</span>');
 
-  return `<nav class="breadcrumbs" aria-label="页面导航">${items}</nav>`;
+  return `<nav class="breadcrumbs" aria-label="\u9875\u9762\u5bfc\u822a">${items}</nav>`;
 }
 
 function renderContextBadges(badges) {
@@ -162,7 +168,7 @@ function renderPageActions(actions) {
   if (!Array.isArray(actions) || actions.length === 0) return '';
   return `<div class="page-actions">${actions.map((action) => {
     const kind = action.kind === 'primary' ? 'primary' : 'secondary';
-    return `<a href="${escapeHtml(action.href ?? '')}" class="page-action ${kind}">${escapeHtml(action.label ?? '')}</a>`;
+    return `<a href="${escapeHtml(action.href ?? '')}" class="page-action ${kind}"${renderDownloadAttr(action.download)}>${escapeHtml(action.label ?? '')}</a>`;
   }).join('')}</div>`;
 }
 
@@ -193,7 +199,7 @@ function renderTableSection(section) {
 
 function isMonoMetaItem(item) {
   const label = String(item?.label ?? '');
-  return /(^|\b)(id|trace|time|timestamp|时间|日期)(\b|$)/i.test(label);
+  return /(^|\b)(id|trace|time|timestamp|\u65f6\u95f4|\u65e5\u671f)(\b|$)/i.test(label);
 }
 
 function renderDefinitionListSection(section) {
@@ -275,7 +281,7 @@ function renderTraceSequenceSection(section) {
     const metaItems = [
       hasValue(step.timestamp) ? `<span>${escapeHtml(step.timestamp)}</span>` : '',
       hasValue(step.span_id) ? `<span>Span ${escapeHtml(step.span_id)}</span>` : '',
-      hasValue(step.parent_span_id) ? `<span>父 Span ${escapeHtml(step.parent_span_id)}</span>` : '',
+      hasValue(step.parent_span_id) ? `<span>Parent Span ${escapeHtml(step.parent_span_id)}</span>` : '',
       hasValue(step.duration_ms) ? `<span>${escapeHtml(step.duration_ms)}</span>` : '',
     ].filter(Boolean).join('');
     const summary = hasValue(step.error_message) ? step.error_message : step.summary;
@@ -314,15 +320,14 @@ function renderTraceAnalysisSection(section) {
   return `<section${renderSectionIdAttr(id)} class="data-section trace-analysis-section">
     <h3>${title}</h3>
     <div class="trace-analysis-grid">
-      ${hasValue(section.purpose) ? `<div class="trace-analysis-block"><div class="trace-analysis-label">调用目的</div><p>${escapeHtml(section.purpose)}</p></div>` : ''}
-      ${hasValue(section.chain_summary) ? `<div class="trace-analysis-block"><div class="trace-analysis-label">链路解读</div><p>${escapeHtml(section.chain_summary)}</p></div>` : ''}
-      ${riskPoints.length > 0 ? `<div class="trace-analysis-block"><div class="trace-analysis-label">风险点</div>${renderList(riskPoints)}</div>` : ''}
-      ${nextActions.length > 0 ? `<div class="trace-analysis-block"><div class="trace-analysis-label">建议动作</div>${renderList(nextActions)}</div>` : ''}
+      ${hasValue(section.purpose) ? `<div class="trace-analysis-block"><div class="trace-analysis-label">\u8c03\u7528\u76ee\u7684</div><p>${escapeHtml(section.purpose)}</p></div>` : ''}
+      ${hasValue(section.chain_summary) ? `<div class="trace-analysis-block"><div class="trace-analysis-label">\u94fe\u8def\u89e3\u8bfb</div><p>${escapeHtml(section.chain_summary)}</p></div>` : ''}
+      ${riskPoints.length > 0 ? `<div class="trace-analysis-block"><div class="trace-analysis-label">\u98ce\u9669\u70b9</div>${renderList(riskPoints)}</div>` : ''}
+      ${nextActions.length > 0 ? `<div class="trace-analysis-block"><div class="trace-analysis-label">\u5efa\u8bae\u52a8\u4f5c</div>${renderList(nextActions)}</div>` : ''}
     </div>
-    ${hasValue(section.model) ? `<div class="trace-analysis-model mono">模型：${escapeHtml(section.model)}</div>` : ''}
+    ${hasValue(section.model) ? `<div class="trace-analysis-model mono">\u6a21\u578b\uff1a${escapeHtml(section.model)}</div>` : ''}
   </section>`;
 }
-
 function renderSection(section) {
   if (!section) return '';
   switch (section.type) {
@@ -339,21 +344,21 @@ function renderSection(section) {
 
 function renderSections(sections) {
   const visible = visibleSections(sections);
-  if (!Array.isArray(visible) || visible.length === 0) return '<div class="empty-state">暂无可展示的审查数据</div>';
+  if (!Array.isArray(visible) || visible.length === 0) return '<div class="empty-state">\u6682\u65e0\u53ef\u5c55\u793a\u7684\u5ba1\u67e5\u6570\u636e</div>';
   return visible.map(renderSection).join('\n');
 }
 
 function renderEmptyState() {
-  return '<div class="empty-state">暂无可展示的审查数据</div>';
+  return '<div class="empty-state">\u6682\u65e0\u53ef\u5c55\u793a\u7684\u5ba1\u67e5\u6570\u636e</div>';
 }
 
 function renderErrorState(message) {
-  return `<div class="error-state">加载错误: ${escapeHtml(message ?? '')}</div>`;
+  return `<div class="error-state">\u52a0\u8f7d\u9519\u8bef: ${escapeHtml(message ?? '')}</div>`;
 }
 
 export function renderDashboard(templateInput) {
   const page = templateInput?.page ?? {};
-  const title = escapeHtml(page.title ?? '审计看板');
+  const title = escapeHtml(page.title ?? '\u5ba1\u8ba1\u770b\u677f');
   const subtitle = escapeHtml(page.subtitle ?? '');
   const updatedAt = escapeHtml(page.updated_at ?? '');
   const metrics = renderSummaryMetrics(templateInput?.summary_metrics);
@@ -747,7 +752,7 @@ footer { text-align: center; color: var(--text-muted); font-size: 12px; padding:
 </header>
 <main class="container">
   <div class="time-range-bar">
-    <span>更新时间：${updatedAt}</span>
+    <span>\u66f4\u65b0\u65f6\u95f4\uff1a${updatedAt}</span>
   </div>
   ${breadcrumbs}
   ${pageActions}
@@ -756,7 +761,7 @@ footer { text-align: center; color: var(--text-muted); font-size: 12px; padding:
   ${filters}
   ${sections}
 </main>
-<footer>audit-logger-agent 审计看板</footer>
+<footer>audit-logger-agent \u5ba1\u8ba1\u770b\u677f</footer>
 </body>
 </html>`;
 }

@@ -7,7 +7,7 @@
 
 // src/auditReview/visualization.js
 // Build direct-data view models for the dashboard pages.
-// The template receives fully-populated sections (rows/items/links) 鈥?no browser-side fetch.
+// The template receives fully-populated sections (rows/items/links) - no browser-side fetch.
 
 const SEVERITY_LABELS = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low' };
 const STATUS_LABELS = {
@@ -62,6 +62,22 @@ const REVIEWS_TABLE_COLUMNS = [
   { key: 'finding_count', label: 'Findings' },
   { key: 'trigger_type', label: 'Trigger' },
   { key: 'finished_at', label: 'Finished at' },
+];
+
+const AGENT_SELECTOR_COLUMNS = [
+  { key: 'agent_id', label: 'Agent ID' },
+  { key: 'agent_name', label: 'Agent 名称' },
+  { key: 'latest_snapshot', label: '最新快照' },
+  { key: 'latest', label: '最新审查' },
+  { key: 'history', label: '历史' },
+];
+
+const AGENT_HISTORY_COLUMNS = [
+  { key: 'created_at', label: '生成时间' },
+  { key: 'review_id', label: 'Review ID' },
+  { key: 'finding_count', label: '发现数' },
+  { key: 'view', label: '查看' },
+  { key: 'download', label: '下载' },
 ];
 
 const TRACE_ANALYSIS_SYSTEM_PROMPT = [
@@ -311,7 +327,7 @@ function localTraceChainSummary(traceEvents) {
 }
 
 function normalizeTraceAnalysis(raw, traceEvents = []) {
-  if (!raw || typeof raw !== 'object') throw new Error('LLM 閾捐矾鍒嗘瀽缁撴灉涓嶆槸瀵硅薄');
+  if (!raw || typeof raw !== 'object') throw new Error('LLM 链路分析结果不是对象');
   const analysis = {
     purpose: boundedText(raw.purpose, 300),
     chain_summary: boundedText(raw.chain_summary, 500) || localTraceChainSummary(traceEvents),
@@ -319,7 +335,7 @@ function normalizeTraceAnalysis(raw, traceEvents = []) {
     next_actions: boundedTextList(raw.next_actions, { maxItems: 5, maxLength: 220 }),
   };
   if (!isPresent(analysis.purpose) && !isPresent(analysis.chain_summary)) {
-    throw new Error('LLM 閾捐矾鍒嗘瀽缂哄皯 purpose 鎴?chain_summary');
+    throw new Error('LLM 链路分析缺少 purpose 或 chain_summary');
   }
   return analysis;
 }
@@ -762,7 +778,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
           evidence_count: {
             text: String(Array.isArray(finding.evidence) ? finding.evidence.length : 0),
             mono: true,
-            secondary: Array.isArray(finding.evidence) && finding.evidence.length > 1 ? '澶氭潯璇佹嵁' : undefined,
+            secondary: Array.isArray(finding.evidence) && finding.evidence.length > 1 ? '多条证据' : undefined,
           },
         })),
       });
@@ -798,8 +814,8 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
         subtitle: formatWindow(run) || reviewId,
         updated_at: updatedAt,
         breadcrumbs: [
-          { label: '鎬昏', href: dashboardPath },
-          { label: '瀹℃煡鎵规', href: reviewUrl(reviewId) },
+          { label: '总览', href: dashboardPath },
+          { label: '审查批次', href: reviewUrl(reviewId) },
         ],
         context_badges,
         page_actions,
@@ -1011,6 +1027,252 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     return page;
   }
 
+  function agentLatestUrl(agentId) {
+    return `${dashboardPath}/agents/${encodeURIComponent(agentId)}/latest`;
+  }
+
+  function agentHistoryUrl(agentId) {
+    return `${dashboardPath}/agents/${encodeURIComponent(agentId)}/history`;
+  }
+
+  function snapshotViewHref(snapshot) {
+    if (snapshot?.html_href) return snapshot.html_href;
+    if (snapshot?.snapshot_id && snapshot?.agent_id) {
+      return `${dashboardPath}/agents/${encodeURIComponent(snapshot.agent_id)}/snapshots/${encodeURIComponent(snapshot.snapshot_id)}`;
+    }
+    if (snapshot?.review_id && snapshot?.agent_id) {
+      return `${dashboardPath}/agents/${encodeURIComponent(snapshot.agent_id)}/reviews/${encodeURIComponent(snapshot.review_id)}`;
+    }
+    return undefined;
+  }
+
+  function snapshotDownloadHref(snapshot) {
+    return snapshot?.download_href ?? snapshotViewHref(snapshot);
+  }
+
+  function agentNameFrom(agentId, snapshots = []) {
+    const fromSnapshot = snapshots.find((snapshot) => snapshot?.agent_id === agentId && isPresent(snapshot.agent_name));
+    if (fromSnapshot) return fromSnapshot.agent_name;
+    const fromFinding = listFindings(1000, { agentId })
+      .filter((finding) => finding?.agent_id === agentId)
+      .find((finding) => isPresent(finding.agent_name));
+    return fromFinding?.agent_name ?? '';
+  }
+
+  function latestSnapshotFor(agentId, snapshots = []) {
+    return snapshots
+      .filter((snapshot) => snapshot?.agent_id === agentId)
+      .slice()
+      .sort((left, right) => compareByIsoDesc(left?.created_at ?? left?.finished_at, right?.created_at ?? right?.finished_at))[0] ?? null;
+  }
+
+  function agentFindingRow(finding) {
+    return {
+      title: {
+        text: finding.title ?? '',
+        href: finding.finding_id ? findingUrl(finding.finding_id) : undefined,
+      },
+      severity_label: {
+        text: labelOf(SEVERITY_LABELS, finding.severity),
+        tone: severityTone(finding.severity),
+      },
+      category_label: labelOf(CATEGORY_LABELS, finding.category),
+      agent_name: finding.agent_name ?? finding.agent_id ?? '',
+      tool_name: finding.tool_name ?? '',
+      trace_id: traceCellFor(finding),
+      status: {
+        text: labelOf(STATUS_LABELS, finding.status),
+        tone: statusTone(finding.status),
+      },
+      review_id: {
+        text: finding.review_id ?? '',
+        href: finding.review_id ? reviewUrl(finding.review_id) : undefined,
+        mono: true,
+      },
+      last_seen_at: {
+        text: formatTime(lastSeenAtOf(finding)),
+        mono: true,
+      },
+    };
+  }
+
+  function agentSelectorPage({ allowedAgentIds = [], snapshots = [] } = {}) {
+    const ids = Array.from(new Set(allowedAgentIds.filter(isPresent).map(String)));
+    const rows = ids.map((agentId) => {
+      const latestSnapshot = latestSnapshotFor(agentId, snapshots);
+      return {
+        agent_id: {
+          text: agentId,
+          href: agentLatestUrl(agentId),
+          mono: true,
+        },
+        agent_name: agentNameFrom(agentId, snapshots),
+        latest_snapshot: {
+          text: formatTime(latestSnapshot?.created_at ?? latestSnapshot?.finished_at),
+          mono: true,
+        },
+        latest: {
+          text: '查看最新',
+          href: agentLatestUrl(agentId),
+        },
+        history: {
+          text: '查看历史',
+          href: agentHistoryUrl(agentId),
+        },
+      };
+    });
+
+    return {
+      page: {
+        title: '选择 Agent',
+        subtitle: '选择一个 Agent 查看最新审查或历史快照。',
+        updated_at: nowIso(),
+        breadcrumbs: [
+          { label: '总览', href: dashboardPath },
+          { label: 'Agent', href: `${dashboardPath}/agents` },
+        ],
+        context_badges: [{ label: `${rows.length} 个 Agent`, tone: 'neutral' }],
+        page_actions: [{ label: '返回总览', href: dashboardPath, kind: 'secondary' }],
+      },
+      summary_metrics: [{ label: 'Agent', value: rows.length, tone: 'neutral' }],
+      filters: [],
+      sections: rows.length > 0
+        ? [{ id: 'agent_selector', title: '可选 Agent', type: 'table', columns: AGENT_SELECTOR_COLUMNS, rows }]
+        : [{ id: 'agent_selector_empty', title: '暂无 Agent', type: 'callout', body: '当前没有可选 Agent。' }],
+    };
+  }
+
+  function agentLatestPage(agentId) {
+    const findings = listFindings(1000, { agentId })
+      .filter((finding) => finding?.agent_id === agentId)
+      .slice()
+      .sort(compareFindings);
+    const latestReviewId = findings[0]?.review_id;
+    const latestFindings = latestReviewId
+      ? findings.filter((finding) => finding.review_id === latestReviewId)
+      : findings;
+    const agentName = findings.find((finding) => isPresent(finding.agent_name))?.agent_name ?? '';
+
+    return {
+      page: {
+        title: 'Agent 最新审查',
+        subtitle: agentName ? `${agentName} (${agentId})` : String(agentId),
+        updated_at: nowIso(),
+        breadcrumbs: [
+          { label: '总览', href: dashboardPath },
+          { label: 'Agent', href: `${dashboardPath}/agents` },
+          { label: '最新审查', href: agentLatestUrl(agentId) },
+        ],
+        context_badges: [
+          { label: `Agent ${agentId}`, tone: 'neutral' },
+          { label: `${latestFindings.length} 个发现`, tone: latestFindings.length > 0 ? 'high' : 'neutral' },
+        ],
+        page_actions: [
+          { label: '查看历史', href: agentHistoryUrl(agentId), kind: 'primary' },
+          { label: '返回 Agent 列表', href: `${dashboardPath}/agents`, kind: 'secondary' },
+        ],
+      },
+      summary_metrics: [{ label: '发现数', value: latestFindings.length, tone: latestFindings.length > 0 ? 'high' : 'neutral' }],
+      filters: [],
+      sections: latestFindings.length > 0
+        ? [{ id: 'agent_latest_findings', title: '最近发现', type: 'table', columns: OVERVIEW_FINDINGS_COLUMNS, rows: latestFindings.map(agentFindingRow) }]
+        : [{ id: 'agent_latest_empty', title: '暂无数据', type: 'callout', body: '暂未找到该 Agent 的审查发现。' }],
+    };
+  }
+
+  function agentHistoryPage(agentId, snapshots = []) {
+    const rows = snapshots
+      .filter((snapshot) => !snapshot?.agent_id || snapshot.agent_id === agentId)
+      .slice()
+      .sort((left, right) => compareByIsoDesc(left?.created_at ?? left?.finished_at, right?.created_at ?? right?.finished_at))
+      .map((snapshot) => ({
+        created_at: {
+          text: formatTime(snapshot.created_at ?? snapshot.finished_at),
+          mono: true,
+        },
+        review_id: {
+          text: snapshot.review_id ?? '',
+          href: snapshot.review_id ? reviewUrl(snapshot.review_id) : undefined,
+          mono: true,
+        },
+        finding_count: String(snapshot.finding_count ?? 0),
+        view: {
+          text: '查看',
+          href: snapshotViewHref(snapshot),
+        },
+        download: {
+          text: '下载 HTML',
+          href: snapshotDownloadHref(snapshot),
+          download: true,
+        },
+      }));
+
+    return {
+      page: {
+        title: 'Agent 历史快照',
+        subtitle: `过去 24h: ${agentId}`,
+        updated_at: nowIso(),
+        breadcrumbs: [
+          { label: '总览', href: dashboardPath },
+          { label: 'Agent', href: `${dashboardPath}/agents` },
+          { label: '历史快照', href: agentHistoryUrl(agentId) },
+        ],
+        context_badges: [{ label: `${rows.length} 个快照`, tone: 'neutral' }],
+        page_actions: [
+          { label: '最新审查', href: agentLatestUrl(agentId), kind: 'primary' },
+          { label: '返回 Agent 列表', href: `${dashboardPath}/agents`, kind: 'secondary' },
+        ],
+      },
+      summary_metrics: [{ label: '快照数', value: rows.length, tone: 'neutral' }],
+      filters: [],
+      sections: rows.length > 0
+        ? [{ id: 'agent_history', title: '过去 24h 快照', type: 'table', columns: AGENT_HISTORY_COLUMNS, rows }]
+        : [{ id: 'agent_history_empty', title: '暂无快照', type: 'callout', body: '过去 24h 暂无该 Agent 的快照。' }],
+    };
+  }
+
+  function snapshotDetailPage(snapshotOrRef = {}) {
+    const snapshot = typeof snapshotOrRef === 'object' && snapshotOrRef !== null ? snapshotOrRef : { review_id: snapshotOrRef };
+    const agentId = snapshot.agent_id ?? '';
+    const metadata = [
+      { label: 'Snapshot ID', value: snapshot.snapshot_id ?? '' },
+      { label: 'Agent ID', value: agentId },
+      { label: 'Agent 名称', value: snapshot.agent_name ?? '' },
+      { label: 'Review ID', value: snapshot.review_id ?? '' },
+      { label: '生成时间', value: formatTime(snapshot.created_at ?? snapshot.finished_at) },
+      { label: '发现数', value: snapshot.finding_count ?? 0 },
+    ].filter((item) => isPresent(item.value));
+
+    const pageActions = [];
+    const downloadHref = snapshotDownloadHref(snapshot);
+    if (downloadHref) {
+      pageActions.push({ label: '下载 HTML', href: downloadHref, kind: 'primary', download: true });
+    }
+    if (agentId) {
+      pageActions.push({ label: '返回历史', href: agentHistoryUrl(agentId), kind: 'secondary' });
+    }
+
+    return {
+      page: {
+        title: '快照详情',
+        subtitle: agentId ? `Agent ${agentId}` : '',
+        updated_at: nowIso(),
+        breadcrumbs: [
+          { label: '总览', href: dashboardPath },
+          { label: 'Agent', href: `${dashboardPath}/agents` },
+          { label: '快照详情', href: snapshotViewHref(snapshot) },
+        ],
+        context_badges: agentId ? [{ label: `Agent ${agentId}`, tone: 'neutral' }] : [],
+        page_actions: pageActions,
+      },
+      summary_metrics: [{ label: '发现数', value: snapshot.finding_count ?? 0, tone: (snapshot.finding_count ?? 0) > 0 ? 'high' : 'neutral' }],
+      filters: [],
+      sections: [
+        { id: 'snapshot_metadata', title: '快照信息', type: 'definition_list', items: metadata },
+      ],
+    };
+  }
+
   return {
     dashboardUrlFor,
     findingUrlFor,
@@ -1018,5 +1280,9 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     reviewDetailPage,
     findingDetailPage,
     findingDetailPageWithAnalysis,
+    agentSelectorPage,
+    agentLatestPage,
+    agentHistoryPage,
+    snapshotDetailPage,
   };
 }

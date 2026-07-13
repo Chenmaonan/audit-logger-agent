@@ -11,8 +11,11 @@
 //   - Emit runtime audit events for every lifecycle step (agent_id='audit-logger-agent').
 
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { agentDisplayName, buildEvidenceDetail, buildEvidenceIndex, evidenceForEventIds } from './evidence.js';
 import { estimateTokensForPayload, llmBudgetFromConfig, usageWouldExceedBudget } from './llmBudget.js';
+import { hashHtml, renderDownloadableDashboardHtml, snapshotFilename } from './dashboardSnapshot.js';
 
 const LOCK_NAME = 'audit_review_scheduler';
 const LEASE_MINUTES = 10;
@@ -28,6 +31,49 @@ function estimateTokensForReview({ reviewId, window, candidates }) {
 function reviewIdFor(now) {
   const ts = now.toISOString().replace(/[:.]/g, '-');
   return `review_${ts}_${crypto.randomUUID().slice(0, 8)}`;
+}
+
+function resolveSnapshotDir(config) {
+  const configured = config?.paths?.dashboardSnapshotsDir
+    ?? config?.auditReview?.visualization?.snapshotDir
+    ?? path.join('data', 'dashboard-snapshots');
+  if (path.isAbsolute(configured)) return configured;
+  return path.resolve(config?.rootDir ?? config?.paths?.rootDir ?? process.cwd(), configured);
+}
+
+function snapshotTtlHours(config) {
+  const value = Number(config?.auditReview?.visualization?.snapshotTtlHours ?? 24);
+  return Number.isFinite(value) && value > 0 ? value : 24;
+}
+
+function severityCountsFor(findings) {
+  const counts = { critical: 0, high: 0, medium: 0, low: 0 };
+  for (const finding of Array.isArray(findings) ? findings : []) {
+    if (Object.prototype.hasOwnProperty.call(counts, finding.severity)) {
+      counts[finding.severity] += 1;
+    }
+  }
+  return counts;
+}
+
+function writeFileAtomic(filePath, content) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmpPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  fs.writeFileSync(tmpPath, content, 'utf-8');
+  fs.renameSync(tmpPath, filePath);
+}
+
+function distinctAgentsInWindow(db, { windowFrom, windowTo }) {
+  try {
+    return db.prepare(`
+      SELECT DISTINCT agent_id
+      FROM audit_events
+      WHERE ts >= @windowFrom AND ts <= @windowTo
+      ORDER BY agent_id ASC
+    `).all({ windowFrom, windowTo }).map((row) => row.agent_id).filter(Boolean);
+  } catch {
+    return [];
+  }
 }
 
 const SEVERITY_RANK = { low: 1, medium: 2, high: 3, critical: 4 };
@@ -230,9 +276,9 @@ function parseErrorFindings(parseErrors, reviewId, riskPolicyVersion, reviewerVe
       entity: null,
       entity_type: null,
       entity_id: null,
-      title: '鏃ュ織瑙ｆ瀽澶辫触',
-      summary: `${errors.length} 鏉¤В鏋愰敊璇紝娑夊強 ${uniqueFiles.size} 涓枃浠躲€傛牱渚? ${samples.join('; ')}`,
-      recommendation: '妫€鏌ユ棩蹇楁牸寮忔槸鍚︾鍚?agent-audit-log v1.0 瑙勮寖',
+      title: '日志解析失败',
+      summary: `${errors.length} 条解析错误，涉及 ${uniqueFiles.size} 个文件。样例：${samples.join('; ')}`,
+      recommendation: '检查日志格式是否符合 agent-audit-log v1.0 规范',
       requires_action: 0,
       evidence_event_ids: [],
       evidence_event_ids_json: '[]',
@@ -257,6 +303,8 @@ export function createAuditReviewScheduler({
   toolSemanticMapper,
   notifier,
   visualization,
+  dashboardSnapshotStore,
+  logBatchStore,
   auditLogger,
   llmModel: llmModelOpt,
   now = () => new Date(),
@@ -310,6 +358,34 @@ export function createAuditReviewScheduler({
       });
     } catch {
       // Never let audit logging break the review cycle.
+    }
+  }
+
+  async function cleanupExpiredDashboardSnapshots(cleanupNow) {
+    if (!dashboardSnapshotStore?.deleteExpiredSnapshots) return null;
+
+    try {
+      const result = dashboardSnapshotStore.deleteExpiredSnapshots(cleanupNow);
+      const failedCount = result.failedFiles?.length ?? 0;
+      const deletedFileCount = result.deletedFiles?.length ?? 0;
+      const missingFileCount = result.missingFiles?.length ?? 0;
+      if (result.deleted > 0 || failedCount > 0) {
+        await logAudit(
+          'review.snapshot.expired_deleted',
+          failedCount > 0 ? 'INTERNAL' : 'OK',
+          `Expired snapshot cleanup: metadata=${result.deleted}, files=${deletedFileCount}, missing=${missingFileCount}, failed=${failedCount}.`,
+          'audit.snapshot',
+        );
+      }
+      return result;
+    } catch (error) {
+      await logAudit(
+        'review.snapshot.expired_delete_failed',
+        'INTERNAL',
+        `Expired snapshot cleanup failed: ${error.message}`,
+        'audit.snapshot',
+      );
+      return null;
     }
   }
 
@@ -367,7 +443,7 @@ export function createAuditReviewScheduler({
     // 1. Acquire lease lock.
     const acquired = lockStore.acquire({ lockName: LOCK_NAME, ownerId, leaseMinutes: LEASE_MINUTES });
     if (!acquired.acquired) {
-      // Another run holds the lease 鈥?record a skipped run and return.
+      // Another run holds the lease - record a skipped run and return.
       const reviewId = reviewIdFor(now());
       reviewStore.createRun({
         reviewId,
@@ -391,6 +467,7 @@ export function createAuditReviewScheduler({
 
     const reviewId = reviewIdFor(now());
     const windowTo = now().toISOString();
+    await cleanupExpiredDashboardSnapshots(windowTo);
 
     // 2. Compute window.
     const lastWindowTo = lastSuccessfulWindowTo(reviewStore);
@@ -430,6 +507,148 @@ export function createAuditReviewScheduler({
     let ingestResult = { inserted: 0, scannedFiles: 0, parseErrors: [], cursorUpdates: 0 };
     let candidates = { candidates: [], totalEvents: 0, trimmed: false };
     let llmResult = { ok: false, degraded: true, error: 'not_run' };
+    const lockedBatches = [];
+
+    function deletePreviousReviewedRawLogs(agentId, excludeBatchId) {
+      if (!logBatchStore?.deleteReviewedRawLogsForAgent) return;
+      try {
+        const result = logBatchStore.deleteReviewedRawLogsForAgent({
+          agentId,
+          excludeBatchId,
+          now: now().toISOString(),
+        });
+        if (result?.skipped) {
+          logAudit(
+            'review.batch.raw_delete_skipped',
+            'OK',
+            `Skipped raw deletion for agent ${agentId}: ${result.reason ?? 'unknown reason'}.`,
+            'audit.review.batch',
+          );
+        } else if ((result?.batchIds?.length ?? 0) > 0) {
+          logAudit(
+            'review.batch.raw_deleted',
+            'OK',
+            `Deleted ${result.deletedRows ?? 0} raw event(s) from ${result.batchIds.length} reviewed batch(es) for agent ${agentId}.`,
+            'audit.review.batch',
+          );
+        }
+      } catch (error) {
+        logAudit(
+          'review.batch.raw_delete_failed',
+          'INTERNAL',
+          `Failed to delete reviewed raw logs for agent ${agentId}: ${error.message}`,
+          'audit.review.batch',
+        );
+      }
+    }
+
+    function lockOpenBatchesForReview() {
+      if (!logBatchStore) return;
+      const agentIds = distinctAgentsInWindow(db, { windowFrom, windowTo });
+      for (const agentId of agentIds) {
+        try {
+          const batchNow = now().toISOString();
+          const currentOpenBatch = logBatchStore.getOrCreateOpenBatch?.(agentId, { now: batchNow });
+          deletePreviousReviewedRawLogs(agentId, currentOpenBatch?.batch_id);
+          const result = logBatchStore.lockOpenBatchForReview({ agentId, reviewId, now: batchNow });
+          if (result?.lockedBatch) lockedBatches.push(result.lockedBatch);
+        } catch (error) {
+          logAudit(
+            'review.batch.lock_failed',
+            'INTERNAL',
+            `Failed to lock batch for agent ${agentId}: ${error.message}`,
+            'audit.review.batch',
+          );
+        }
+      }
+    }
+
+    function agentIdsForSnapshots() {
+      const ids = new Set();
+      for (const candidate of candidates.candidates ?? []) {
+        if (candidate?.agent_id) ids.add(candidate.agent_id);
+      }
+      for (const error of ingestResult.parseErrors ?? []) {
+        if (error?.agent_id) ids.add(error.agent_id);
+      }
+      return [...ids].sort();
+    }
+
+    function createSnapshot({ run, agentId = null, page }) {
+      const generatedAt = run.finished_at ?? new Date().toISOString();
+      const expiresAt = new Date(Date.parse(generatedAt) + snapshotTtlHours(config) * 60 * 60 * 1000).toISOString();
+      const html = renderDownloadableDashboardHtml(page);
+      const { sha256, byteSize } = hashHtml(html);
+      const snapshotId = `snapshot_${crypto.randomUUID()}`;
+      const filename = snapshotFilename({ agentId, reviewId, createdAt: generatedAt });
+      const filePath = path.join(resolveSnapshotDir(config), filename);
+      writeFileAtomic(filePath, html);
+      const findings = reviewStore.listFindings({ limit: 1000, reviewId });
+      return dashboardSnapshotStore.createSnapshotMetadata({
+        snapshotId,
+        reviewId,
+        agentId,
+        generatedAt,
+        expiresAt,
+        filePath,
+        sha256,
+        byteSize,
+        title: agentId ? `Agent ${agentId} 审查快照` : `Review ${reviewId} 审查快照`,
+        status: run.status,
+        findingCount: agentId
+          ? findings.filter((finding) => finding.agent_id === agentId).length
+          : run.finding_count,
+        severityCounts: severityCountsFor(agentId
+          ? findings.filter((finding) => finding.agent_id === agentId)
+          : findings),
+      });
+    }
+
+    function generateDashboardSnapshots() {
+      if (!dashboardSnapshotStore) return { snapshots: [], agentSnapshotByAgentId: new Map() };
+      const run = reviewStore.getRun(reviewId);
+      const snapshots = [];
+      const agentSnapshotByAgentId = new Map();
+      const reviewSnapshot = createSnapshot({
+        run,
+        page: visualization.reviewDetailPage(reviewId),
+      });
+      snapshots.push(reviewSnapshot);
+
+      for (const agentId of agentIdsForSnapshots()) {
+        const snapshot = createSnapshot({
+          run,
+          agentId,
+          page: visualization.agentLatestPage(agentId),
+        });
+        snapshots.push(snapshot);
+        agentSnapshotByAgentId.set(agentId, snapshot);
+      }
+
+      return { snapshots, agentSnapshotByAgentId };
+    }
+
+    function markLockedBatchesReviewed(snapshotResult) {
+      if (!logBatchStore || lockedBatches.length === 0 || snapshotResult.snapshots.length === 0) return;
+      const reviewSnapshot = snapshotResult.snapshots.find((snapshot) => !snapshot.agentId);
+      for (const batch of lockedBatches) {
+        try {
+          const agentSnapshot = snapshotResult.agentSnapshotByAgentId.get(batch.agent_id);
+          logBatchStore.markReviewed({
+            batchId: batch.batch_id,
+            reviewId,
+            snapshotId: agentSnapshot?.snapshotId ?? reviewSnapshot?.snapshotId ?? snapshotResult.snapshots[0].snapshotId,
+          });
+        } catch (error) {
+          logAudit(
+            'review.batch.mark_reviewed_failed',
+            'INTERNAL',
+            `Failed to mark batch ${batch.batch_id} reviewed: ${error.message}`,
+            'audit.review.batch',
+          );
+        }
+      }
+    }
 
     try {
       // 5. Ingest.
@@ -442,6 +661,7 @@ export function createAuditReviewScheduler({
           `Ingest: scanned=${ingestResult.scannedFiles}, inserted=${ingestResult.inserted}, parseErrors=${ingestResult.parseErrors.length}`,
           'audit.ingest',
         );
+        lockOpenBatchesForReview();
       } catch (err) {
         logAudit(
           'review.ingest.completed',
@@ -696,6 +916,26 @@ export function createAuditReviewScheduler({
         llmModel,
         errorCode,
       });
+      let snapshotResult = { snapshots: [], agentSnapshotByAgentId: new Map() };
+      try {
+        snapshotResult = generateDashboardSnapshots();
+        if (snapshotResult.snapshots.length > 0) {
+          logAudit(
+            'review.snapshot.generated',
+            'OK',
+            `Generated ${snapshotResult.snapshots.length} dashboard snapshot(s) for review ${reviewId}.`,
+            'audit.snapshot',
+          );
+          markLockedBatchesReviewed(snapshotResult);
+        }
+      } catch (error) {
+        logAudit(
+          'review.snapshot.generated',
+          'INTERNAL',
+          `Snapshot generation failed for review ${reviewId}: ${error.message}`,
+          'audit.snapshot',
+        );
+      }
       logAudit(
         'review.completed',
         status === 'completed' ? 'OK' : 'INTERNAL',

@@ -1,6 +1,8 @@
 // src/auditReview/dashboardAuth.js
 // Access control for dashboard and audit review API.
 
+export const DASHBOARD_SESSION_COOKIE = 'dashboard_session';
+
 function isLoopback(remoteAddress) {
   if (!remoteAddress) return false;
   if (remoteAddress === '127.0.0.1' || remoteAddress === '::1') return true;
@@ -65,6 +67,31 @@ export function createDashboardAuth({ config, env }) {
     return match ? match[1] : null;
   }
 
+  function extractCookie(req, name) {
+    const header = req?.headers?.cookie;
+    if (!header || typeof header !== 'string') return null;
+    for (const part of header.split(';')) {
+      const [rawKey, ...rawValue] = part.trim().split('=');
+      if (rawKey === name) return rawValue.join('=');
+    }
+    return null;
+  }
+
+  function authorizeBearer(req) {
+    const configured = token();
+    if (!configured) {
+      return { ok: false, status: 401, code: 'missing_token' };
+    }
+    const provided = extractBearerToken(req);
+    if (!provided) {
+      return { ok: false, status: 401, code: 'missing_token' };
+    }
+    if (!timingSafeEqualString(provided, configured)) {
+      return { ok: false, status: 403, code: 'invalid_token' };
+    }
+    return { ok: true, type: 'bearer', allowedAgentIds: null };
+  }
+
   function authorize(req, { isWrite } = {}) {
     const remoteAddress = req?.socket?.remoteAddress ?? req?.remoteAddress;
     const loopback = isLoopback(remoteAddress);
@@ -89,6 +116,38 @@ export function createDashboardAuth({ config, env }) {
     return { ok: true };
   }
 
+  function authorizeDashboard(req, { accessStore, now } = {}) {
+    const bearer = extractBearerToken(req);
+    if (bearer) return authorizeBearer(req);
+
+    if (accessStore) {
+      const sessionId = extractCookie(req, DASHBOARD_SESSION_COOKIE);
+      if (!sessionId) {
+        return { ok: false, status: 401, code: 'missing_session' };
+      }
+      const session = accessStore.getSession(sessionId, now ? { now } : undefined);
+      if (!session) {
+        return { ok: false, status: 401, code: 'invalid_session' };
+      }
+      return {
+        ok: true,
+        type: 'session',
+        allowedAgentIds: session.allowedAgentIds,
+        expiresAt: session.expiresAt,
+      };
+    }
+
+    const fallback = authorize(req, { isWrite: false });
+    if (!fallback.ok) return fallback;
+    return { ok: true, type: 'legacy', allowedAgentIds: null };
+  }
+
+  function isAgentAllowed(authResult, agentId) {
+    if (!authResult?.ok) return false;
+    if (!Array.isArray(authResult.allowedAgentIds)) return true;
+    return authResult.allowedAgentIds.includes(String(agentId));
+  }
+
   function corsHeaders(origin) {
     const allowed = httpConfig.allowedOrigins ?? [];
     if (!origin) return {};
@@ -109,6 +168,9 @@ export function createDashboardAuth({ config, env }) {
     shouldRequireToken,
     validateBoot,
     authorize,
+    authorizeBearer,
+    authorizeDashboard,
+    isAgentAllowed,
     corsHeaders,
   };
 }

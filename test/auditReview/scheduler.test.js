@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 import crypto from 'crypto';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { ensureRuntimeSchema } from '../../src/db/runtimeSchema.js';
 import { ensureReviewSchema } from '../../src/db/reviewSchema.js';
 import { createReviewStore } from '../../src/auditReview/reviewStore.js';
@@ -13,6 +16,8 @@ import { createReviewNotifier } from '../../src/auditReview/notification.js';
 import { createVisualization } from '../../src/auditReview/visualization.js';
 import { createRuntimeAuditLogger } from '../../src/observability/runtimeAudit.js';
 import { createAuditReviewScheduler } from '../../src/auditReview/scheduler.js';
+import { createDashboardSnapshotStore } from '../../src/auditReview/dashboardSnapshotStore.js';
+import { createLogBatchStore } from '../../src/auditReview/logBatchStore.js';
 
 const AUDIT_EVENTS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -311,6 +316,39 @@ function buildRealDeps(db, { llmClient, configOverrides } = {}) {
 
 // ===================== Tests =====================
 
+test('scheduler.runOnce creates Chinese parse-error finding without mojibake', async () => {
+  const db = makeDb();
+  const deps = buildRealDeps(db, { llmClient: makeFakeLlmClientFailing() });
+  deps.ingestService = {
+    ingestSince() {
+      return {
+        inserted: 0,
+        scannedFiles: 2,
+        parseErrors: [
+          { agent_id: 'mt-agent', file: 'agent-a/audit.log', line: 7, error: 'invalid json' },
+          { agent_id: 'mt-agent', file: 'agent-b/audit.log', line: 9, error: 'missing event' },
+        ],
+        cursorUpdates: 0,
+      };
+    },
+  };
+  const scheduler = createAuditReviewScheduler({ db, ...deps, now: () => new Date('2026-07-03T10:30:00.000Z') });
+
+  const result = await scheduler.runOnce({ triggerType: 'scheduled' });
+
+  assert.equal(result.status, 'completed_degraded');
+  const finding = deps.reviewStore.listFindings({ limit: 100 })
+    .find((row) => row.category === 'ingest_parse_error');
+  assert.ok(finding);
+  assert.equal(finding.title, '\u65e5\u5fd7\u89e3\u6790\u5931\u8d25');
+  assert.match(finding.summary, /2 \u6761\u89e3\u6790\u9519\u8bef/);
+  assert.match(finding.summary, /\u6d89\u53ca 2 \u4e2a\u6587\u4ef6/);
+  assert.equal(finding.recommendation, '\u68c0\u67e5\u65e5\u5fd7\u683c\u5f0f\u662f\u5426\u7b26\u5408 agent-audit-log v1.0 \u89c4\u8303');
+  assert.doesNotMatch(`${finding.title} ${finding.summary} ${finding.recommendation}`, /[鏃鈥瀹鎵閾澶楂浣淇鎴鍏鐖璋椋寤妯鏆鍔鏇鐪鎬]/);
+
+  db.close();
+});
+
 test('scheduler.runOnce happy path: creates completed run, persists findings, releases lock, logs audit events', async () => {
   const db = makeDb();
   // Insert an error event so the detector finds a candidate.
@@ -358,6 +396,211 @@ test('scheduler.runOnce happy path: creates completed run, persists findings, re
   assert.ok(events.includes('review.ingest.completed'), 'should log review.ingest.completed');
 
   db.close();
+});
+
+test('scheduler.runOnce creates review and agent dashboard snapshots after finishing the run', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-scheduler-snapshots-'));
+  const db = makeDb();
+  try {
+    insertEvent(db, 1, {
+      ts: '2026-07-03T10:00:01.000Z',
+      tool_name: 'some.query',
+      status: 'INTERNAL',
+      event: 'tool.end',
+    });
+
+    const dashboardSnapshotStore = createDashboardSnapshotStore(db);
+    const deps = buildRealDeps(db, {
+      configOverrides: {
+        visualization: {
+          snapshotDir: path.join(tmpDir, 'snapshots'),
+          baseUrl: 'http://127.0.0.1:9320',
+          dashboardPath: '/dashboard',
+        },
+      },
+    });
+    const scheduler = createAuditReviewScheduler({
+      db,
+      ...deps,
+      dashboardSnapshotStore,
+      now: () => new Date('2026-07-03T10:30:00.000Z'),
+    });
+
+    const result = await scheduler.runOnce({ triggerType: 'scheduled' });
+
+    assert.equal(result.status, 'completed');
+    const run = deps.reviewStore.getRun(result.reviewId);
+    assert.ok(run.finished_at, 'run must be finished before snapshot metadata is written');
+
+    const snapshots = dashboardSnapshotStore.listSnapshots({ reviewId: result.reviewId });
+    assert.ok(snapshots.some((snapshot) => snapshot.agentId === null), 'review-level snapshot should be created');
+    assert.ok(snapshots.some((snapshot) => snapshot.agentId === 'mt-agent'), 'agent-level snapshot should be created');
+    for (const snapshot of snapshots) {
+      assert.ok(Date.parse(snapshot.generatedAt) >= Date.parse(run.finished_at));
+      assert.equal(fs.existsSync(snapshot.filePath), true);
+      const html = fs.readFileSync(snapshot.filePath, 'utf-8');
+      assert.ok(html.includes('<html'));
+      assert.equal(html.includes('/dashboard/open/'), false);
+      assert.equal(/Bearer\s+/i.test(html), false);
+      assert.equal(/token=/i.test(html), false);
+    }
+  } finally {
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('scheduler.runOnce deletes expired dashboard snapshot HTML before generating new snapshots', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-scheduler-expired-snapshots-'));
+  const db = makeDb();
+  try {
+    insertEvent(db, 1, {
+      ts: '2026-07-03T10:00:01.000Z',
+      tool_name: 'some.query',
+      status: 'INTERNAL',
+      event: 'tool.end',
+    });
+
+    const dashboardSnapshotStore = createDashboardSnapshotStore(db);
+    const expiredPath = path.join(tmpDir, 'snapshots', 'expired.html');
+    const freshPath = path.join(tmpDir, 'snapshots', 'fresh.html');
+    fs.mkdirSync(path.dirname(expiredPath), { recursive: true });
+    fs.writeFileSync(expiredPath, '<html>expired</html>');
+    fs.writeFileSync(freshPath, '<html>fresh</html>');
+    dashboardSnapshotStore.createSnapshotMetadata({
+      snapshotId: 'expired-snapshot',
+      reviewId: 'review-expired',
+      agentId: null,
+      generatedAt: '2026-07-02T10:30:00.000Z',
+      expiresAt: '2026-07-03T10:30:00.000Z',
+      filePath: expiredPath,
+      sha256: 'f'.repeat(64),
+      byteSize: 100,
+    });
+    dashboardSnapshotStore.createSnapshotMetadata({
+      snapshotId: 'fresh-snapshot',
+      reviewId: 'review-fresh',
+      agentId: null,
+      generatedAt: '2026-07-03T10:00:00.000Z',
+      expiresAt: '2026-07-04T10:00:00.000Z',
+      filePath: freshPath,
+      sha256: 'a'.repeat(64),
+      byteSize: 100,
+    });
+
+    const deps = buildRealDeps(db, {
+      configOverrides: {
+        visualization: {
+          snapshotDir: path.join(tmpDir, 'snapshots'),
+          baseUrl: 'http://127.0.0.1:9320',
+          dashboardPath: '/dashboard',
+        },
+      },
+    });
+    const scheduler = createAuditReviewScheduler({
+      db,
+      ...deps,
+      dashboardSnapshotStore,
+      now: () => new Date('2026-07-03T10:30:00.000Z'),
+    });
+
+    const result = await scheduler.runOnce({ triggerType: 'scheduled' });
+
+    assert.equal(result.status, 'completed');
+    assert.equal(fs.existsSync(expiredPath), false);
+    assert.equal(fs.existsSync(freshPath), true);
+    assert.equal(dashboardSnapshotStore.getSnapshot('expired-snapshot'), null);
+    assert.equal(dashboardSnapshotStore.getSnapshot('fresh-snapshot').filePath, freshPath);
+    assert.ok(dashboardSnapshotStore.listSnapshots({ reviewId: result.reviewId }).length > 0);
+  } finally {
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('scheduler.runOnce deletes previous reviewed raw rows for the same agent before reviewing current batch', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-scheduler-raw-delete-'));
+  const db = makeDb();
+  try {
+    const logBatchStore = createLogBatchStore(db);
+    const oldBatch = logBatchStore.getOrCreateOpenBatch('mt-agent', { now: '2026-07-03T09:00:00.000Z' });
+    logBatchStore.markReviewed({
+      batchId: oldBatch.batch_id,
+      reviewId: 'review-old',
+      snapshotId: 'snapshot-old',
+    });
+    const currentBatch = logBatchStore.getOrCreateOpenBatch('mt-agent', { now: '2026-07-03T10:00:00.000Z' });
+    const otherAgentBatch = logBatchStore.getOrCreateOpenBatch('other-agent', { now: '2026-07-03T09:00:00.000Z' });
+    logBatchStore.markReviewed({
+      batchId: otherAgentBatch.batch_id,
+      reviewId: 'review-other',
+      snapshotId: 'snapshot-other',
+    });
+
+    insertEvent(db, 1, {
+      ts: '2026-07-03T09:01:00.000Z',
+      agent_id: 'mt-agent',
+      trace_id: 'old-trace',
+      span_id: 'old-span',
+      status: 'OK',
+    });
+    db.prepare('UPDATE audit_events SET batch_id = ? WHERE trace_id = ?').run(oldBatch.batch_id, 'old-trace');
+    insertEvent(db, 2, {
+      ts: '2026-07-03T10:00:01.000Z',
+      agent_id: 'mt-agent',
+      trace_id: 'current-trace',
+      span_id: 'current-span',
+      tool_name: 'some.query',
+      status: 'INTERNAL',
+      event: 'tool.end',
+    });
+    db.prepare('UPDATE audit_events SET batch_id = ? WHERE trace_id = ?').run(currentBatch.batch_id, 'current-trace');
+    insertEvent(db, 3, {
+      ts: '2026-07-03T09:01:00.000Z',
+      agent_id: 'other-agent',
+      trace_id: 'other-trace',
+      span_id: 'other-span',
+      status: 'OK',
+    });
+    db.prepare('UPDATE audit_events SET batch_id = ? WHERE trace_id = ?').run(otherAgentBatch.batch_id, 'other-trace');
+
+    const dashboardSnapshotStore = createDashboardSnapshotStore(db);
+    const deps = buildRealDeps(db, {
+      configOverrides: {
+        visualization: {
+          snapshotDir: path.join(tmpDir, 'snapshots'),
+          baseUrl: 'http://127.0.0.1:9320',
+          dashboardPath: '/dashboard',
+        },
+      },
+    });
+    const scheduler = createAuditReviewScheduler({
+      db,
+      ...deps,
+      dashboardSnapshotStore,
+      logBatchStore,
+      now: () => new Date('2026-07-03T10:30:00.000Z'),
+    });
+
+    const result = await scheduler.runOnce({ triggerType: 'scheduled' });
+
+    assert.equal(result.status, 'completed');
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM audit_events WHERE batch_id = ?').get(oldBatch.batch_id).count, 0);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM audit_events WHERE batch_id = ?').get(currentBatch.batch_id).count, 1);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM audit_events WHERE batch_id = ?').get(otherAgentBatch.batch_id).count, 1);
+
+    const oldAfter = db.prepare('SELECT status, raw_deleted_at FROM audit_log_batches WHERE batch_id = ?').get(oldBatch.batch_id);
+    assert.equal(oldAfter.status, 'raw_deleted');
+    assert.ok(oldAfter.raw_deleted_at);
+
+    const currentAfter = db.prepare('SELECT status, raw_deleted_at, snapshot_id FROM audit_log_batches WHERE batch_id = ?').get(currentBatch.batch_id);
+    assert.equal(currentAfter.status, 'reviewed');
+    assert.equal(currentAfter.raw_deleted_at, null);
+    assert.ok(currentAfter.snapshot_id);
+  } finally {
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 test('scheduler.runOnce with LLM failing: status completed_degraded, still inserts rule-based findings, lock released', async () => {
