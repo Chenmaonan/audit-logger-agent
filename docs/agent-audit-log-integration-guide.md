@@ -88,7 +88,7 @@ http://10.10.20.15:9320/v1/ingest
 - 通过反向代理或网关提供 TLS、身份认证与来源限制，并且仅放行必要路由；
 - 使用受控 VPN、mTLS 或等效的网络身份边界。
 
-审计服务的 Dashboard 认证配置不等同于 ingest 认证，不能用 Dashboard Token 代替网络隔离。
+审计服务的 Dashboard 页面不要求登录，Dashboard Token 也不用于 ingest 认证，不能用它代替网络隔离。
 
 ## 3. 上游 Agent 必须新增的配置
 

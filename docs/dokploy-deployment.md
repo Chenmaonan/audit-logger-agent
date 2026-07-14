@@ -23,9 +23,9 @@
 | `AUDIT_AGENT_LLM_MODEL` | 是 | 审查与语义映射使用的模型名 |
 | `AUDIT_AGENT_LLM_BASE_URL` | 是 | OpenAI-compatible LLM API 地址，例如 `https://api.openai.com/v1` 或实际模型服务地址 |
 | `AUDIT_AGENT_LLM_TIMEOUT_MS` | 否 | LLM 请求超时毫秒数；未设置时为 `30000` |
-| `AUDIT_AGENT_DASHBOARD_TOKEN` | 是 | Dashboard 登录和 `/v1/audit-*` Bearer 鉴权的共享密钥 |
+| `AUDIT_AGENT_DASHBOARD_TOKEN` | 否 | `/v1/audit-*` Bearer 鉴权密钥；Dashboard 页面不使用它 |
 
-`AUDIT_AGENT_DASHBOARD_TOKEN` 应是独立的高强度随机值。轮换它会使已有 Dashboard 会话失效，需要重新登录。
+如需调用 `/v1/audit-*` API，`AUDIT_AGENT_DASHBOARD_TOKEN` 应是独立的高强度随机值。未配置时 Dashboard 仍可访问，但审查 API 的 Bearer 鉴权不会放行请求。
 
 ## 3. 持久化与健康检查
 
@@ -50,17 +50,17 @@ GET /health -> 200
 - 在 Dokploy Proxy 或上游反向代理/网关按来源 IP、VPN 网段、mTLS 或专用认证策略限制该路径；或
 - 将 ingest 仅置于私有网络，让上游 Agent 通过内网访问，并且不要为该路径绑定公网路由。
 
-不要只依赖 Dashboard Token 保护 ingest：它不用于 `/v1/ingest`。同时应限制 `/query` 和 `/report/*` 的公开访问范围，避免暴露审计数据。
+不要依赖 Dashboard Token 保护 ingest：它不用于 `/v1/ingest`。同时应限制 Dashboard、`/query` 和 `/report/*` 的公开访问范围，避免暴露审计数据。
 
 ## 5. Dashboard 访问
 
 部署和域名生效后，使用：
 
 ```text
-https://<域名>/dashboard/login
+https://<域名>/dashboard
 ```
 
-输入 `AUDIT_AGENT_DASHBOARD_TOKEN` 后会跳转到 `/dashboard`。登录会话 Cookie 为 HttpOnly 与 SameSite=Lax；经 Dokploy HTTPS Proxy 访问时会带 Secure 属性。审查 API `/v1/audit-*` 不接受该 Cookie，只接受同一 token 的 Bearer 请求。
+Dashboard 页面不要求登录，能访问该域名和路径的用户可以直接查看审计数据。生产环境应在 Dokploy Proxy、上游网关、VPN 或 IP allowlist 中限制访问范围。审查 API `/v1/audit-*` 不接受 Dashboard 页面访问权限，只接受 `AUDIT_AGENT_DASHBOARD_TOKEN` 对应的 Bearer 请求。
 
 ## 6. 通知与外部回调
 

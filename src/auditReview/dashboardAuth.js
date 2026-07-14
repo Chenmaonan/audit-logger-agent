@@ -57,24 +57,16 @@ export function createDashboardAuth({ config, env }) {
   }
 
   function shouldRequireToken({ bindHost }) {
-    // loopback + not requireDashboardToken -> no token required (GET)
-    // anything else requires token
-    if (!bindHost) return false;
-    if (isLoopback(bindHost) && !httpConfig.requireDashboardToken) {
-      return false;
-    }
-    return true;
+    // Dashboard HTML is public. API routes enforce Bearer token authorization
+    // at request time via authorizeApi().
+    void bindHost;
+    return false;
   }
 
   function validateBoot({ bindHost }) {
-    if (shouldRequireToken({ bindHost })) {
-      const t = token();
-      if (!t) {
-        throw new Error(
-          'AUDIT_AGENT_DASHBOARD_TOKEN must be configured when binding to a non-loopback address'
-        );
-      }
-    }
+    // Dashboard HTML is intentionally viewable without a login token.
+    // Audit-review API routes still enforce Bearer token authorization per request.
+    void bindHost;
   }
 
   function extractBearerToken(req) {
@@ -122,17 +114,7 @@ export function createDashboardAuth({ config, env }) {
   }
 
   function authorizeDashboard(req) {
-    const bearer = extractBearerToken(req);
-    if (bearer) return authorizeLoginToken(bearer);
-
-    const expectedSession = sessionValue();
-    const providedSession = cookieValue(req, SESSION_COOKIE_NAME);
-    if (!expectedSession || !providedSession) {
-      return { ok: false, status: 401, code: 'missing_token' };
-    }
-    if (!timingSafeEqualString(providedSession, expectedSession)) {
-      return { ok: false, status: 403, code: 'invalid_token' };
-    }
+    void req;
     return { ok: true };
   }
 

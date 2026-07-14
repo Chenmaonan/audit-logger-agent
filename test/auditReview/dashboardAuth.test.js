@@ -74,12 +74,12 @@ test('non-loopback GET with correct token is authorized', () => {
   assert.equal(res.ok, true);
 });
 
-test('validateBoot throws when non-loopback and no token configured', () => {
+test('validateBoot does not throw when non-loopback and no token configured', () => {
   const auth = createDashboardAuth({
     config: { auditReview: { http: { bindHost: '0.0.0.0', requireDashboardToken: false, allowedOrigins: [] } } },
     env: {},
   });
-  assert.throws(() => auth.validateBoot({ bindHost: '0.0.0.0' }), /AUDIT_AGENT_DASHBOARD_TOKEN/);
+  auth.validateBoot({ bindHost: '0.0.0.0' });
 });
 
 test('validateBoot does not throw when loopback and no token', () => {
@@ -128,7 +128,7 @@ test('isLoopback handles ::ffff:127.0.0.1', () => {
   assert.equal(auth.isLoopback('10.0.0.1'), false);
 });
 
-test('dashboard session cookie authorizes HTML but cannot authorize audit APIs', () => {
+test('dashboard HTML is authorized without token but session cookie cannot authorize audit APIs', () => {
   const auth = createDashboardAuth({
     config: { auditReview: { http: {} } },
     env: { AUDIT_AGENT_DASHBOARD_TOKEN: 'secret-token' },
@@ -142,6 +142,7 @@ test('dashboard session cookie authorizes HTML but cannot authorize audit APIs',
   assert.equal(cookie.includes('secret-token'), false);
   const cookieHeader = cookie.split(';', 1)[0];
 
+  assert.equal(auth.authorizeDashboard(makeReq({ remoteAddress: '10.0.0.5' })).ok, true);
   assert.equal(
     auth.authorizeDashboard(makeReq({ remoteAddress: '127.0.0.1', headers: { cookie: cookieHeader } })).ok,
     true,

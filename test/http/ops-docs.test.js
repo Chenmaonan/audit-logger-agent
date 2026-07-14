@@ -38,15 +38,11 @@ test('README links human users to deployment and Agent integration guides', () =
   for (const required of [
     'docs/dokploy-deployment.md',
     'docs/agent-audit-log-integration-guide.md',
-    '/dashboard/login',
+    '/dashboard',
   ]) {
     assert.ok(readme.includes(required), `README should include ${required}`);
   }
-  assert.match(
-    readme,
-    /\$env:AUDIT_AGENT_DASHBOARD_TOKEN\s*=\s*'[^']+'/,
-    'README should set the Dashboard login token as a PowerShell environment variable',
-  );
+  assert.ok(readme.includes('Dashboard 页面可直接访问'));
   assert.doesNotMatch(readme, /"AUDIT_AGENT_DASHBOARD_TOKEN"\s*:/);
 });
 
@@ -65,7 +61,7 @@ test('Dokploy deployment guide covers required deployment, security, and recover
     '/health',
     'TLS',
     '/v1/ingest',
-    'https://<域名>/dashboard/login',
+    'https://<域名>/dashboard',
     'auditReview.visualization.baseUrl',
     'callback',
     '备份',

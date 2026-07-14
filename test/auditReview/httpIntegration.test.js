@@ -273,52 +273,32 @@ test('audit review HTTP integration smoke test', async () => {
   const bearerHeaders = { Authorization: 'Bearer test-token-123' };
 
   try {
-    // Browser login must not expose the shared token in form HTML or errors.
+    // Dashboard HTML is public; legacy login routes redirect back to the dashboard
+    // and must not expose the shared API token.
     {
       const loginPage = await fetch(`${baseUrl}/dashboard/login?token=test-token-123`);
       assert.equal(loginPage.status, 200);
-      const html = await loginPage.text();
-      assert.ok(html.includes('<form'));
-      assert.ok(html.includes('Dashboard 登录'));
-      assert.ok(html.includes('访问令牌'));
-      assert.equal(html.includes('test-token-123'), false);
-      assert.doesNotMatch(html, MOJIBAKE_PATTERN);
-    }
-
-    let dashboardCookie;
-    {
-      const failedLogin = await fetch(`${baseUrl}/dashboard/login`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        body: 'token=wrong-token',
-      });
-      assert.equal(failedLogin.status, 403);
-      assert.equal((await failedLogin.text()).includes('test-token-123'), false);
-
+      assert.equal(loginPage.url, `${baseUrl}/dashboard`);
       const login = await fetch(`${baseUrl}/dashboard/login`, {
         method: 'POST',
         redirect: 'manual',
         headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        body: 'token=test-token-123',
+        body: 'token=wrong-token',
       });
       assert.equal(login.status, 303);
       assert.equal(login.headers.get('location'), '/dashboard');
-      const setCookie = login.headers.get('set-cookie');
-      assert.match(setCookie, /HttpOnly/);
-      assert.match(setCookie, /SameSite=Lax/);
-      assert.equal(setCookie.includes('test-token-123'), false);
-      dashboardCookie = setCookie.split(';', 1)[0];
     }
 
     {
-      const dashboard = await fetch(`${baseUrl}/dashboard`, { headers: { cookie: dashboardCookie } });
+      const dashboard = await fetch(`${baseUrl}/dashboard`);
       assert.equal(dashboard.status, 200);
       assert.equal(dashboard.headers.get('cache-control'), 'no-store');
-      const dashboardWithSlash = await fetch(`${baseUrl}/dashboard/`, { headers: { cookie: dashboardCookie } });
+      const dashboardHtml = await dashboard.text();
+      assert.equal(dashboardHtml.includes('test-token-123'), false);
+      assert.doesNotMatch(dashboardHtml, MOJIBAKE_PATTERN);
+      const dashboardWithSlash = await fetch(`${baseUrl}/dashboard/`);
       assert.equal(dashboardWithSlash.status, 200);
       assert.equal(dashboardWithSlash.headers.get('cache-control'), 'no-store');
-      const apiWithCookie = await fetch(`${baseUrl}/v1/audit-reviews`, { headers: { cookie: dashboardCookie } });
-      assert.equal(apiWithCookie.status, 401);
       const apiWithBearer = await fetch(`${baseUrl}/v1/audit-reviews`, { headers: bearerHeaders });
       assert.equal(apiWithBearer.status, 200);
     }
@@ -327,10 +307,9 @@ test('audit review HTTP integration smoke test', async () => {
       const logout = await fetch(`${baseUrl}/dashboard/logout`, {
         method: 'POST',
         redirect: 'manual',
-        headers: { cookie: dashboardCookie },
       });
       assert.equal(logout.status, 303);
-      assert.equal(logout.headers.get('location'), '/dashboard/login');
+      assert.equal(logout.headers.get('location'), '/dashboard');
       assert.match(logout.headers.get('set-cookie'), /Max-Age=0/);
     }
 

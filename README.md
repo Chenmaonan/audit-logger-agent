@@ -23,13 +23,12 @@
 }
 ```
 
-`AUDIT_AGENT_DASHBOARD_TOKEN` 只从进程环境变量读取，用于登录 `http://127.0.0.1:9320/dashboard/login`；请使用高熵随机值，不要复用 LLM API Key。
+Dashboard 页面可直接访问，不需要登录。`AUDIT_AGENT_DASHBOARD_TOKEN` 只从进程环境变量读取，用于 `/v1/audit-*` API 的 Bearer 鉴权；如需调用这些 API，请使用高熵随机值，不要复用 LLM API Key。
 
 然后执行：
 
 ```powershell
 npm install
-$env:AUDIT_AGENT_DASHBOARD_TOKEN = '<使用高熵随机值>'
 npm run server -- --port 9320
 Invoke-RestMethod -Uri 'http://127.0.0.1:9320/health'
 ```
@@ -45,7 +44,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:9320/health'
 | `GET /report/daily` | 查看日报 |
 | `GET /report/errors` | 查看错误报表 |
 | `GET /report/tools` | 查看工具使用统计 |
-| `GET /dashboard/login` | 登录 Dashboard |
+| `GET /dashboard` | 查看 Dashboard |
 | `POST /v1/ingest` | 接收其他 Agent 的审计事件 |
 
 ## 文档
@@ -55,4 +54,4 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:9320/health'
 
 ## 运行边界
 
-`/v1/ingest` 当前没有内建认证。生产环境必须仅允许受控上游 Agent 或可信网关访问，不能直接暴露到公网。Dashboard 使用 `AUDIT_AGENT_DASHBOARD_TOKEN` 登录；部署细节见 Dokploy 说明。
+`/v1/ingest` 当前没有内建认证。生产环境必须仅允许受控上游 Agent 或可信网关访问，不能直接暴露到公网。Dashboard 页面本身不要求登录；部署时必须依赖反向代理、VPN、IP allowlist 或平台访问控制限制可见范围。部署细节见 Dokploy 说明。
