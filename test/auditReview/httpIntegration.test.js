@@ -45,6 +45,17 @@ function makeUpstreamEvent(overrides = {}) {
   };
 }
 
+async function waitFor(predicate, { timeoutMs = 1000, intervalMs = 10 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return predicate();
+}
+
+const MOJIBAKE_PATTERN = /(?:[涓楂椋闄浣淇鎴鍏椤瀵艰埅鐖璋鐩閾捐矾寤妯鏆棤鍙睍绀鐧诲綍璁块棶浠ょ墝鏇柊堕棿鎬昏澶氶潯佹嵁鏃瑙妫]{2,}|鈥\?|€�)/;
+
 test('audit review HTTP integration smoke test', async () => {
   // ------------------------------------------------------------------
   // 1. Build a real DB with runtime + review schema and seed audit_events
@@ -259,13 +270,70 @@ test('audit review HTTP integration smoke test', async () => {
   await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
   const { port } = app.address();
   const baseUrl = `http://127.0.0.1:${port}`;
+  const bearerHeaders = { Authorization: 'Bearer test-token-123' };
 
   try {
+    // Dashboard HTML is public; legacy login routes redirect back to the dashboard
+    // and must not expose the shared API token.
+    {
+      const loginPage = await fetch(`${baseUrl}/dashboard/login?token=test-token-123`);
+      assert.equal(loginPage.status, 200);
+      assert.equal(loginPage.url, `${baseUrl}/dashboard`);
+      const login = await fetch(`${baseUrl}/dashboard/login`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: 'token=wrong-token',
+      });
+      assert.equal(login.status, 303);
+      assert.equal(login.headers.get('location'), '/dashboard');
+    }
+
+    {
+      const root = await fetch(`${baseUrl}/`);
+      assert.equal(root.status, 200, 'GET / should render the agent index page');
+      assert.equal(root.headers.get('content-type'), 'text/html; charset=utf-8');
+      assert.equal(root.headers.get('cache-control'), 'no-store');
+      const rootHtml = await root.text();
+      assert.ok(rootHtml.includes('Agent 日志入口'), 'root page should contain the agent index title');
+      assert.ok(rootHtml.includes('agent-test'), 'root page should list received agent id');
+      assert.ok(rootHtml.includes('/dashboard?agent_id=agent-test'), 'root page should link agent to filtered dashboard');
+      assert.doesNotMatch(rootHtml, MOJIBAKE_PATTERN);
+
+      const dashboard = await fetch(`${baseUrl}/dashboard`);
+      assert.equal(dashboard.status, 200);
+      assert.equal(dashboard.headers.get('cache-control'), 'no-store');
+      const dashboardHtml = await dashboard.text();
+      assert.equal(dashboardHtml.includes('test-token-123'), false);
+      assert.doesNotMatch(dashboardHtml, MOJIBAKE_PATTERN);
+      const dashboardWithSlash = await fetch(`${baseUrl}/dashboard/`);
+      assert.equal(dashboardWithSlash.status, 200);
+      assert.equal(dashboardWithSlash.headers.get('cache-control'), 'no-store');
+      const agentDashboard = await fetch(`${baseUrl}/dashboard?agent_id=agent-test`);
+      assert.equal(agentDashboard.status, 200);
+      const agentDashboardHtml = await agentDashboard.text();
+      assert.ok(agentDashboardHtml.includes('Agent 日志审计：agent-test'));
+      assert.ok(agentDashboardHtml.includes('href="/" class="page-action'));
+      assert.doesNotMatch(agentDashboardHtml, MOJIBAKE_PATTERN);
+      const apiWithBearer = await fetch(`${baseUrl}/v1/audit-reviews`, { headers: bearerHeaders });
+      assert.equal(apiWithBearer.status, 200);
+    }
+
+    {
+      const logout = await fetch(`${baseUrl}/dashboard/logout`, {
+        method: 'POST',
+        redirect: 'manual',
+      });
+      assert.equal(logout.status, 303);
+      assert.equal(logout.headers.get('location'), '/dashboard');
+      assert.match(logout.headers.get('set-cookie'), /Max-Age=0/);
+    }
+
     // ------------------------------------------------------------------
-    // Case 1: GET /v1/audit-reviews before any run -> 200 with empty results
+    // Case 1: GET /v1/audit-reviews before any run -> 200 with Bearer auth
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/v1/audit-reviews`);
+      const res = await fetch(`${baseUrl}/v1/audit-reviews`, { headers: bearerHeaders });
       assert.equal(res.status, 200, 'GET /v1/audit-reviews should be 200');
       const body = await res.json();
       assert.equal(body.count, 0, 'should have zero runs');
@@ -316,7 +384,7 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /v1/audit-reviews -> new run listed
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/v1/audit-reviews`);
+      const res = await fetch(`${baseUrl}/v1/audit-reviews`, { headers: bearerHeaders });
       assert.equal(res.status, 200);
       const body = await res.json();
       assert.ok(body.count >= 1, 'should list at least 1 run');
@@ -328,7 +396,7 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /v1/audit-reviews/:reviewId -> 200
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/v1/audit-reviews/${reviewId}`);
+      const res = await fetch(`${baseUrl}/v1/audit-reviews/${reviewId}`, { headers: bearerHeaders });
       assert.equal(res.status, 200, 'GET review by id should be 200');
       const body = await res.json();
       assert.equal(body.review_id, reviewId, 'review_id should match');
@@ -339,7 +407,7 @@ test('audit review HTTP integration smoke test', async () => {
     // ------------------------------------------------------------------
     let findingId;
     {
-      const res = await fetch(`${baseUrl}/v1/audit-findings`);
+      const res = await fetch(`${baseUrl}/v1/audit-findings`, { headers: bearerHeaders });
       assert.equal(res.status, 200);
       const body = await res.json();
       assert.ok(body.count >= 1, 'should have at least 1 finding');
@@ -351,7 +419,7 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /v1/audit-findings/:findingId -> 200
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/v1/audit-findings/${findingId}`);
+      const res = await fetch(`${baseUrl}/v1/audit-findings/${findingId}`, { headers: bearerHeaders });
       assert.equal(res.status, 200, 'GET finding by id should be 200');
       const body = await res.json();
       assert.equal(body.finding_id, findingId, 'finding_id should match');
@@ -379,58 +447,77 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /dashboard -> 200 text/html with 审计 or Severity
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/dashboard`);
+      const res = await fetch(`${baseUrl}/dashboard`, { headers: bearerHeaders });
       assert.equal(res.status, 200, 'GET /dashboard should be 200');
       assert.equal(
         res.headers.get('content-type'),
         'text/html; charset=utf-8',
         'dashboard content-type should be text/html',
       );
+      assert.equal(res.headers.get('cache-control'), 'no-store');
       const html = await res.text();
       assert.ok(html.includes('<html'), 'dashboard html should contain <html');
-      assert.ok(
-        html.includes('Audit Review Overview') || html.includes('Review'),
-        'dashboard should contain Audit Review Overview or Review',
-      );
-      assert.equal(html.includes('Severity'), true, 'dashboard should contain Severity');
+      assert.ok(html.includes('审计审查总览'), 'dashboard should contain Chinese overview title');
+      assert.ok(html.includes('严重级别'), 'dashboard should contain Chinese severity label');
+      assert.equal(html.includes('Audit Review Overview'), false, 'dashboard should not contain English overview title');
+      assert.equal(html.includes('Severity'), false, 'dashboard should not contain English Severity');
       assert.equal(html.includes('Confidence'), false, 'dashboard should not contain English Confidence');
       assert.equal(html.includes('Data source'), false, 'dashboard should not contain Data source');
       assert.ok(html.includes('Trace ID'), 'dashboard should contain trace link column');
       assert.ok(html.includes('#trace_sequence'), 'dashboard should link trace ids to the finding trace sequence');
+      assert.doesNotMatch(html, MOJIBAKE_PATTERN);
+
+      const filtered = await fetch(`${baseUrl}/dashboard?agent_id=agent-test`, { headers: bearerHeaders });
+      assert.equal(filtered.status, 200, 'GET filtered agent dashboard should be 200');
+      const filteredHtml = await filtered.text();
+      assert.ok(filteredHtml.includes('Agent 日志审计：agent-test'), 'filtered dashboard should include agent title');
+      const filteredApi = await fetch(`${baseUrl}/v1/audit-findings?agent_id=agent-test`, { headers: bearerHeaders });
+      assert.equal(filteredApi.status, 200);
+      const filteredBody = await filteredApi.json();
+      assert.ok(filteredBody.count >= 1, 'filtered API should contain the agent finding');
+      assert.ok(filteredHtml.includes('待处理风险发现'), 'filtered dashboard should render the findings section');
+      assert.ok(filteredHtml.includes('agent-test'), 'filtered dashboard should contain the agent id');
+      assert.ok(filteredHtml.includes('db.delete'), 'filtered dashboard should contain the agent finding tool');
+      assert.doesNotMatch(filteredHtml, MOJIBAKE_PATTERN);
     }
 
     // ------------------------------------------------------------------
     // Case: GET /dashboard/audit-reviews/:reviewId -> 200 html
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/dashboard/audit-reviews/${reviewId}`);
+      const res = await fetch(`${baseUrl}/dashboard/audit-reviews/${reviewId}`, { headers: bearerHeaders });
       assert.equal(res.status, 200, 'GET dashboard review detail should be 200');
       assert.equal(res.headers.get('content-type'), 'text/html; charset=utf-8');
       const html = await res.text();
       assert.ok(html.includes('<html'), 'review detail html should contain <html');
+      assert.ok(html.includes('审查批次'), 'review detail should contain Chinese review title');
       assert.ok(html.includes('Trace ID'), 'review detail should contain trace link column');
       assert.ok(html.includes('#trace_sequence'), 'review detail should link trace ids to the finding trace sequence');
+      assert.doesNotMatch(html, MOJIBAKE_PATTERN);
     }
 
     // ------------------------------------------------------------------
     // Case: GET /dashboard/audit-findings/:findingId -> 200 html
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/dashboard/audit-findings/${findingId}`);
+      const res = await fetch(`${baseUrl}/dashboard/audit-findings/${findingId}`, { headers: bearerHeaders });
       assert.equal(res.status, 200, 'GET dashboard finding detail should be 200');
       assert.equal(res.headers.get('content-type'), 'text/html; charset=utf-8');
       const html = await res.text();
       assert.ok(html.includes('<html'), 'finding detail html should contain <html');
       assert.ok(html.includes('id="trace_sequence"'), 'finding detail should render trace sequence anchor');
-      assert.ok(html.includes('Tool call sequence'), 'finding detail should contain trace sequence section');
+      assert.ok(html.includes('工具调用顺序'), 'finding detail should contain Chinese trace sequence section');
       assert.equal(html.includes('id="trace_timeline"'), false, 'finding detail should not render old trace timeline table');
       assert.equal(html.includes('id="evidence_events"'), false, 'finding detail should not render old evidence table');
       assert.ok(html.includes('trace-del-1'), 'finding detail should contain the finding trace id');
       assert.ok(html.includes('db.delete'), 'finding detail should contain the trace tool call');
       assert.ok(html.includes('deleted 5 rows'), 'finding detail should contain the trace event summary');
-      assert.ok(html.includes('Raw log snippet'), 'finding detail should contain raw evidence log snippets');
+      assert.ok(html.includes('原始日志片段'), 'finding detail should contain Chinese raw evidence log snippets');
       assert.ok(html.includes('raw-log-pre'), 'finding detail should render raw snippets in preformatted blocks');
       assert.ok(html.includes('&quot;tool_name&quot;:&quot;db.delete&quot;'), 'raw snippet should preserve the original compact JSON field');
+      assert.equal(html.includes('Tool call sequence'), false, 'finding detail should not contain English trace sequence section');
+      assert.equal(html.includes('Raw log snippet'), false, 'finding detail should not contain English raw evidence label');
+      assert.doesNotMatch(html, MOJIBAKE_PATTERN);
       assert.equal(html.includes('置信度'), false, 'finding detail should not contain 置信度');
     }
 
@@ -438,7 +525,7 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /v1/audit-reviews/nonexistent -> 404
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/v1/audit-reviews/nonexistent`);
+      const res = await fetch(`${baseUrl}/v1/audit-reviews/nonexistent`, { headers: bearerHeaders });
       assert.equal(res.status, 404, 'GET nonexistent review should be 404');
       const body = await res.json();
       assert.equal(body.error_code, 'review_not_found', 'should be review_not_found');
@@ -448,7 +535,7 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /v1/audit-findings/nonexistent -> 404
     // ------------------------------------------------------------------
     {
-      const res = await fetch(`${baseUrl}/v1/audit-findings/nonexistent`);
+      const res = await fetch(`${baseUrl}/v1/audit-findings/nonexistent`, { headers: bearerHeaders });
       assert.equal(res.status, 404, 'GET nonexistent finding should be 404');
       const body = await res.json();
       assert.equal(body.error_code, 'finding_not_found', 'should be finding_not_found');
@@ -459,7 +546,7 @@ test('audit review HTTP integration smoke test', async () => {
     // ------------------------------------------------------------------
     {
       const res = await fetch(`${baseUrl}/v1/audit-reviews`, {
-        headers: { Origin: 'http://evil.test' },
+        headers: { ...bearerHeaders, Origin: 'http://evil.test' },
       });
       assert.equal(res.status, 200);
       assert.notEqual(
@@ -474,7 +561,7 @@ test('audit review HTTP integration smoke test', async () => {
     // ------------------------------------------------------------------
     {
       const res = await fetch(`${baseUrl}/v1/audit-reviews`, {
-        headers: { Origin: 'http://127.0.0.1:9320' },
+        headers: { ...bearerHeaders, Origin: 'http://127.0.0.1:9320' },
       });
       assert.equal(res.status, 200);
       assert.equal(
@@ -718,14 +805,15 @@ test('audit review ingests all events and sends mapped tool semantics to detecto
     assert.ok(spooled.includes('"event":"tool_end"'));
     assert.ok(spooled.includes(unknownTraceId));
 
-    const runResponse = await fetch(`${baseUrl}/v1/audit-reviews/run`, {
-      method: 'POST',
-      headers: { Authorization: 'Bearer test-token-123' },
-    });
-    assert.equal(runResponse.status, 202);
+    const sawCombinedAutoReview = await waitFor(() =>
+      capturedPayloads.some((payload) =>
+        payload.candidates.some((candidate) => candidate.trace_id === aliasTraceId) &&
+        payload.candidates.some((candidate) => candidate.trace_id === unknownTraceId)));
+    assert.equal(sawCombinedAutoReview, true);
 
-    assert.equal(capturedPayloads.length, 1);
-    const [payload] = capturedPayloads;
+    const payload = capturedPayloads.find((candidatePayload) =>
+      candidatePayload.candidates.some((candidate) => candidate.trace_id === aliasTraceId) &&
+      candidatePayload.candidates.some((candidate) => candidate.trace_id === unknownTraceId));
     assert.equal(payload.candidates.length, 2);
     assert.equal(payload.candidates[0].trace_id, aliasTraceId);
     assert.equal(payload.candidates[0].tool_name, 'db.delete');
@@ -733,6 +821,75 @@ test('audit review ingests all events and sends mapped tool semantics to detecto
     assert.equal(payload.candidates[0].mapped_tool_type, 'delete');
     assert.ok(payload.candidates.some((candidate) => candidate.trace_id === unknownTraceId));
     assert.ok(payload.candidates.every((candidate) => candidate.mapped_tool_type === 'delete'));
+  } finally {
+    app.close();
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('POST /v1/ingest triggers an audit review only when a batch is accepted', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-review-ingest-trigger-'));
+  const dbPath = path.join(tmpDir, 'test.db');
+  const db = openDb(dbPath);
+  ensureRuntimeSchema(db);
+  ensureReviewSchema(db);
+
+  const triggerCalls = [];
+  const app = createHttpApp({
+    db,
+    config: {
+      dbPath,
+      ingest: {
+        http: {
+          enabled: true,
+          maxBodyBytes: 1024 * 1024,
+          maxLineBytes: 64 * 1024,
+        },
+        spoolDir: path.join(tmpDir, 'incoming'),
+      },
+    },
+    scheduler: {
+      runAfterIngest() {
+        triggerCalls.push(Date.now());
+        return Promise.resolve({ status: 'completed' });
+      },
+    },
+  });
+
+  await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
+  const { port } = app.address();
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    const acceptedResponse = await fetch(`${baseUrl}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(makeUpstreamEvent({
+        ts: '2026-07-10T08:15:38.000Z',
+        trace_id: 'trace-trigger-review',
+      })),
+    });
+    assert.equal(acceptedResponse.status, 202);
+    assert.deepEqual(await acceptedResponse.json(), { accepted: 1, rejected: 0, errors: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(triggerCalls.length, 1);
+
+    const rejectedResponse = await fetch(`${baseUrl}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        ts: '2026-07-10T08:15:39.000Z',
+        agent_id: 'agent-test',
+        trace_id: 'trace-rejected',
+      }),
+    });
+    assert.equal(rejectedResponse.status, 202);
+    const rejectedBody = await rejectedResponse.json();
+    assert.equal(rejectedBody.accepted, 0);
+    assert.equal(rejectedBody.rejected, 1);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(triggerCalls.length, 1);
   } finally {
     app.close();
     db.close();

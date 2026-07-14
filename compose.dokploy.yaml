@@ -1,0 +1,35 @@
+name: audit-logger-agent
+
+services:
+  audit-logger-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    expose:
+      - "9320"
+    environment:
+      NODE_ENV: production
+      AUDIT_AGENT_CONFIG_PATH: /app/config.container.json
+      AUDIT_AGENT_BIND_HOST: 0.0.0.0
+      AUDIT_AGENT_LLM_API_KEY: ${AUDIT_AGENT_LLM_API_KEY:?AUDIT_AGENT_LLM_API_KEY must be set in Dokploy}
+      AUDIT_AGENT_LLM_MODEL: ${AUDIT_AGENT_LLM_MODEL:?AUDIT_AGENT_LLM_MODEL must be set in Dokploy}
+      AUDIT_AGENT_LLM_BASE_URL: ${AUDIT_AGENT_LLM_BASE_URL:?AUDIT_AGENT_LLM_BASE_URL must be set in Dokploy}
+      AUDIT_AGENT_LLM_TIMEOUT_MS: ${AUDIT_AGENT_LLM_TIMEOUT_MS:-30000}
+      AUDIT_AGENT_DASHBOARD_TOKEN: ${AUDIT_AGENT_DASHBOARD_TOKEN:-}
+    volumes:
+      - audit-logger-data:/app/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:9320/health').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  audit-logger-data:

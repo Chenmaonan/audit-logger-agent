@@ -1,0 +1,30 @@
+# Host-only dependency and source-control state
+node_modules/
+.git/
+
+# Runtime state; it is created under the persistent /app/data volume.
+data/
+logs/
+tmp/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Never copy local credentials or environment files into the image.
+.config
+config.json
+.npmrc
+.env
+.env.*
+*.pem
+*.key
+
+# Local agent/editor artifacts and test/documentation sources are not needed
+# by the explicit COPY instructions in Dockerfile.
+.agents/
+.claude/
+.superpowers/
+test/
+docs/
+README.md

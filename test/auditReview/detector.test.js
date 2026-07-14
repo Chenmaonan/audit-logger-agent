@@ -254,6 +254,56 @@ test('detect flags anomalous_call for unknown tool not in agent allowlist', () =
   assert.ok(anomalous.some((c) => c.event_id === 1), 'unknown tool should be anomalous_call');
 });
 
+test('detect flags traces with more than 50 tool-chain steps as anomalous', () => {
+  const db = makeDb();
+  for (let i = 1; i <= 51; i++) {
+    mk(db, i, {
+      ts: `2026-07-03T10:00:${String(i).padStart(2, '0')}.000Z`,
+      trace_id: 'trace-too-long',
+      span_id: `span-long-${i}`,
+      tool_name: `tool.${i}`,
+      status: 'OK',
+      event: 'tool.end',
+    });
+  }
+  mk(db, 100, {
+    ts: '2026-07-03T10:02:00.000Z',
+    trace_id: 'trace-at-limit',
+    span_id: 'span-limit',
+    tool_name: 'tool.limit',
+    status: 'OK',
+    event: 'tool.end',
+  });
+
+  const detector = createCandidateDetector({
+    db,
+    riskPolicy: {
+      version: 'risk-policy-v1',
+      repeatWindowMinutes: 10,
+      repeatThreshold: 5,
+      slowCallDurationMs: 30000,
+      highRiskToolPatterns: [],
+      agentToolAllowlists: {},
+      traceToolChainStepThreshold: 50,
+    },
+  });
+
+  const { candidates } = detector.detect({
+    windowFrom: '2026-07-03T10:00:00.000Z',
+    windowTo: '2026-07-03T10:30:00.000Z',
+    maxEventsPerReview: 500,
+  });
+
+  const anomalous = candidates.filter((c) => c.category === 'anomalous_call');
+  assert.ok(anomalous.some((c) => (
+    c.trace_id === 'trace-too-long'
+      && /51 tool-chain steps/.test(c.reason)
+      && /exceeds 50/.test(c.reason)
+      && c.min_severity === 'medium'
+  )));
+  assert.equal(anomalous.some((c) => c.trace_id === 'trace-at-limit'), false);
+});
+
 test('detect sees canonical event after upstream alias is normalized before insert', () => {
   const db = makeDb();
   mkNormalized(db, 1, {

@@ -8,6 +8,7 @@ import { openDb } from '../../scripts/lib/db.js';
 import { ensureReviewSchema } from '../../src/db/reviewSchema.js';
 import { createIngestCursorStore } from '../../src/auditReview/ingestCursorStore.js';
 import { createAuditIngestService } from '../../src/auditReview/ingestService.js';
+import { createRetentionService } from '../../src/auditReview/retention.js';
 import { createHttpApp } from '../../src/adapters/http/app.js';
 import { resolveSpoolDir } from '../../src/adapters/http/ingestRoute.js';
 
@@ -42,7 +43,10 @@ async function withIngestServer(fn, configOverrides = {}, dependencies = {}) {
   };
   const cursorStore = createIngestCursorStore(db);
   const ingestService = createAuditIngestService({ db, config, cursorStore });
-  const server = createHttpApp({ db, config, ...dependencies });
+  const resolvedDependencies = typeof dependencies === 'function'
+    ? dependencies({ db, config, cursorStore, ingestService })
+    : dependencies;
+  const server = createHttpApp({ db, config, ...resolvedDependencies });
 
   try {
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -64,6 +68,24 @@ async function withIngestServer(fn, configOverrides = {}, dependencies = {}) {
 function readSpool(config, agentId, date = '2026-07-06') {
   const file = path.join(config.ingest.spoolDir, agentId, `audit-${date}.jsonl`);
   return fs.readFileSync(file, 'utf-8');
+}
+
+function insertAuditEvent(db, event) {
+  db.prepare(`
+    INSERT INTO audit_events (
+      row_hash, ts, agent_id, trace_id, span_id, parent_span_id, event,
+      tool_name, status, result_summary, duration_ms, channel, user_id,
+      entity_type, entity_id, llm_intent_json, error_message, tags, raw_json
+    ) VALUES (
+      @row_hash, @ts, @agent_id, @trace_id, @span_id, NULL, @event,
+      @tool_name, @status, @result_summary, 1, NULL, NULL,
+      NULL, NULL, NULL, NULL, NULL, @raw_json
+    )
+  `).run({
+    row_hash: `seed-${event.trace_id}`,
+    raw_json: JSON.stringify(event),
+    ...event,
+  });
 }
 
 test('resolveSpoolDir defaults to the normalized spool layout', () => {
@@ -197,6 +219,52 @@ test('POST /v1/ingest accepts JSON event batches and stores them immediately', a
     assert.equal(ingestResult.inserted, 0);
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM audit_events').get().count, 2);
   });
+});
+
+test('POST /v1/ingest prunes audit events immediately after accepted batches', async () => {
+  await withIngestServer(async ({ baseUrl, db }) => {
+    insertAuditEvent(db, makeEvent({
+      ts: '2026-07-06T01:00:00.000Z',
+      trace_id: 'prune-oldest',
+      span_id: 'span-prune-oldest',
+    }));
+    insertAuditEvent(db, makeEvent({
+      ts: '2026-07-06T01:01:00.000Z',
+      trace_id: 'prune-middle',
+      span_id: 'span-prune-middle',
+    }));
+
+    const response = await fetch(`${baseUrl}/v1/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(makeEvent({
+        ts: '2026-07-06T01:02:00.000Z',
+        trace_id: 'prune-newest',
+        span_id: 'span-prune-newest',
+      })),
+    });
+
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), { accepted: 1, rejected: 0, errors: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(
+      db.prepare(`SELECT trace_id FROM audit_events WHERE agent_id = 'remote-agent' ORDER BY ts ASC`).all().map((row) => row.trace_id),
+      ['prune-middle', 'prune-newest'],
+    );
+  }, {
+    retention: {
+      eventsHours: 48,
+      maxEventsPerAgent: 2,
+    },
+  }, ({ db, config, cursorStore }) => ({
+    retentionService: createRetentionService({
+      db,
+      config,
+      cursorStore,
+      now: () => new Date('2026-07-06T01:03:00.000Z'),
+    }),
+  }));
 });
 
 test('POST /v1/ingest accepts NDJSON bodies and stores them immediately', async () => {

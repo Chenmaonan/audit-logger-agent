@@ -1,5 +1,6 @@
 {
-  "dbPath": "data/db/audit.db",
+  "dataDir": "/app/data",
+  "dbPath": "/app/data/db/audit.db",
   "agents": {},
   "ingest": {
     "http": {
@@ -7,11 +8,11 @@
       "maxBodyBytes": 1048576,
       "maxLineBytes": 65536
     },
-    "spoolDir": "data/spool/incoming"
+    "spoolDir": "/app/data/spool/incoming"
   },
-  "capturesDir": "data/captures",
-  "tmpDir": "data/tmp",
-  "logDir": "logs",
+  "capturesDir": "/app/data/captures",
+  "tmpDir": "/app/data/tmp",
+  "logDir": "/app/data/logs",
   "limits": {
     "maxLineBytes": 65536,
     "maxChunkBytes": 16777216,
@@ -44,15 +45,14 @@
     "lookbackOverlapMinutes": 5,
     "maxEventsPerReview": 500,
     "notification": {
-      "mode": "callback",
-      "callbackUrl": "http://127.0.0.1:9999/audit-review-events",
+      "enabled": false,
       "minSeverity": "medium",
       "sendEmptyReview": false
     },
     "http": {
-      "bindHost": "127.0.0.1",
+      "bindHost": "0.0.0.0",
       "requireDashboardToken": false,
-      "allowedOrigins": ["http://127.0.0.1:9320"]
+      "allowedOrigins": []
     },
     "riskPolicy": {
       "version": "risk-policy-v1",
@@ -107,7 +107,7 @@
     },
     "visualization": {
       "enabled": true,
-      "baseUrl": "http://127.0.0.1:9320",
+      "baseUrl": "",
       "dashboardPath": "/dashboard",
       "template": "audit-review-dashboard-v1",
       "attachDashboardUrlToFeishu": true

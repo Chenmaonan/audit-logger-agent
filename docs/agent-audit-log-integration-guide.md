@@ -14,93 +14,41 @@
 4. 网络错误、超时、非 2xx 或部分拒绝时，未确认事件进入本地重试队列，并在后续安全时机回放。
 5. 重试不会重新生成时间、链路 ID 或业务字段，也不会改变业务主流程的成功/失败结果。
 6. 可使用 `GET /query?trace_id=...` 查到一次完整请求或任务的事件链路。
+7. 查询结果中的 `mapped_tool_type` 和 `mapping_status` 不能是 `unknown`；出现 `unknown` 视为接入不合格，必须修正 `tool_name`。
 
 ## 2. 接入前先确认边界
 
-### 2.1 服务端并不要求预注册 Agent
+### 2.1 不需要预注册 Agent
 
 HTTP ingest 会接收任意符合格式且 `agent_id` 合法的事件。也就是说，**写入日志不需要先在服务端创建 Agent 记录**。
 
-但新 Agent 上线前仍应在审计服务的 `config.json` 中补充以下可选配置：
+改造 Agent 时必须保证：
 
-- `agents.<agent_id>.displayName`：Dashboard 和 Finding 中展示人类可读名称；未配置时直接显示 `agent_id`。
-- `auditReview.riskPolicy.agentToolAllowlists.<agent_id>`：该 Agent 的允许工具名列表。列表非空时，调用名单外工具会被标记为异常调用；它不阻止日志接收。
+- `agent_id` 是稳定的生产者 ID，例如 `catalog-agent`。
+- 同一个 Agent 在所有事件中使用同一个 `agent_id`。
+- `agent_id` 只包含字母、数字、`.`, `_`, `-`，不得包含路径片段或斜杠。
 
-示例：
+### 2.2 日志发送目标
 
-```json
-{
-  "agents": {
-    "catalog-agent": {
-      "displayName": "商品目录 Agent"
-    }
-  },
-  "auditReview": {
-    "riskPolicy": {
-      "agentToolAllowlists": {
-        "catalog-agent": [
-          "catalog.getProduct",
-          "catalog.updateProduct"
-        ]
-      }
-    }
-  }
-}
-```
-
-暂时无法列全工具时，可先使用空数组，后续再补齐。不要为了避免告警而填写不相关的工具名。
-
-### 2.2 网络与安全边界
-
-审计服务的默认监听地址是 `127.0.0.1`。同机部署时，上游地址应为：
+所有上游 Agent 必须把日志发送到审计服务的 ingest endpoint：
 
 ```text
-http://127.0.0.1:9320/v1/ingest
+http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me/v1/ingest
 ```
 
-跨机器部署时，由服务端运维人员在 `config.json` 设置受控私网监听地址：
-
-```json
-{
-  "auditReview": {
-    "http": {
-      "bindHost": "10.10.20.15"
-    }
-  }
-}
-```
-
-然后启动服务：
-
-```powershell
-npm run server -- --port 9320
-```
-
-上游使用：
-
-```text
-http://10.10.20.15:9320/v1/ingest
-```
-
-当前 `/v1/ingest` 没有内建认证。不要把它直接暴露到公网，也不要假设附加 `Authorization` 请求头就会被应用校验。跨主机时必须至少满足其一：
-
-- 上游和审计服务位于同一受控私网，并以防火墙或安全组限制来源；
-- 通过反向代理或网关提供 TLS、身份认证与来源限制，并且仅放行必要路由；
-- 使用受控 VPN、mTLS 或等效的网络身份边界。
-
-审计服务的 Dashboard 认证配置不等同于 ingest 认证，不能用 Dashboard Token 代替网络隔离。
+Agent 代码不得把该 URL 写死在业务调用点；必须从配置读取，便于不同环境覆盖。除非接入方明确提供网关认证要求，否则不要自行添加未在配置中声明的认证头或 Cookie。
 
 ## 3. 上游 Agent 必须新增的配置
 
-审计服务不强制上游使用某组环境变量名。新 Agent 应在自己的配置层定义等价配置，并让它们可由环境变量覆盖。推荐字段如下：
+Agent 必须在自己的配置层支持以下字段，并允许通过环境变量覆盖：
 
-| 建议配置 | 作用 | 推荐默认值 |
+| 配置 | 作用 | 必须行为 |
 | --- | --- | --- |
-| `AUDIT_INGEST_URL` | 审计服务的完整 ingest 地址 | 同机时 `http://127.0.0.1:9320/v1/ingest` |
-| `AUDIT_INGEST_TIMEOUT_MS` | 单次 HTTP 发送超时 | `1500` |
-| `AUDIT_RETRY_ENABLED` | 是否回放失败队列 | `true` |
-| `AUDIT_RETRY_MAX_BATCH` | 一次最多回放的事件数 | `50` |
-| `<AGENT>_AUDIT_LOG_DIR` | 本地审计日志和失败队列目录 | Agent 自己可写的持久目录 |
+| `AUDIT_INGEST_URL` | 审计服务的完整 ingest 地址 | 默认指向 `http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me/v1/ingest` |
+| `AUDIT_INGEST_TIMEOUT_MS` | 单次 HTTP 发送超时 | 默认 `1500`，必须解析为有限正整数 |
+| `AUDIT_RETRY_ENABLED` | 是否回放失败队列 | 默认 `true` |
+| `AUDIT_RETRY_MAX_BATCH` | 一次最多回放的事件数 | 默认 `50`，必须解析为有限正整数 |
+| `<AGENT>_AUDIT_LOG_DIR` | 本地审计日志和失败队列目录 | 必须指向 Agent 自己可写的持久目录 |
 
 这组配置是上游 Agent 的改造接口，不是审计服务自动读取的环境变量。已有 Agent 可以保留其现有变量命名，但语义必须一致。
 
@@ -114,6 +62,15 @@ http://10.10.20.15:9320/v1/ingest
 ## 4. 必须新增或统一的审计日志模块
 
 不要在业务调用点直接拼 HTTP 请求。为上游 Agent 新建或统一一个单独的 `auditLogger` 模块，并让所有运行时、工具和高风险操作经由它记录。
+
+可参考本机已有的两个初步改造实现，但不要要求目标 Agent 直接复制代码：
+
+| 参考 Agent | 可借鉴点 |
+| --- | --- |
+| `E:\工作空间\rental-price-agent-main\scripts\lib\audit-logger.js` | CommonJS 零依赖实现；本地 NDJSON、HTTP ingest、状态归一化、失败队列、`startSpan/endSpan` |
+| `E:\工作空间\MT-agent-master\src\observability\auditLogger.ts` | TypeScript 实现；`fetch` 发送、失败队列、`llm_intent`、`entity`、高风险改价链路 |
+| `E:\工作空间\rental-price-agent-main\scripts\sim-audit-drive.js` | 可运行的发送模拟，展示 batch/read/apply/verify 链路 |
+| `E:\工作空间\MT-agent-master\scripts\sim-audit-drive.ts` | 可运行的发送模拟，展示 preview/confirmed apply 高风险链路 |
 
 模块至少包含以下职责：
 
@@ -164,7 +121,7 @@ http://10.10.20.15:9320/v1/ingest
 | `ts` | 有效 ISO 8601 时间戳 | 创建一次后不可在重试时改写 |
 | `agent_id` | 非空字符串，仅可含字母、数字、`.`, `_`, `-` | 使用稳定生产者标识，例如 `catalog-agent`；禁止 `/`、`\\`、`.`、`..` 或任何路径片段 |
 | `trace_id` | 非空字符串 | 同一次用户请求或自治任务的全链路保持一致 |
-| `span_id` | 非空字符串 | 同一工具调用的开始和结束使用同一个值；建议 UUID |
+| `span_id` | 非空字符串 | 同一工具调用的开始和结束使用同一个值；使用 UUID 或等价唯一值 |
 | `event` | 字符串 | 新接入必须使用下文的 canonical 事件名 |
 | `tool_name` | 稳定的工具或运行组件名称 | 例如 `catalog.updateProduct`；禁止随机值、请求参数或自然语言句子 |
 | `status` | canonical gRPC code | 必须全大写，见下文状态码表 |
@@ -213,6 +170,42 @@ http://10.10.20.15:9320/v1/ingest
 
 如果业务结果很长，`result_summary` 只记录可审计摘要；大型产物保留在上游受控存储中，并通过稳定的 `entity` ID 或任务 ID 关联。
 
+### 5.4 服务端接收与映射要求
+
+服务端会先校验事件数据契约，再写入审计数据库。以下情况会导致该事件被拒收，并在 `/v1/ingest` 响应的 `rejected` 和 `errors` 中出现：
+
+| 拒收原因 | Agent 必须修正 |
+| --- | --- |
+| 缺少 `ts`、`agent_id`、`trace_id`、`span_id`、`event`、`tool_name`、`status`、`result_summary` 任一必填字段 | 在事件构造器统一补齐 |
+| `status` 不是 canonical 状态码 | 在发送前映射成本文状态码表中的值 |
+| `ts` 不是可解析的 ISO 8601 时间 | 使用 `new Date().toISOString()` 或等价格式 |
+| `result_summary` 超过 200 字符 | 发送前截断或改写为短摘要 |
+| 出现 `product_id`、`error.code` 或顶层 `error_code` | 改用 `entity`、canonical `status` 和 `error.message` |
+| `entity`、`llm_intent`、`tags` 类型不符合本文规则 | 发送前丢弃非法可选字段或修正结构 |
+| 单事件或 NDJSON 单行超过服务端大小限制 | 减少摘要内容，禁止塞完整请求、响应、HTML 或截图文本 |
+
+写入后，审计服务会根据 `tool_name` 生成工具语义映射字段，例如 `mapped_tool_type` 和 `mapping_status`。Agent 必须让 `tool_name` 能被稳定映射；如果最终映射为 `unknown`，虽然服务端可能已经接收该事件，但本接入验收应视为失败，因为风险发现和后续查询无法可靠理解该工具行为。
+
+`tool_name` 必须遵守：
+
+- 使用稳定、可复用的点号命名：`domain.action` 或 `domain.resource.action`。
+- 名称中体现真实语义，让服务端能映射到 `read`、`write`、`update`、`delete`、`deploy`、`permission`、`credential`、`shell`、`browser`、`network`、`database`、`file`、`notification` 或 `llm`，不要落到 `unknown`。
+- 读操作使用 `read`、`query`、`search`、`get`、`list`、`fetch` 等语义词，例如 `catalog.product.get`。
+- 写入/创建使用 `write`、`create`、`insert`、`save`、`append`，例如 `order.note.create`。
+- 更新使用 `update`、`patch`、`modify`、`edit`、`set`，例如 `rental.price.update`。
+- 删除使用 `delete`、`remove`、`destroy`、`drop`、`truncate`，例如 `inventory.item.delete`。
+- 部署使用 `deploy`、`release`、`publish`、`rollout`，例如 `service.deploy`。
+- 权限和凭证分别使用 `permission`、`role`、`policy`、`grant`、`revoke`，或 `credential`、`secret`、`token`、`api_key`、`password`。
+- Shell、浏览器、数据库、文件、通知、LLM 调用要在名称中显式包含对应语义词，例如 `shell.exec`、`browser.page.click`、`db.query`、`file.write`、`notification.send`、`llm.responses.create`。
+
+不要使用：
+
+- 随机值、自然语言句子、用户输入原文或动态 URL 作为 `tool_name`。
+- `doTask`、`run`、`handler`、`callback`、`process` 这类无法判断读写语义的泛名。
+- 同一工具在不同调用中变换命名。
+
+高风险动作必须拆分为可审计链路，而不是只记录一个模糊工具名。例如改价应拆成 `rental.priceApply.preview`、等待确认、`rental.priceApply`、`rental.priceApply.verify`；参考 `MT-agent-master` 的模拟链路。
+
 ## 6. 事件、状态与链路设计
 
 ### 6.1 新 Agent 应使用的事件名
@@ -237,7 +230,7 @@ ABORTED OUT_OF_RANGE UNIMPLEMENTED INTERNAL UNAVAILABLE DATA_LOSS UNAUTHENTICATE
 
 常用映射：
 
-| 场景 | 推荐状态 |
+| 场景 | 应使用状态 |
 | --- | --- |
 | 成功完成 | `OK` |
 | 用户取消、明确拒绝确认 | `CANCELLED` |
@@ -328,7 +321,7 @@ catalog.update.verify    -> 验证最终状态
 ### 8.2 回放规则
 
 - 回放原始事件，不重新生成 `ts`、`agent_id`、`trace_id`、`span_id`、`event` 或业务字段。
-- 建议保存原始序列化 payload，避免重试时字段排序、默认值或摘要发生变化。
+- 保存原始序列化 payload，避免重试时字段排序、默认值或摘要发生变化。
 - 服务端会对相同原始事件去重，因此投递语义应按 at-least-once 设计。
 - 每轮最多回放 `AUDIT_RETRY_MAX_BATCH` 条，避免异常时占满业务线程、网络或内存。
 - 队列持续增长、最早事件长期未发送、磁盘接近上限时必须告警。
@@ -345,29 +338,28 @@ catalog.update.verify    -> 验证最终状态
 6. 为写入、删除、部署、权限、凭证、Shell、浏览器脚本等高风险动作补齐预览、确认、执行、验证记录。
 7. 将旧字段转换为新格式：`product_id` 转为 `entity`，错误码转为 `status`，错误详情转为 `error.message`。
 8. 添加上游配置读取和校验，支持可配置 ingest URL、超时、队列批量和本地目录。
-9. 在审计服务 `config.json` 添加新 Agent 的显示名；工具清单明确后增加 allowlist。
-10. 实施下文的本地与部署验收，不要以 Docker 多服务演示替代验收。
+9. 实施下文验收，不要以 Docker 多服务演示替代真实发送验证。
 
 ## 10. 验收步骤
 
-### 10.1 启动并检查审计服务
+### 10.1 配置发送地址
 
-服务启动前，运维人员必须已通过未纳入 Git 的 `.config` 或环境变量提供 `AUDIT_AGENT_LLM_API_KEY` 和 `AUDIT_AGENT_LLM_MODEL`；缺少任一项时服务不会启动。`AUDIT_AGENT_LLM_BASE_URL` 和 `AUDIT_AGENT_LLM_TIMEOUT_MS` 可按实际 LLM 服务配置。
-
-在审计服务目录执行：
+Agent 必须从配置读取 ingest URL。验收时先把目标地址设置为审计服务 ingest endpoint：
 
 ```powershell
-npm run server -- --port 9320
-Invoke-RestMethod -Uri 'http://127.0.0.1:9320/health'
+$auditBaseUrl = 'http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me'
+$env:AUDIT_INGEST_URL = "$auditBaseUrl/v1/ingest"
 ```
 
-返回中应表明服务正常且数据库可写。
+如果目标 Agent 使用不同配置名，也必须映射到同一个 URL 语义：完整的 HTTP ingest 地址，而不是服务基地址或查询地址。
 
 ### 10.2 发送最小事件
 
 以下 PowerShell 示例可验证服务端契约。请将 `catalog-agent` 替换为新 Agent 的稳定 ID：
 
 ```powershell
+$auditBaseUrl = 'http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me'
+$env:AUDIT_INGEST_URL = "$auditBaseUrl/v1/ingest"
 $traceId = "integration-$([guid]::NewGuid().ToString('N'))"
 $event = @{
   ts = (Get-Date).ToUniversalTime().ToString('o')
@@ -382,7 +374,7 @@ $event = @{
 } | ConvertTo-Json -Compress
 
 $response = Invoke-RestMethod -Method Post `
-  -Uri 'http://127.0.0.1:9320/v1/ingest' `
+  -Uri $env:AUDIT_INGEST_URL `
   -ContentType 'application/json' `
   -Body $event
 
@@ -396,10 +388,16 @@ if ($response.accepted -ne 1 -or $response.rejected -ne 0) {
 在同一 PowerShell 会话中执行：
 
 ```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:9320/query?trace_id=$traceId&limit=100"
+Invoke-RestMethod -Uri "$auditBaseUrl/query?trace_id=$traceId&limit=100"
 ```
 
 返回应包含刚发送的事件。随后用真实 Agent 执行一次完整工具调用，确认相同 `trace_id` 下同时出现 `tool.start` 与 `tool.end` 或 `tool.error`。
+
+验收时还必须检查查询结果中的工具语义映射字段：
+
+- `mapped_tool_type` 不应为 `unknown`，除非该工具确实没有可判断语义。
+- `mapping_status` 不应为 `unknown`。
+- 如果出现 `unknown`，修改 Agent 的 `tool_name`，不要通过改 `result_summary` 或添加自然语言解释规避。
 
 ### 10.4 验证失败回放
 
@@ -412,13 +410,13 @@ Invoke-RestMethod -Uri "http://127.0.0.1:9320/query?trace_id=$traceId&limit=100"
 
 | 现象 | 原因与处理 |
 | --- | --- |
-| `404` | `ingest.http.enabled` 为 `false`，或 URL 路径不是 `/v1/ingest` |
+| `404` | URL 路径不是 `/v1/ingest`，或接入地址不是审计服务 ingest endpoint |
 | `400` | JSON 结构不合法；检查必填字段、ISO 时间、状态码、`entity`、`llm_intent` 与 `result_summary` 长度 |
 | `413` | 请求超过 `maxBodyBytes`；拆分批次，不能截断单个 JSON 事件 |
 | `415` | `Content-Type` 不是 `application/json` 或 `application/x-ndjson` |
 | `202` 但 `rejected > 0` | 批次部分拒绝；逐条处理 `errors`，未确认事件不能删除 |
 | 收到 `202` 但查不到工具语义 | 语义映射异步执行；先确认事件已存在，稍后再查看映射结果 |
-| 重试队列持续增长 | 检查 URL、DNS、网络策略、服务健康、超时、服务端大小限制和 payload 合法性 |
+| 重试队列持续增长 | 检查 URL、DNS、网络连通性、超时、服务端大小限制和 payload 合法性 |
 | `agent_id is invalid` | 使用稳定 ID；不得包含路径、空值、`.`、`..` 或斜杠 |
 
 ## 12. 交付物
@@ -429,11 +427,5 @@ Invoke-RestMethod -Uri "http://127.0.0.1:9320/query?trace_id=$traceId&limit=100"
 - 对请求、任务和工具执行点的审计埋点；
 - 本地日志、失败队列和有限回放机制；
 - 覆盖成功发送、字段拒绝、超时/网络失败、队列回放与 trace 查询的测试；
-- 审计服务中该 Agent 的显示名和已确认工具 allowlist（若已具备工具清单）。
 
-完成后，编码 Agent 应在交付说明中报告：实际 `agent_id`、ingest URL 部署方式、日志目录、重试策略、验证所用 `trace_id`，以及任何暂未配置的网络认证或工具白名单项。
-
-## 相关文档
-
-- [README：项目概览与部署入口](../README.md#接入与部署)
-- [其他 Agent 服务化接入改造方案](other-agent-server-integration-plan-2026-07-07.md)
+完成后，编码 Agent 应在交付说明中报告：实际 `agent_id`、实际 ingest URL、日志目录、重试策略和验证所用 `trace_id`。

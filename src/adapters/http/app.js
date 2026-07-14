@@ -147,12 +147,22 @@ function auditJson(res, status, data, corsHeaders) {
 function html(res, status, body, corsHeaders) {
   const headers = {
     'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'no-store',
     'access-control-allow-methods': 'GET, OPTIONS',
     'access-control-allow-headers': 'content-type, authorization',
   };
   Object.assign(headers, corsHeaders ?? {});
   res.writeHead(status, headers);
   res.end(body);
+}
+
+function redirect(res, location, headers = {}) {
+  res.writeHead(303, {
+    location,
+    'cache-control': 'no-store',
+    ...headers,
+  });
+  res.end();
 }
 
 // Map dashboardAuth authorize failures to HTTP status + body.
@@ -250,7 +260,7 @@ function mapRuntimeError(error) {
   return { status: 500, body: { error_code: 'internal_error', error: 'Internal server error' } };
 }
 
-export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth, toolSemanticMapper, now = () => new Date() } = {}) {
+export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth, toolSemanticMapper, retentionService, now = () => new Date() } = {}) {
   // Helpers for audit-review routes. These are optional — if not provided
   // (e.g. in the existing runs-api test), the new routes return 503.
   const hasReviewDeps = !!(scheduler && reviewStore && visualization && dashboardAuth);
@@ -268,10 +278,26 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
     }
 
     try {
+      // ===================== Dashboard Browser Login =====================
+      if (hasReviewDeps && req.method === 'GET' && url.pathname === '/dashboard/login') {
+        redirect(res, '/dashboard');
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'POST' && url.pathname === '/dashboard/login') {
+        redirect(res, '/dashboard');
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'POST' && url.pathname === '/dashboard/logout') {
+        redirect(res, '/dashboard', { 'set-cookie': dashboardAuth.clearSessionCookie(req) });
+        return;
+      }
+
       // ===================== Audit Review API (v1.4) =====================
       if (hasReviewDeps && req.method === 'GET' && url.pathname === '/v1/audit-reviews') {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeApi(req);
         const fail = mapAuthFailure(auth);
         if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
         const { limit, offset } = paginationFromUrl(url, { defaultLimit: 50, config });
@@ -282,7 +308,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/v1/audit-reviews/') && url.pathname !== '/v1/audit-reviews/run') {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeApi(req);
         const fail = mapAuthFailure(auth);
         if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
         const reviewId = decodeURIComponent(url.pathname.split('/').pop());
@@ -294,7 +320,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (hasReviewDeps && req.method === 'GET' && url.pathname === '/v1/audit-findings') {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeApi(req);
         const fail = mapAuthFailure(auth);
         if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
         const { limit, offset } = paginationFromUrl(url, { defaultLimit: 100, config });
@@ -311,7 +337,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/v1/audit-findings/')) {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeApi(req);
         const fail = mapAuthFailure(auth);
         if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
         const findingId = decodeURIComponent(url.pathname.split('/').pop());
@@ -323,7 +349,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (hasReviewDeps && req.method === 'POST' && url.pathname === '/v1/audit-reviews/run') {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: true });
+        const auth = dashboardAuth.authorizeApi(req);
         const fail = mapAuthFailure(auth);
         if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
         try {
@@ -340,19 +366,32 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
       }
 
       // ===================== Dashboard Pages (v1.4) =====================
-      if (hasReviewDeps && req.method === 'GET' && url.pathname === '/dashboard') {
+      if (hasReviewDeps && req.method === 'GET' && (url.pathname === '/' || url.pathname === '')) {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeDashboard(req);
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
-        const page = visualization.overviewPage();
+        const page = typeof visualization.agentIndexPage === 'function'
+          ? visualization.agentIndexPage()
+          : visualization.overviewPage();
+        html(res, 200, renderDashboard(page), cors);
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'GET' && (url.pathname === '/dashboard' || url.pathname === '/dashboard/')) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeDashboard(req);
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
+        const agentId = url.searchParams.get('agent_id') || undefined;
+        const page = visualization.overviewPage({ agentId });
         html(res, 200, renderDashboard(page), cors);
         return;
       }
 
       if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/dashboard/audit-reviews/')) {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeDashboard(req);
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
         const reviewId = decodeURIComponent(url.pathname.split('/').pop());
@@ -365,7 +404,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
 
       if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/dashboard/audit-findings/')) {
         const cors = reviewCors(req);
-        const auth = dashboardAuth.authorize(req, { isWrite: false });
+        const auth = dashboardAuth.authorizeDashboard(req);
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
         const findingId = decodeURIComponent(url.pathname.split('/').pop());
@@ -395,7 +434,24 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
       }
 
       if (req.method === 'POST' && url.pathname === '/v1/ingest' && isHttpIngestEnabled(config)) {
-        await handleIngestRoute(req, res, { config, db, toolSemanticMapper });
+        await handleIngestRoute(req, res, {
+          config,
+          db,
+          toolSemanticMapper,
+          onAcceptedBatch: () => {
+            if (typeof retentionService?.pruneAuditEvents === 'function') {
+              try {
+                retentionService.pruneAuditEvents();
+              } catch {
+                // Retention failures must not block review scheduling.
+              }
+            }
+            if (typeof scheduler?.runAfterIngest === 'function') {
+              return scheduler.runAfterIngest();
+            }
+            return undefined;
+          },
+        });
         return;
       }
 

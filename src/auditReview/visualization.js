@@ -7,61 +7,72 @@
 
 // src/auditReview/visualization.js
 // Build direct-data view models for the dashboard pages.
-// The template receives fully-populated sections (rows/items/links) 鈥?no browser-side fetch.
+// The template receives fully-populated sections (rows/items/links) - no browser-side fetch.
 
-const SEVERITY_LABELS = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low' };
+const SEVERITY_LABELS = { critical: '严重', high: '高风险', medium: '中风险', low: '低风险' };
 const STATUS_LABELS = {
-  open: 'Open',
-  acknowledged: 'Acknowledged',
-  snoozed: 'Snoozed',
-  resolved: 'Resolved',
-  completed: 'Completed',
-  completed_degraded: 'Completed degraded',
-  failed: 'Failed',
-  running: 'Running',
-  skipped: 'Skipped',
-  OK: 'OK',
-  INTERNAL: 'Internal',
+  open: '待处理',
+  acknowledged: '已确认',
+  snoozed: '已暂缓',
+  resolved: '已解决',
+  completed: '已完成',
+  completed_degraded: '降级完成',
+  failed: '失败',
+  running: '运行中',
+  skipped: '已跳过',
+  OK: '正常',
+  INTERNAL: '内部错误',
 };
 const CATEGORY_LABELS = {
-  high_risk_permission: 'High risk permission',
-  anomalous_call: 'Anomalous call',
-  repeated_call: 'Repeated call',
-  failed_call: 'Failed call',
-  trace_integrity: 'Trace integrity',
-  ingest_parse_error: 'Ingest parse error',
+  high_risk_permission: '高风险权限',
+  anomalous_call: '异常调用',
+  repeated_call: '重复调用',
+  failed_call: '失败调用',
+  trace_integrity: '链路完整性',
+  ingest_parse_error: '日志解析错误',
 };
+const TRACE_DISPLAY_STEP_LIMIT = 20;
+const TRACE_ANALYSIS_STEP_LIMIT = 20;
+const TRACE_ABNORMAL_STEP_THRESHOLD = 50;
 
 const OVERVIEW_FINDINGS_COLUMNS = [
-  { key: 'title', label: 'Title' },
-  { key: 'severity_label', label: 'Severity' },
-  { key: 'category_label', label: 'Category' },
+  { key: 'title', label: '标题' },
+  { key: 'severity_label', label: '严重级别' },
+  { key: 'category_label', label: '类别' },
   { key: 'agent_name', label: 'Agent' },
-  { key: 'tool_name', label: 'Tool' },
+  { key: 'tool_name', label: '工具' },
   { key: 'trace_id', label: 'Trace ID' },
-  { key: 'status', label: 'Status' },
-  { key: 'review_id', label: 'Review ID' },
-  { key: 'last_seen_at', label: 'Last seen' },
+  { key: 'status', label: '状态' },
+  { key: 'review_id', label: '审查批次' },
+  { key: 'last_seen_at', label: '最后出现' },
 ];
 
 const REVIEW_FINDINGS_COLUMNS = [
-  { key: 'title', label: 'Title' },
-  { key: 'severity_label', label: 'Severity' },
-  { key: 'category_label', label: 'Category' },
+  { key: 'title', label: '标题' },
+  { key: 'severity_label', label: '严重级别' },
+  { key: 'category_label', label: '类别' },
   { key: 'agent_name', label: 'Agent' },
-  { key: 'tool_name', label: 'Tool' },
+  { key: 'tool_name', label: '工具' },
   { key: 'trace_id', label: 'Trace ID' },
-  { key: 'status', label: 'Status' },
-  { key: 'evidence_count', label: 'Evidence' },
+  { key: 'status', label: '状态' },
+  { key: 'evidence_count', label: '证据' },
 ];
 
 const REVIEWS_TABLE_COLUMNS = [
-  { key: 'review_id', label: 'Review ID' },
-  { key: 'status_label', label: 'Status' },
-  { key: 'time_window', label: 'Window' },
-  { key: 'finding_count', label: 'Findings' },
-  { key: 'trigger_type', label: 'Trigger' },
-  { key: 'finished_at', label: 'Finished at' },
+  { key: 'review_id', label: '审查批次' },
+  { key: 'status_label', label: '状态' },
+  { key: 'time_window', label: '时间窗口' },
+  { key: 'finding_count', label: '发现数' },
+  { key: 'trigger_type', label: '触发方式' },
+  { key: 'finished_at', label: '完成时间' },
+];
+
+const AGENT_INDEX_COLUMNS = [
+  { key: 'agent_id', label: 'Agent ID' },
+  { key: 'event_count', label: '接收日志数' },
+  { key: 'open_finding_count', label: '待处理发现' },
+  { key: 'finding_count', label: '累计发现' },
+  { key: 'last_event_at', label: '最新日志时间' },
 ];
 
 const TRACE_ANALYSIS_SYSTEM_PROMPT = [
@@ -157,8 +168,9 @@ function statusTone(status) {
 }
 
 function triggerLabel(triggerType) {
-  if (triggerType === 'scheduled') return 'Scheduled';
-  if (triggerType === 'manual') return 'Manual';
+  if (triggerType === 'scheduled') return '定时审查';
+  if (triggerType === 'manual') return '手动触发';
+  if (triggerType === 'ingest') return '接收日志';
   return triggerType ?? '-';
 }
 
@@ -219,7 +231,7 @@ function lastSeenAtOf(finding) {
 }
 
 function traceSequenceSteps(events) {
-  return orderedTraceEvents(events).map((event, index) => ({
+  return orderedTraceEvents(events).slice(0, TRACE_DISPLAY_STEP_LIMIT).map((event, index) => ({
     order: index + 1,
     timestamp: formatTime(event.ts),
     event: event.event ?? '',
@@ -255,6 +267,7 @@ function compactTraceEventForLlm(event, index) {
 
 function buildTraceAnalysisInput({ finding, traceEvents }) {
   const orderedEvents = orderedTraceEvents(traceEvents);
+  const analysisEvents = orderedEvents.slice(0, TRACE_ANALYSIS_STEP_LIMIT);
   const payload = {
     finding: {
       finding_id: finding.finding_id ?? null,
@@ -273,7 +286,10 @@ function buildTraceAnalysisInput({ finding, traceEvents }) {
           : null
       ),
     },
-    trace_events: orderedEvents.map(compactTraceEventForLlm),
+    trace_event_count: orderedEvents.length,
+    analyzed_trace_event_count: analysisEvents.length,
+    trace_events_truncated: orderedEvents.length > analysisEvents.length,
+    trace_events: analysisEvents.map(compactTraceEventForLlm),
   };
 
   return [
@@ -300,18 +316,18 @@ function localTraceChainSummary(traceEvents) {
   const orderedEvents = orderedTraceEvents(traceEvents);
   if (orderedEvents.length === 0) return '';
   const chain = orderedEvents.map((event, index) => {
-    const toolName = event.tool_name ?? 'unknown tool';
-    const eventName = event.event ?? 'unknown event';
-    const status = labelOf(STATUS_LABELS, event.status) || event.status || 'unknown status';
+    const toolName = event.tool_name ?? '未知工具';
+    const eventName = event.event ?? '未知事件';
+    const status = labelOf(STATUS_LABELS, event.status) || event.status || '未知状态';
     return `${index + 1}. ${toolName} ${eventName}: ${status}`;
   }).join(' -> ');
   const errors = orderedEvents.map((event) => event.error_message).filter(isPresent);
   const lastError = errors[errors.length - 1];
-  return lastError ? `Trace sequence: ${chain}. Last error: ${lastError}` : `Trace sequence: ${chain}`;
+  return lastError ? `调用链路：${chain}。最后错误：${lastError}` : `调用链路：${chain}`;
 }
 
 function normalizeTraceAnalysis(raw, traceEvents = []) {
-  if (!raw || typeof raw !== 'object') throw new Error('LLM 閾捐矾鍒嗘瀽缁撴灉涓嶆槸瀵硅薄');
+  if (!raw || typeof raw !== 'object') throw new Error('LLM 链路分析结果不是对象');
   const analysis = {
     purpose: boundedText(raw.purpose, 300),
     chain_summary: boundedText(raw.chain_summary, 500) || localTraceChainSummary(traceEvents),
@@ -319,7 +335,7 @@ function normalizeTraceAnalysis(raw, traceEvents = []) {
     next_actions: boundedTextList(raw.next_actions, { maxItems: 5, maxLength: 220 }),
   };
   if (!isPresent(analysis.purpose) && !isPresent(analysis.chain_summary)) {
-    throw new Error('LLM 閾捐矾鍒嗘瀽缂哄皯 purpose 鎴?chain_summary');
+    throw new Error('LLM 链路分析缺少 purpose 或 chain_summary');
   }
   return analysis;
 }
@@ -338,7 +354,7 @@ function isFreshAnalysisCache(finding) {
 function traceAnalysisSection({ analysis, model }) {
   return {
     id: 'trace_llm_analysis',
-    title: 'LLM trace analysis',
+    title: 'LLM 链路分析',
     type: 'trace_analysis',
     model,
     ...analysis,
@@ -348,10 +364,26 @@ function traceAnalysisSection({ analysis, model }) {
 function traceAnalysisUnavailableSection(message) {
   return {
     id: 'trace_llm_analysis',
-    title: 'LLM analysis unavailable',
+    title: 'LLM 分析不可用',
     type: 'callout',
     body: message,
   };
+}
+
+function traceAbnormalSection(totalSteps) {
+  return {
+    id: 'trace_sequence_abnormal',
+    title: '异常情况',
+    type: 'callout',
+    body: `该 Trace 工具链共 ${totalSteps} 步，超过 ${TRACE_ABNORMAL_STEP_THRESHOLD} 步阈值。Dashboard 仅展示前 ${TRACE_DISPLAY_STEP_LIMIT} 步，LLM 链路分析不会继续调用。`,
+  };
+}
+
+function traceSequenceTitle(totalSteps, visibleSteps) {
+  if (totalSteps > visibleSteps) {
+    return `工具调用顺序（显示前 ${visibleSteps} 步，共 ${totalSteps} 步）`;
+  }
+  return `工具调用顺序（共 ${visibleSteps} 步）`;
 }
 
 function insertSectionAfter(sections, anchorId, section) {
@@ -384,17 +416,29 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     return `${dashboardPath}/audit-findings/${encodeURIComponent(findingId)}`;
   }
 
-  function countOpenFindingsBySeverity() {
+  function agentDashboardUrl(agentId) {
+    return `${dashboardPath}?agent_id=${encodeURIComponent(agentId)}`;
+  }
+
+  function countOpenFindingsBySeverity(filters = {}) {
     const counts = { critical: 0, high: 0, medium: 0, low: 0 };
     try {
       for (const severity of Object.keys(counts)) {
-        const rows = reviewStore.listFindings({ limit: 1000, severity, status: 'open' });
+        const rows = reviewStore.listFindings({ limit: 1000, severity, status: 'open', ...filters });
         counts[severity] = Array.isArray(rows) ? rows.length : 0;
       }
     } catch {
       // reviewStore may throw or return a non-array count; keep zero defaults.
     }
     return counts;
+  }
+
+  function listAgents(limit = 1000) {
+    try {
+      return reviewStore.listAgents?.({ limit }) ?? [];
+    } catch {
+      return [];
+    }
   }
 
   function getDeadLetterCount() {
@@ -503,65 +547,164 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     return events
       .filter((event) => isPresent(event?.raw_json))
       .map((event) => ({
-        label: `Log ID ${event.id}`,
+        label: `日志 ID ${event.id}`,
         body: event.raw_json,
       }));
   }
 
-  function overviewPage() {
-    const openBySev = countOpenFindingsBySeverity();
+  function agentIndexPage() {
+    const agents = listAgents(1000);
+    const updatedAt = nowIso();
+    const totalEvents = agents.reduce((sum, agent) => sum + (Number(agent?.event_count) || 0), 0);
+    const openFindings = agents.reduce((sum, agent) => sum + (Number(agent?.open_finding_count) || 0), 0);
+    const totalFindings = agents.reduce((sum, agent) => sum + (Number(agent?.finding_count) || 0), 0);
+
+    const rows = agents.map((agent) => ({
+      agent_id: {
+        text: agent.agent_id ?? '',
+        href: agent.agent_id ? agentDashboardUrl(agent.agent_id) : undefined,
+        mono: true,
+      },
+      event_count: {
+        text: String(agent.event_count ?? 0),
+        href: agent.agent_id ? agentDashboardUrl(agent.agent_id) : undefined,
+        mono: true,
+      },
+      open_finding_count: {
+        text: String(agent.open_finding_count ?? 0),
+        tone: Number(agent.open_finding_count ?? 0) > 0 ? 'high' : 'success',
+      },
+      finding_count: {
+        text: String(agent.finding_count ?? 0),
+        mono: true,
+      },
+      last_event_at: {
+        text: formatTime(agent.last_event_at),
+        mono: true,
+      },
+    }));
+
+    const sections = rows.length > 0
+      ? [{
+          id: 'received_agents',
+          title: '已接收日志的 Agent',
+          type: 'table',
+          columns: AGENT_INDEX_COLUMNS,
+          rows,
+        }]
+      : [{
+          id: 'empty_agents',
+          title: '暂无 Agent 日志',
+          type: 'callout',
+          body: '当前数据库还没有接收到任何 Agent 日志。日志写入后，这里会展示对应的 Agent ID。',
+        }];
+
+    return {
+      page: {
+        title: 'Agent 日志入口',
+        subtitle: '选择已接收日志的 Agent，进入对应的日志审计结果。',
+        updated_at: updatedAt,
+        breadcrumbs: [{ label: 'Agent 列表', href: '/' }],
+        context_badges: [
+          { label: `Agent ${agents.length}`, tone: 'neutral' },
+          { label: `待处理发现 ${openFindings}`, tone: openFindings > 0 ? 'high' : 'neutral' },
+        ],
+        page_actions: [{ label: '查看全部审计', href: dashboardPath, kind: 'secondary' }],
+      },
+      summary_metrics: [
+        { label: 'Agent 数', value: agents.length, tone: 'neutral' },
+        { label: '接收日志', value: totalEvents, tone: 'neutral' },
+        { label: '待处理发现', value: openFindings, tone: openFindings > 0 ? 'high' : 'success' },
+        { label: '累计发现', value: totalFindings, tone: totalFindings > 0 ? 'medium' : 'neutral' },
+      ],
+      filters: [],
+      sections,
+    };
+  }
+
+  function overviewPage({ agentId } = {}) {
+    const findingFilters = agentId ? { agentId } : {};
+    const openBySev = countOpenFindingsBySeverity(findingFilters);
     const deadLetters = getDeadLetterCount();
     const runs = listRuns(20);
-    const findings = listFindings(1000).slice().sort(compareFindings);
+    const findings = listFindings(1000, findingFilters).slice().sort(compareFindings);
+    const relevantReviewIds = agentId
+      ? new Set(findings.map((finding) => finding?.review_id).filter(isPresent))
+      : null;
+    const visibleRuns = relevantReviewIds
+      ? runs.filter((run) => relevantReviewIds.has(run?.review_id))
+      : runs;
     const updatedAt = nowIso();
     const openFindingTotal = Object.values(openBySev).reduce((sum, count) => sum + count, 0);
-    const latestRun = runs[0] ?? null;
+    const latestRun = visibleRuns[0] ?? null;
+    const severityHref = (severity) => {
+      const params = new URLSearchParams();
+      if (agentId) params.set('agent_id', agentId);
+      params.set('severity', severity);
+      return `${dashboardPath}?${params.toString()}#pending_findings`;
+    };
 
     const summary_metrics = [
-      { label: SEVERITY_LABELS.critical, value: openBySev.critical, tone: 'critical', href: `${dashboardPath}?severity=critical#pending_findings` },
-      { label: SEVERITY_LABELS.high, value: openBySev.high, tone: 'high', href: `${dashboardPath}?severity=high#pending_findings` },
-      { label: SEVERITY_LABELS.medium, value: openBySev.medium, tone: 'medium', href: `${dashboardPath}?severity=medium#pending_findings` },
-      { label: SEVERITY_LABELS.low, value: openBySev.low, tone: 'low', href: `${dashboardPath}?severity=low#pending_findings` },
-      { label: 'Dead letters', value: deadLetters, tone: deadLetters > 0 ? 'critical' : 'neutral', href: `${dashboardPath}#dead_letters` },
+      { label: SEVERITY_LABELS.critical, value: openBySev.critical, tone: 'critical', href: severityHref('critical') },
+      { label: SEVERITY_LABELS.high, value: openBySev.high, tone: 'high', href: severityHref('high') },
+      { label: SEVERITY_LABELS.medium, value: openBySev.medium, tone: 'medium', href: severityHref('medium') },
+      { label: SEVERITY_LABELS.low, value: openBySev.low, tone: 'low', href: severityHref('low') },
+      { label: '死信消息', value: deadLetters, tone: deadLetters > 0 ? 'critical' : 'neutral', href: `${dashboardPath}#dead_letters` },
     ];
 
     const context_badges = [];
     if (latestRun) {
       context_badges.push({
-        label: `Latest run: ${labelOf(STATUS_LABELS, latestRun.status)}`,
+        label: `最新审查：${labelOf(STATUS_LABELS, latestRun.status)}`,
         tone: statusTone(latestRun.status),
       });
     }
     context_badges.push({
-      label: `Open findings: ${openFindingTotal}`,
+      label: `${agentId ? '当前 Agent ' : ''}待处理发现：${openFindingTotal}`,
       tone: openFindingTotal > 0 ? 'high' : 'neutral',
     });
+    if (agentId) {
+      context_badges.unshift({
+        label: `Agent：${agentId}`,
+        tone: 'neutral',
+      });
+    }
     if (deadLetters > 0) {
       context_badges.push({
-        label: `Dead letters: ${deadLetters}`,
+        label: `死信消息：${deadLetters}`,
         tone: 'critical',
       });
     }
 
     const page_actions = [];
-    const latestRunWithFindings = runs.find((run) => (run?.finding_count ?? 0) > 0 && run?.review_id);
-    if (latestRunWithFindings) {
+    if (agentId) {
       page_actions.push({
-        label: 'Open latest review with findings',
+        label: '返回 Agent 列表',
+        href: '/',
+      });
+      page_actions.push({
+        label: '查看全部审计',
+        href: dashboardPath,
+      });
+    }
+    const latestRunWithFindings = visibleRuns.find((run) => (run?.finding_count ?? 0) > 0 && run?.review_id);
+    if (!agentId && latestRunWithFindings) {
+      page_actions.push({
+        label: '打开最新有发现的审查',
         href: reviewUrl(latestRunWithFindings.review_id),
       });
     }
     const highestSeverityOpenFinding = findings.find((finding) => finding?.status === 'open' && finding?.finding_id);
     if (highestSeverityOpenFinding) {
       page_actions.push({
-        label: 'Open highest risk finding',
+        label: '打开最高风险发现',
         href: findingUrl(highestSeverityOpenFinding.finding_id),
       });
     }
-    const degradedRun = runs.find((run) => run?.status === 'completed_degraded' && run?.review_id);
+    const degradedRun = visibleRuns.find((run) => run?.status === 'completed_degraded' && run?.review_id);
     if (degradedRun) {
       page_actions.push({
-        label: 'Open latest degraded review',
+        label: '打开最新降级审查',
         href: reviewUrl(degradedRun.review_id),
       });
     }
@@ -598,15 +741,15 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       },
     }));
 
-    const runsWithFindings = runs.filter((run) => (run?.finding_count ?? 0) > 0);
-    const runsWithoutFindings = runs.filter((run) => (run?.finding_count ?? 0) === 0);
+    const runsWithFindings = visibleRuns.filter((run) => (run?.finding_count ?? 0) > 0);
+    const runsWithoutFindings = visibleRuns.filter((run) => (run?.finding_count ?? 0) === 0);
 
     const reviewRowsFor = (rows, { includeSecondary }) => rows.map((run) => ({
       review_id: {
         text: run.review_id ?? '',
         href: run.review_id ? reviewUrl(run.review_id) : undefined,
         mono: true,
-        secondary: includeSecondary ? `${run.finding_count ?? 0} findings` : undefined,
+        secondary: includeSecondary ? `${run.finding_count ?? 0} 个发现` : undefined,
       },
       status_label: {
         text: labelOf(STATUS_LABELS, run.status),
@@ -631,7 +774,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     if (findingRows.length > 0) {
       sections.push({
         id: 'pending_findings',
-        title: 'Open findings',
+        title: '待处理风险发现',
         type: 'table',
         columns: OVERVIEW_FINDINGS_COLUMNS,
         rows: findingRows,
@@ -640,7 +783,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     if (runsWithFindings.length > 0) {
       sections.push({
         id: 'reviews_with_findings',
-        title: 'Recent reviews with findings',
+        title: '最近有发现的审查',
         type: 'table',
         columns: REVIEWS_TABLE_COLUMNS,
         rows: reviewRowsFor(runsWithFindings, { includeSecondary: true }),
@@ -649,7 +792,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     if (runsWithoutFindings.length > 0) {
       sections.push({
         id: 'reviews_without_findings',
-        title: 'Recent reviews without findings',
+        title: '最近无发现的审查',
         type: 'table',
         columns: REVIEWS_TABLE_COLUMNS,
         rows: reviewRowsFor(runsWithoutFindings, { includeSecondary: false }),
@@ -658,18 +801,20 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     if (deadLetters > 0) {
       sections.push({
         id: 'dead_letters',
-        title: 'Dead letters',
+        title: '死信消息',
         type: 'callout',
-        body: `${deadLetters} dead letter message(s) need attention.`,
+        body: `${deadLetters} 条死信消息需要处理。`,
       });
     }
 
     return {
       page: {
-        title: 'Audit Review Overview',
-        subtitle: 'Recent reviews, open risks, and evidence access.',
+        title: agentId ? `Agent 日志审计：${agentId}` : '审计审查总览',
+        subtitle: agentId ? '查看该 Agent 的待处理风险和关联证据。' : '查看最近审查、待处理风险和关联证据。',
         updated_at: updatedAt,
-        breadcrumbs: [{ label: 'Overview', href: dashboardPath }],
+        breadcrumbs: agentId
+          ? [{ label: 'Agent 列表', href: '/' }, { label: 'Agent 审计', href: agentDashboardUrl(agentId) }]
+          : [{ label: '总览', href: dashboardPath }],
         context_badges,
         page_actions,
       },
@@ -694,7 +839,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       { label: SEVERITY_LABELS.high, value: severityCounts.high, tone: 'high', href: `${reviewUrl(reviewId)}?severity=high#review_findings` },
       { label: SEVERITY_LABELS.medium, value: severityCounts.medium, tone: 'medium', href: `${reviewUrl(reviewId)}?severity=medium#review_findings` },
       { label: SEVERITY_LABELS.low, value: severityCounts.low, tone: 'low', href: `${reviewUrl(reviewId)}?severity=low#review_findings` },
-      { label: 'Findings', value: findingCount, tone: 'neutral' },
+      { label: '风险发现', value: findingCount, tone: 'neutral' },
     ];
 
     const context_badges = [];
@@ -704,15 +849,15 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
         tone: statusTone(run.status),
       });
     }
-    context_badges.push({ label: `${findingCount} findings`, tone: 'neutral' });
+    context_badges.push({ label: `${findingCount} 个发现`, tone: 'neutral' });
     context_badges.push({ label: triggerLabel(run?.trigger_type), tone: 'neutral' });
 
     const page_actions = [
-      { label: 'Back to overview', href: dashboardPath, kind: 'secondary' },
+      { label: '返回总览', href: dashboardPath, kind: 'secondary' },
     ];
     if (reviewFindings[0]?.finding_id) {
       page_actions.unshift({
-        label: 'Open highest risk finding',
+        label: '打开最高风险发现',
         href: findingUrl(reviewFindings[0].finding_id),
         kind: 'primary',
       });
@@ -722,16 +867,16 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     if (run?.status === 'completed_degraded') {
       sections.push({
         id: 'degraded_notice',
-        title: 'Degraded review',
+        title: '降级审查',
         type: 'callout',
-        body: 'This review completed in degraded mode. Use the findings for initial triage and verify against evidence logs.',
+        body: '本次审查以降级模式完成。请将发现用于初步排查，并结合证据日志确认。',
       });
     }
     if (run?.error_code) {
       const body = run.error_message ? `${run.error_code}: ${run.error_message}` : String(run.error_code);
       sections.push({
         id: 'run_error',
-        title: 'Run error',
+        title: '运行错误',
         type: 'callout',
         body,
       });
@@ -739,7 +884,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     if (reviewFindings.length > 0) {
       sections.push({
         id: 'review_findings',
-        title: 'Review findings',
+        title: '本次审查的风险发现',
         type: 'table',
         columns: REVIEW_FINDINGS_COLUMNS,
         rows: reviewFindings.map((finding) => ({
@@ -762,30 +907,30 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
           evidence_count: {
             text: String(Array.isArray(finding.evidence) ? finding.evidence.length : 0),
             mono: true,
-            secondary: Array.isArray(finding.evidence) && finding.evidence.length > 1 ? '澶氭潯璇佹嵁' : undefined,
+            secondary: Array.isArray(finding.evidence) && finding.evidence.length > 1 ? '多条证据' : undefined,
           },
         })),
       });
     }
     if (run) {
       const metaItems = [
-        { label: 'Review ID', value: run.review_id ?? '' },
-        { label: 'Status', value: labelOf(STATUS_LABELS, run.status) },
-        { label: 'Window', value: formatWindow(run) },
-        { label: 'Findings', value: run.finding_count ?? 0 },
-        { label: 'Trigger', value: triggerLabel(run.trigger_type) },
-        { label: 'Finished at', value: formatTime(run.finished_at) },
-        { label: 'Risk policy version', value: run.risk_policy_version ?? '' },
-        { label: 'Prompt version', value: run.prompt_version ?? '' },
-        { label: 'Reviewer version', value: run.reviewer_version ?? '' },
-        { label: 'LLM model', value: run.llm_model ?? '' },
-        { label: 'Scanned files', value: run.scanned_files },
-        { label: 'Candidate events', value: run.candidate_event_count },
+        { label: '审查批次 ID', value: run.review_id ?? '' },
+        { label: '状态', value: labelOf(STATUS_LABELS, run.status) },
+        { label: '时间窗口', value: formatWindow(run) },
+        { label: '发现数', value: run.finding_count ?? 0 },
+        { label: '触发方式', value: triggerLabel(run.trigger_type) },
+        { label: '完成时间', value: formatTime(run.finished_at) },
+        { label: '风险策略版本', value: run.risk_policy_version ?? '' },
+        { label: 'Prompt 版本', value: run.prompt_version ?? '' },
+        { label: '审查器版本', value: run.reviewer_version ?? '' },
+        { label: 'LLM 模型', value: run.llm_model ?? '' },
+        { label: '扫描文件数', value: run.scanned_files },
+        { label: '候选事件数', value: run.candidate_event_count },
       ].filter((item) => isPresent(item.value));
       if (metaItems.length > 0) {
         sections.push({
           id: 'run_metadata',
-          title: 'Review metadata',
+          title: '审查元数据',
           type: 'definition_list',
           items: metaItems,
         });
@@ -794,12 +939,12 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
 
     return {
       page: {
-        title: 'Review',
+        title: '审查批次',
         subtitle: formatWindow(run) || reviewId,
         updated_at: updatedAt,
         breadcrumbs: [
-          { label: '鎬昏', href: dashboardPath },
-          { label: '瀹℃煡鎵规', href: reviewUrl(reviewId) },
+          { label: '总览', href: dashboardPath },
+          { label: '审查批次', href: reviewUrl(reviewId) },
         ],
         context_badges,
         page_actions,
@@ -816,25 +961,25 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     if (!finding) {
       return {
         page: {
-          title: 'Finding not found',
-          subtitle: `Finding ${findingId}`,
+          title: '未找到风险发现',
+          subtitle: `风险发现 ${findingId}`,
           updated_at: updatedAt,
-          breadcrumbs: [{ label: 'Overview', href: dashboardPath }],
+          breadcrumbs: [{ label: '总览', href: dashboardPath }],
           context_badges: [],
-          page_actions: [{ label: 'Back to overview', href: dashboardPath, kind: 'secondary' }],
+          page_actions: [{ label: '返回总览', href: dashboardPath, kind: 'secondary' }],
         },
         summary_metrics: [],
         filters: [],
         sections: [
-          { id: 'not_found', type: 'callout', title: 'Not found', body: `Finding ${findingId} was not found.` },
+          { id: 'not_found', type: 'callout', title: '未找到', body: `未找到风险发现 ${findingId}。` },
         ],
       };
     }
 
     const reviewId = finding.review_id;
-    const breadcrumbs = [{ label: 'Overview', href: dashboardPath }];
-    if (reviewId) breadcrumbs.push({ label: 'Review', href: reviewUrl(reviewId) });
-    breadcrumbs.push({ label: 'Finding', href: findingUrl(findingId) });
+    const breadcrumbs = [{ label: '总览', href: dashboardPath }];
+    if (reviewId) breadcrumbs.push({ label: '审查批次', href: reviewUrl(reviewId) });
+    breadcrumbs.push({ label: '风险发现', href: findingUrl(findingId) });
 
     const context_badges = [
       { label: labelOf(SEVERITY_LABELS, finding.severity), tone: severityTone(finding.severity) },
@@ -844,20 +989,20 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       { label: finding.tool_name ?? '', tone: 'neutral' },
     ].filter((badge) => isPresent(badge.label));
 
-    const page_actions = [{ label: 'Back to overview', href: dashboardPath, kind: 'secondary' }];
+    const page_actions = [{ label: '返回总览', href: dashboardPath, kind: 'secondary' }];
     if (reviewId) {
-      page_actions.unshift({ label: 'Back to review', href: reviewUrl(reviewId), kind: 'primary' });
+      page_actions.unshift({ label: '返回审查批次', href: reviewUrl(reviewId), kind: 'primary' });
     }
 
     const definitionItems = [
-      { label: 'Finding ID', value: finding.finding_id ?? '' },
-      { label: 'Review ID', value: finding.review_id ?? '' },
-      { label: 'Agent name', value: finding.agent_name ?? '' },
+      { label: '风险发现 ID', value: finding.finding_id ?? '' },
+      { label: '审查批次 ID', value: finding.review_id ?? '' },
+      { label: 'Agent 名称', value: finding.agent_name ?? '' },
       { label: 'Agent ID', value: finding.agent_id ?? '' },
-      { label: 'Tool', value: finding.tool_name ?? '' },
+      { label: '工具', value: finding.tool_name ?? '' },
       { label: 'Trace ID', value: finding.trace_id ?? '' },
-      { label: 'Entity', value: [finding.entity?.type, finding.entity?.id].filter(Boolean).join('/') },
-      { label: 'Last seen', value: formatTime(lastSeenAtOf(finding)) },
+      { label: '实体', value: [finding.entity?.type, finding.entity?.id].filter(Boolean).join('/') },
+      { label: '最后出现', value: formatTime(lastSeenAtOf(finding)) },
     ].filter((item) => isPresent(item.value));
 
     const traceEvents = orderedTraceEvents(listTraceEvents(finding.trace_id, 200));
@@ -867,15 +1012,15 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
 
     const linkItems = [];
     if (reviewId) {
-      linkItems.push({ href: reviewUrl(reviewId), label: 'Back to review' });
+      linkItems.push({ href: reviewUrl(reviewId), label: '返回审查批次' });
     }
-    linkItems.push({ href: dashboardPath, label: 'Back to overview' });
+    linkItems.push({ href: dashboardPath, label: '返回总览' });
 
     const sections = [];
     if (isPresent(finding.summary)) {
       sections.push({
         id: 'finding_summary',
-        title: 'Summary',
+        title: '摘要',
         type: 'callout',
         body: finding.summary,
       });
@@ -883,7 +1028,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     if (isPresent(finding.recommendation)) {
       sections.push({
         id: 'recommendation',
-        title: 'Recommendation',
+        title: '建议',
         type: 'callout',
         body: finding.recommendation,
       });
@@ -891,7 +1036,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     if (definitionItems.length > 0) {
       sections.push({
         id: 'finding_detail',
-        title: 'Details',
+        title: '详情',
         type: 'definition_list',
         items: definitionItems,
       });
@@ -899,23 +1044,26 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     if (traceSteps.length > 0) {
       sections.push({
         id: 'trace_sequence',
-        title: `Tool call sequence (${traceSteps.length} steps)`,
+        title: traceSequenceTitle(traceEvents.length, traceSteps.length),
         type: 'trace_sequence',
         steps: traceSteps,
       });
     }
+    if (traceEvents.length > TRACE_ABNORMAL_STEP_THRESHOLD) {
+      sections.push(traceAbnormalSection(traceEvents.length));
+    }
     if (traceSteps.length === 0 && isPresent(finding.trace_id)) {
       sections.push({
         id: 'trace_sequence_empty',
-        title: 'Tool call sequence',
+        title: '工具调用顺序',
         type: 'callout',
-        body: `No complete tool-call events were found for trace ${finding.trace_id}. Use the raw evidence logs below for triage.`,
+        body: `Trace ${finding.trace_id} 没有找到完整的工具调用事件。请结合下方原始证据日志排查。`,
       });
     }
     if (rawEvidenceSnippets.length > 0) {
       sections.push({
         id: 'evidence_raw_logs',
-        title: rawEvidenceSnippets.length > 1 ? `Raw log snippets (${rawEvidenceSnippets.length})` : 'Raw log snippet',
+        title: rawEvidenceSnippets.length > 1 ? `原始日志片段（${rawEvidenceSnippets.length} 条）` : '原始日志片段',
         type: 'raw_log_list',
         snippets: rawEvidenceSnippets,
       });
@@ -923,7 +1071,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     if (linkItems.length > 0) {
       sections.push({
         id: 'linked_navigation',
-        title: 'Links',
+        title: '相关链接',
         type: 'link_list',
         links: linkItems,
       });
@@ -932,7 +1080,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     return {
       page: {
         title: finding.title ?? `Finding ${findingId}`,
-        subtitle: 'Finding',
+        subtitle: '风险发现',
         updated_at: updatedAt,
         breadcrumbs,
         context_badges,
@@ -951,6 +1099,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
 
     const traceEvents = orderedTraceEvents(listTraceEvents(finding.trace_id, 200));
     if (traceEvents.length === 0) return page;
+    if (traceEvents.length > TRACE_ABNORMAL_STEP_THRESHOLD) return page;
 
     if (cacheDetailAnalysis && isFreshAnalysisCache(finding)) {
       insertSectionAfter(page.sections, 'trace_sequence', traceAnalysisSection({
@@ -967,7 +1116,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       const usageDay = llmUsageDayKey();
       if (!reserveDetailAnalysisBudget({ day: usageDay, estimatedTokens })) {
         insertSectionAfter(page.sections, 'trace_sequence', traceAnalysisUnavailableSection(
-          'Cannot generate trace analysis: llm_budget_exceeded',
+          '无法生成链路分析：LLM 预算已用尽。',
         ));
         return page;
       }
@@ -984,7 +1133,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
         llmError = error;
       }
       if (llmError) throw llmError;
-      const analysis = normalizeTraceAnalysis(raw, traceEvents);
+      const analysis = normalizeTraceAnalysis(raw, traceEvents.slice(0, TRACE_ANALYSIS_STEP_LIMIT));
       if (cacheDetailAnalysis) {
         try {
           reviewStore.saveFindingAnalysis?.(finding.finding_id, { analysis, generatedAt: nowIso() });
@@ -994,7 +1143,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       }
       insertSectionAfter(page.sections, 'trace_sequence', {
         id: 'trace_llm_analysis',
-        title: 'LLM trace analysis',
+        title: 'LLM 链路分析',
         type: 'trace_analysis',
         model: traceAnalysisModel,
         ...analysis,
@@ -1002,9 +1151,9 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     } catch (error) {
       insertSectionAfter(page.sections, 'trace_sequence', {
         id: 'trace_llm_analysis',
-        title: 'LLM trace analysis unavailable',
+        title: 'LLM 链路分析不可用',
         type: 'callout',
-        body: `Unable to generate trace analysis: ${error?.message ?? String(error)}`,
+        body: `无法生成链路分析：${error?.message ?? String(error)}`,
       });
     }
 
@@ -1014,6 +1163,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
   return {
     dashboardUrlFor,
     findingUrlFor,
+    agentIndexPage,
     overviewPage,
     reviewDetailPage,
     findingDetailPage,

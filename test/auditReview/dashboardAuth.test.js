@@ -74,12 +74,12 @@ test('non-loopback GET with correct token is authorized', () => {
   assert.equal(res.ok, true);
 });
 
-test('validateBoot throws when non-loopback and no token configured', () => {
+test('validateBoot does not throw when non-loopback and no token configured', () => {
   const auth = createDashboardAuth({
     config: { auditReview: { http: { bindHost: '0.0.0.0', requireDashboardToken: false, allowedOrigins: [] } } },
     env: {},
   });
-  assert.throws(() => auth.validateBoot({ bindHost: '0.0.0.0' }), /AUDIT_AGENT_DASHBOARD_TOKEN/);
+  auth.validateBoot({ bindHost: '0.0.0.0' });
 });
 
 test('validateBoot does not throw when loopback and no token', () => {
@@ -126,4 +126,46 @@ test('isLoopback handles ::ffff:127.0.0.1', () => {
   });
   assert.equal(auth.isLoopback('::ffff:127.0.0.1'), true);
   assert.equal(auth.isLoopback('10.0.0.1'), false);
+});
+
+test('dashboard HTML is authorized without token but session cookie cannot authorize audit APIs', () => {
+  const auth = createDashboardAuth({
+    config: { auditReview: { http: {} } },
+    env: { AUDIT_AGENT_DASHBOARD_TOKEN: 'secret-token' },
+  });
+  assert.equal(typeof auth.createSessionCookie, 'function');
+  assert.equal(typeof auth.authorizeDashboard, 'function');
+  assert.equal(typeof auth.authorizeApi, 'function');
+
+  const cookie = auth.createSessionCookie(makeReq({ remoteAddress: '127.0.0.1' }));
+  assert.match(cookie, /^audit_dashboard_session=[^;]+; Path=\/dashboard; HttpOnly; SameSite=Lax$/);
+  assert.equal(cookie.includes('secret-token'), false);
+  const cookieHeader = cookie.split(';', 1)[0];
+
+  assert.equal(auth.authorizeDashboard(makeReq({ remoteAddress: '10.0.0.5' })).ok, true);
+  assert.equal(
+    auth.authorizeDashboard(makeReq({ remoteAddress: '127.0.0.1', headers: { cookie: cookieHeader } })).ok,
+    true,
+  );
+  const apiAuth = auth.authorizeApi(makeReq({ remoteAddress: '127.0.0.1', headers: { cookie: cookieHeader } }));
+  assert.equal(apiAuth.ok, false);
+  assert.equal(apiAuth.code, 'missing_token');
+});
+
+test('audit APIs accept a valid Bearer token and no token is leaked by invalid login checks', () => {
+  const auth = createDashboardAuth({
+    config: { auditReview: { http: {} } },
+    env: { AUDIT_AGENT_DASHBOARD_TOKEN: 'secret-token' },
+  });
+
+  assert.equal(
+    auth.authorizeApi(makeReq({
+      remoteAddress: '127.0.0.1',
+      headers: { authorization: 'Bearer secret-token' },
+    })).ok,
+    true,
+  );
+  const invalid = auth.authorizeLoginToken('wrong-token');
+  assert.deepEqual(invalid, { ok: false, status: 403, code: 'invalid_token' });
+  assert.equal(JSON.stringify(invalid).includes('secret-token'), false);
 });

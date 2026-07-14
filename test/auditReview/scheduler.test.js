@@ -66,6 +66,8 @@ const RISK_POLICY = {
   agentToolAllowlists: {},
 };
 
+const MOJIBAKE_PATTERN = /(?:[涓楂椋闄浣淇鎴鍏椤瀵艰埅鐖璋鐩閾捐矾寤妯鏆棤鍙睍绀鐧诲綍璁块棶浠ょ墝鏇柊堕棿鎬昏澶氶潯佹嵁鏃瑙妫]{2,}|鈥\?|€�)/;
+
 function makeConfig(overrides = {}) {
   return {
     dbPath: ':memory:',
@@ -357,6 +359,100 @@ test('scheduler.runOnce happy path: creates completed run, persists findings, re
   assert.ok(events.includes('review.completed'), 'should log review.completed');
   assert.ok(events.includes('review.ingest.completed'), 'should log review.ingest.completed');
 
+  db.close();
+});
+
+test('scheduler.runOnce stores parse error findings with readable Chinese text', async () => {
+  const db = makeDb();
+  const llmClient = makeFakeLlmClient({
+    type: 'audit_review',
+    review_id: 'fake',
+    window: { from: '2026-07-03T10:00:00.000Z', to: '2026-07-03T10:30:00.000Z' },
+    summary: {
+      title: '审查完成，未发现风险',
+      overview: '本次仅发现日志解析错误。',
+      severity_counts: { critical: 0, high: 0, medium: 0, low: 0 },
+    },
+    findings: [],
+  });
+  const deps = buildRealDeps(db, { llmClient });
+  deps.ingestService = {
+    ingestSince() {
+      return {
+        inserted: 0,
+        scannedFiles: 2,
+        cursorUpdates: 0,
+        parseErrors: [
+          { agent_id: 'mt-agent', file: 'tmp/audit-a.jsonl', line: 3, error: 'Unexpected token' },
+          { agent_id: 'mt-agent', file: 'tmp/audit-b.jsonl', line: 7, error: 'Missing field trace_id' },
+        ],
+      };
+    },
+  };
+  const scheduler = createAuditReviewScheduler({ db, ...deps, now: () => new Date('2026-07-03T10:30:00.000Z') });
+
+  const result = await scheduler.runOnce({ triggerType: 'scheduled' });
+
+  assert.equal(result.status, 'completed');
+  const findings = deps.reviewStore.listFindings({ limit: 100 });
+  const parseError = findings.find((f) => f.category === 'ingest_parse_error');
+  assert.ok(parseError, 'parse error finding should be persisted');
+  assert.equal(parseError.title, '日志解析失败');
+  assert.match(parseError.summary, /^2 条解析错误，涉及 2 个文件。样例：/);
+  assert.equal(parseError.recommendation, '检查日志格式是否符合 agent-audit-log v1.0 规范');
+  assert.doesNotMatch(`${parseError.title}\n${parseError.summary}\n${parseError.recommendation}`, MOJIBAKE_PATTERN);
+
+  db.close();
+});
+
+test('scheduler.runAfterIngest runs an immediate review and resets the scheduled timer', async () => {
+  const db = makeDb();
+  insertEvent(db, 1, {
+    ts: '2026-07-03T10:29:00.000Z',
+    tool_name: 'some.query',
+    status: 'INTERNAL',
+    event: 'tool.end',
+  });
+
+  const deps = buildRealDeps(db);
+  let timerId = 0;
+  const timeoutCalls = [];
+  const clearedTimeouts = [];
+  const timerApi = {
+    setTimeout(callback, delayMs) {
+      const handle = { id: ++timerId, callback, delayMs };
+      timeoutCalls.push(handle);
+      return handle;
+    },
+    clearTimeout(handle) {
+      if (handle) clearedTimeouts.push(handle);
+    },
+    setInterval() {
+      return { id: ++timerId, interval: true };
+    },
+    clearInterval() {},
+  };
+  const scheduler = createAuditReviewScheduler({
+    db,
+    ...deps,
+    now: () => new Date('2026-07-03T10:30:00.000Z'),
+    timerApi,
+  });
+
+  scheduler.start();
+  assert.equal(timeoutCalls.length, 1);
+  assert.equal(timeoutCalls[0].delayMs, 30_000);
+
+  const result = await scheduler.runAfterIngest();
+
+  assert.equal(result.status, 'completed');
+  const runs = deps.reviewStore.listRuns({ limit: 10 });
+  assert.equal(runs[0].trigger_type, 'ingest');
+  assert.equal(timeoutCalls.length, 2);
+  assert.equal(timeoutCalls[1].delayMs, 30 * 60 * 1000);
+  assert.equal(clearedTimeouts[0], timeoutCalls[0]);
+
+  scheduler.stop();
   db.close();
 });
 

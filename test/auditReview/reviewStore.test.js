@@ -341,6 +341,58 @@ test('reviewStore: listFindings filters by severity/category/agent', () => {
   db.close();
 });
 
+test('reviewStore: listAgents summarizes received audit events by agent', () => {
+  const db = openDb();
+  db.exec(`
+    CREATE TABLE audit_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      agent_id TEXT NOT NULL
+    );
+  `);
+  const insert = db.prepare(`INSERT INTO audit_events (ts, agent_id) VALUES (?, ?)`);
+  insert.run('2026-07-03T10:00:00.000Z', 'agent-a');
+  insert.run('2026-07-03T10:05:00.000Z', 'agent-b');
+  insert.run('2026-07-03T10:10:00.000Z', 'agent-a');
+
+  const store = createReviewStore(db);
+  const reviewId = `rev_agents_${crypto.randomUUID()}`;
+  store.upsertFinding(makeFinding({ review_id: reviewId, severity: 'high', agent_id: 'agent-a' }));
+  const { finding } = store.upsertFinding({
+    ...baseFinding,
+    review_id: reviewId,
+    severity: 'medium',
+    agent_id: 'agent-b',
+    tool_name: 'otherTool',
+    trace_id: 'trace_agent_b',
+    category: 'repeated_call',
+    title: 'agent-b repeated',
+    summary: 's',
+  });
+  store.updateFinding(finding.finding_id, {
+    status: 'resolved',
+    resolved_at: '2026-07-03T10:20:00.000Z',
+  });
+
+  const agents = store.listAgents({ limit: 10 });
+  assert.deepEqual(agents.map((agent) => agent.agent_id), ['agent-a', 'agent-b']);
+  assert.equal(agents[0].event_count, 2);
+  assert.equal(agents[0].last_event_at, '2026-07-03T10:10:00.000Z');
+  assert.equal(agents[0].finding_count, 1);
+  assert.equal(agents[0].open_finding_count, 1);
+  assert.equal(agents[1].event_count, 1);
+  assert.equal(agents[1].finding_count, 1);
+  assert.equal(agents[1].open_finding_count, 0);
+  db.close();
+});
+
+test('reviewStore: listAgents returns empty when audit_events table is unavailable', () => {
+  const db = openDb();
+  const store = createReviewStore(db);
+  assert.deepEqual(store.listAgents({ limit: 10 }), []);
+  db.close();
+});
+
 test('reviewStore: listTraceEvents returns audit events for a trace in chronological order', () => {
   const db = openDb();
   db.exec(`
