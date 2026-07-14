@@ -290,6 +290,16 @@ test('audit review HTTP integration smoke test', async () => {
     }
 
     {
+      const root = await fetch(`${baseUrl}/`);
+      assert.equal(root.status, 200, 'GET / should render the agent index page');
+      assert.equal(root.headers.get('content-type'), 'text/html; charset=utf-8');
+      assert.equal(root.headers.get('cache-control'), 'no-store');
+      const rootHtml = await root.text();
+      assert.ok(rootHtml.includes('Agent 日志入口'), 'root page should contain the agent index title');
+      assert.ok(rootHtml.includes('agent-test'), 'root page should list received agent id');
+      assert.ok(rootHtml.includes('/dashboard?agent_id=agent-test'), 'root page should link agent to filtered dashboard');
+      assert.doesNotMatch(rootHtml, MOJIBAKE_PATTERN);
+
       const dashboard = await fetch(`${baseUrl}/dashboard`);
       assert.equal(dashboard.status, 200);
       assert.equal(dashboard.headers.get('cache-control'), 'no-store');
@@ -299,6 +309,12 @@ test('audit review HTTP integration smoke test', async () => {
       const dashboardWithSlash = await fetch(`${baseUrl}/dashboard/`);
       assert.equal(dashboardWithSlash.status, 200);
       assert.equal(dashboardWithSlash.headers.get('cache-control'), 'no-store');
+      const agentDashboard = await fetch(`${baseUrl}/dashboard?agent_id=agent-test`);
+      assert.equal(agentDashboard.status, 200);
+      const agentDashboardHtml = await agentDashboard.text();
+      assert.ok(agentDashboardHtml.includes('Agent 日志审计：agent-test'));
+      assert.ok(agentDashboardHtml.includes('href="/" class="page-action'));
+      assert.doesNotMatch(agentDashboardHtml, MOJIBAKE_PATTERN);
       const apiWithBearer = await fetch(`${baseUrl}/v1/audit-reviews`, { headers: bearerHeaders });
       assert.equal(apiWithBearer.status, 200);
     }
@@ -450,6 +466,19 @@ test('audit review HTTP integration smoke test', async () => {
       assert.ok(html.includes('Trace ID'), 'dashboard should contain trace link column');
       assert.ok(html.includes('#trace_sequence'), 'dashboard should link trace ids to the finding trace sequence');
       assert.doesNotMatch(html, MOJIBAKE_PATTERN);
+
+      const filtered = await fetch(`${baseUrl}/dashboard?agent_id=agent-test`, { headers: bearerHeaders });
+      assert.equal(filtered.status, 200, 'GET filtered agent dashboard should be 200');
+      const filteredHtml = await filtered.text();
+      assert.ok(filteredHtml.includes('Agent 日志审计：agent-test'), 'filtered dashboard should include agent title');
+      const filteredApi = await fetch(`${baseUrl}/v1/audit-findings?agent_id=agent-test`, { headers: bearerHeaders });
+      assert.equal(filteredApi.status, 200);
+      const filteredBody = await filteredApi.json();
+      assert.ok(filteredBody.count >= 1, 'filtered API should contain the agent finding');
+      assert.ok(filteredHtml.includes('待处理风险发现'), 'filtered dashboard should render the findings section');
+      assert.ok(filteredHtml.includes('agent-test'), 'filtered dashboard should contain the agent id');
+      assert.ok(filteredHtml.includes('db.delete'), 'filtered dashboard should contain the agent finding tool');
+      assert.doesNotMatch(filteredHtml, MOJIBAKE_PATTERN);
     }
 
     // ------------------------------------------------------------------

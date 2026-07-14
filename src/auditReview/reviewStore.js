@@ -180,6 +180,7 @@ export function createReviewStore(db) {
 
   let deadLetterCountStmt = null;
   let traceEventsStmt = null;
+  let listAgentsStmt = null;
   function getDeadLetterCountStmt() {
     if (!deadLetterCountStmt) {
       // Lazy prepare: agent_outbox_events may not exist in isolated tests
@@ -201,6 +202,37 @@ export function createReviewStore(db) {
       `);
     }
     return traceEventsStmt;
+  }
+
+  function getListAgentsStmt() {
+    if (!listAgentsStmt) {
+      listAgentsStmt = db.prepare(`
+        SELECT
+          events.agent_id,
+          events.event_count,
+          events.last_event_at,
+          COALESCE(findings.finding_count, 0) AS finding_count,
+          COALESCE(findings.open_finding_count, 0) AS open_finding_count
+        FROM (
+          SELECT agent_id, COUNT(*) AS event_count, MAX(ts) AS last_event_at
+          FROM audit_events
+          WHERE agent_id IS NOT NULL AND agent_id <> ''
+          GROUP BY agent_id
+        ) events
+        LEFT JOIN (
+          SELECT
+            agent_id,
+            COUNT(*) AS finding_count,
+            SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_finding_count
+          FROM audit_review_findings
+          WHERE agent_id IS NOT NULL AND agent_id <> ''
+          GROUP BY agent_id
+        ) findings ON findings.agent_id = events.agent_id
+        ORDER BY events.last_event_at DESC, events.agent_id ASC
+        LIMIT @limit OFFSET @offset
+      `);
+    }
+    return listAgentsStmt;
   }
 
   return {
@@ -364,6 +396,19 @@ export function createReviewStore(db) {
         `SELECT * FROM audit_review_findings ${where} ORDER BY last_seen_at DESC LIMIT @limit OFFSET @offset`
       ).all(params);
       return rows.map(hydrateFinding);
+    },
+
+    listAgents({ limit = 100, offset = 0 } = {}) {
+      const parsedLimit = Number(limit);
+      const parsedOffset = Number(offset);
+      const safeLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : 100;
+      const safeOffset = Number.isFinite(parsedOffset) && parsedOffset >= 0 ? Math.floor(parsedOffset) : 0;
+      try {
+        return getListAgentsStmt().all({ limit: safeLimit, offset: safeOffset });
+      } catch (error) {
+        if (/no such table/i.test(error?.message ?? '')) return [];
+        throw error;
+      }
     },
 
     listTraceEvents({ traceId, limit = 200 } = {}) {

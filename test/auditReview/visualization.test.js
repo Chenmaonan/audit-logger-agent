@@ -44,6 +44,7 @@ function run(overrides = {}) {
 
 function fakeStore(overrides = {}) {
   const critical = finding(overrides.finding);
+  const findings = [critical, ...(overrides.findings ?? [])];
   const cleanRun = run({ review_id: 'r-clean', status: 'completed', finding_count: 0 });
   const degraded = run();
   const traceEvents = overrides.traceEvents ?? [
@@ -76,12 +77,24 @@ function fakeStore(overrides = {}) {
   ];
 
   return {
-    listFindings({ reviewId, severity, status } = {}) {
-      let rows = [critical];
-      if (reviewId && reviewId !== critical.review_id) rows = [];
+    listFindings({ reviewId, severity, status, agentId } = {}) {
+      let rows = findings;
+      if (reviewId) rows = rows.filter((row) => row.review_id === reviewId);
       if (severity) rows = rows.filter((row) => row.severity === severity);
       if (status) rows = rows.filter((row) => row.status === status);
+      if (agentId) rows = rows.filter((row) => row.agent_id === agentId);
       return rows;
+    },
+    listAgents() {
+      return overrides.agents ?? [
+        {
+          agent_id: 'agent-1',
+          event_count: 2,
+          last_event_at: '2026-07-03T10:02:00.000Z',
+          finding_count: 1,
+          open_finding_count: 1,
+        },
+      ];
     },
     listRuns() {
       return [degraded, cleanRun];
@@ -137,9 +150,61 @@ test('overviewPage returns linked review and finding sections', () => {
   assert.ok(page.sections.find((section) => section.id === 'reviews_without_findings'));
 });
 
+test('agentIndexPage lists received agent ids linked to filtered dashboard', () => {
+  const page = createViz({
+    agents: [
+      {
+        agent_id: 'agent-1',
+        event_count: 3,
+        last_event_at: '2026-07-03T10:02:00.000Z',
+        finding_count: 1,
+        open_finding_count: 1,
+      },
+      {
+        agent_id: 'agent.2',
+        event_count: 1,
+        last_event_at: '2026-07-03T09:50:00.000Z',
+        finding_count: 0,
+        open_finding_count: 0,
+      },
+    ],
+  }).agentIndexPage();
+
+  assert.equal(page.page.title, 'Agent 日志入口');
+  const section = page.sections.find((item) => item.id === 'received_agents');
+  assert.equal(section.title, '已接收日志的 Agent');
+  assert.equal(section.rows[0].agent_id.text, 'agent-1');
+  assert.equal(section.rows[0].agent_id.href, '/dashboard?agent_id=agent-1');
+  assert.equal(section.rows[1].agent_id.href, '/dashboard?agent_id=agent.2');
+  assert.ok(page.page.page_actions.some((action) => action.href === '/dashboard'));
+});
+
+test('overviewPage filters findings by agent id and links back to agent index', () => {
+  const page = createViz({
+    findings: [
+      finding({
+        finding_id: 'f-other',
+        agent_id: 'agent-2',
+        trace_id: 'trace-agent-2',
+        title: 'Other agent finding',
+      }),
+    ],
+  }).overviewPage({ agentId: 'agent-1' });
+
+  assert.equal(page.page.title, 'Agent 日志审计：agent-1');
+  assert.ok(page.page.breadcrumbs.some((crumb) => crumb.href === '/'));
+  assert.ok(page.page.page_actions.some((action) => action.href === '/'));
+  assert.ok(page.summary_metrics.some((metric) => metric.href === '/dashboard?agent_id=agent-1&severity=critical#pending_findings'));
+  const findingsSection = page.sections.find((section) => section.id === 'pending_findings');
+  assert.equal(findingsSection.rows.length, 1);
+  assert.equal(findingsSection.rows[0].agent_name, 'Agent One');
+  assert.equal(JSON.stringify(page).includes('Other agent finding'), false);
+});
+
 test('visualization view models use Chinese UI labels without mojibake', () => {
   const viz = createViz();
   const pages = [
+    viz.agentIndexPage(),
     viz.overviewPage(),
     viz.reviewDetailPage('r-degraded'),
     viz.findingDetailPage('f-critical'),

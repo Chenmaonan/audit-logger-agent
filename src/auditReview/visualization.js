@@ -64,6 +64,14 @@ const REVIEWS_TABLE_COLUMNS = [
   { key: 'finished_at', label: '完成时间' },
 ];
 
+const AGENT_INDEX_COLUMNS = [
+  { key: 'agent_id', label: 'Agent ID' },
+  { key: 'event_count', label: '接收日志数' },
+  { key: 'open_finding_count', label: '待处理发现' },
+  { key: 'finding_count', label: '累计发现' },
+  { key: 'last_event_at', label: '最新日志时间' },
+];
+
 const TRACE_ANALYSIS_SYSTEM_PROMPT = [
   'You analyze audit-log tool call traces for a Chinese audit dashboard.',
   'Return ONLY a JSON object matching the schema. No markdown, no prose outside JSON.',
@@ -385,17 +393,29 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     return `${dashboardPath}/audit-findings/${encodeURIComponent(findingId)}`;
   }
 
-  function countOpenFindingsBySeverity() {
+  function agentDashboardUrl(agentId) {
+    return `${dashboardPath}?agent_id=${encodeURIComponent(agentId)}`;
+  }
+
+  function countOpenFindingsBySeverity(filters = {}) {
     const counts = { critical: 0, high: 0, medium: 0, low: 0 };
     try {
       for (const severity of Object.keys(counts)) {
-        const rows = reviewStore.listFindings({ limit: 1000, severity, status: 'open' });
+        const rows = reviewStore.listFindings({ limit: 1000, severity, status: 'open', ...filters });
         counts[severity] = Array.isArray(rows) ? rows.length : 0;
       }
     } catch {
       // reviewStore may throw or return a non-array count; keep zero defaults.
     }
     return counts;
+  }
+
+  function listAgents(limit = 1000) {
+    try {
+      return reviewStore.listAgents?.({ limit }) ?? [];
+    } catch {
+      return [];
+    }
   }
 
   function getDeadLetterCount() {
@@ -509,20 +529,103 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       }));
   }
 
-  function overviewPage() {
-    const openBySev = countOpenFindingsBySeverity();
+  function agentIndexPage() {
+    const agents = listAgents(1000);
+    const updatedAt = nowIso();
+    const totalEvents = agents.reduce((sum, agent) => sum + (Number(agent?.event_count) || 0), 0);
+    const openFindings = agents.reduce((sum, agent) => sum + (Number(agent?.open_finding_count) || 0), 0);
+    const totalFindings = agents.reduce((sum, agent) => sum + (Number(agent?.finding_count) || 0), 0);
+
+    const rows = agents.map((agent) => ({
+      agent_id: {
+        text: agent.agent_id ?? '',
+        href: agent.agent_id ? agentDashboardUrl(agent.agent_id) : undefined,
+        mono: true,
+      },
+      event_count: {
+        text: String(agent.event_count ?? 0),
+        href: agent.agent_id ? agentDashboardUrl(agent.agent_id) : undefined,
+        mono: true,
+      },
+      open_finding_count: {
+        text: String(agent.open_finding_count ?? 0),
+        tone: Number(agent.open_finding_count ?? 0) > 0 ? 'high' : 'success',
+      },
+      finding_count: {
+        text: String(agent.finding_count ?? 0),
+        mono: true,
+      },
+      last_event_at: {
+        text: formatTime(agent.last_event_at),
+        mono: true,
+      },
+    }));
+
+    const sections = rows.length > 0
+      ? [{
+          id: 'received_agents',
+          title: '已接收日志的 Agent',
+          type: 'table',
+          columns: AGENT_INDEX_COLUMNS,
+          rows,
+        }]
+      : [{
+          id: 'empty_agents',
+          title: '暂无 Agent 日志',
+          type: 'callout',
+          body: '当前数据库还没有接收到任何 Agent 日志。日志写入后，这里会展示对应的 Agent ID。',
+        }];
+
+    return {
+      page: {
+        title: 'Agent 日志入口',
+        subtitle: '选择已接收日志的 Agent，进入对应的日志审计结果。',
+        updated_at: updatedAt,
+        breadcrumbs: [{ label: 'Agent 列表', href: '/' }],
+        context_badges: [
+          { label: `Agent ${agents.length}`, tone: 'neutral' },
+          { label: `待处理发现 ${openFindings}`, tone: openFindings > 0 ? 'high' : 'neutral' },
+        ],
+        page_actions: [{ label: '查看全部审计', href: dashboardPath, kind: 'secondary' }],
+      },
+      summary_metrics: [
+        { label: 'Agent 数', value: agents.length, tone: 'neutral' },
+        { label: '接收日志', value: totalEvents, tone: 'neutral' },
+        { label: '待处理发现', value: openFindings, tone: openFindings > 0 ? 'high' : 'success' },
+        { label: '累计发现', value: totalFindings, tone: totalFindings > 0 ? 'medium' : 'neutral' },
+      ],
+      filters: [],
+      sections,
+    };
+  }
+
+  function overviewPage({ agentId } = {}) {
+    const findingFilters = agentId ? { agentId } : {};
+    const openBySev = countOpenFindingsBySeverity(findingFilters);
     const deadLetters = getDeadLetterCount();
     const runs = listRuns(20);
-    const findings = listFindings(1000).slice().sort(compareFindings);
+    const findings = listFindings(1000, findingFilters).slice().sort(compareFindings);
+    const relevantReviewIds = agentId
+      ? new Set(findings.map((finding) => finding?.review_id).filter(isPresent))
+      : null;
+    const visibleRuns = relevantReviewIds
+      ? runs.filter((run) => relevantReviewIds.has(run?.review_id))
+      : runs;
     const updatedAt = nowIso();
     const openFindingTotal = Object.values(openBySev).reduce((sum, count) => sum + count, 0);
-    const latestRun = runs[0] ?? null;
+    const latestRun = visibleRuns[0] ?? null;
+    const severityHref = (severity) => {
+      const params = new URLSearchParams();
+      if (agentId) params.set('agent_id', agentId);
+      params.set('severity', severity);
+      return `${dashboardPath}?${params.toString()}#pending_findings`;
+    };
 
     const summary_metrics = [
-      { label: SEVERITY_LABELS.critical, value: openBySev.critical, tone: 'critical', href: `${dashboardPath}?severity=critical#pending_findings` },
-      { label: SEVERITY_LABELS.high, value: openBySev.high, tone: 'high', href: `${dashboardPath}?severity=high#pending_findings` },
-      { label: SEVERITY_LABELS.medium, value: openBySev.medium, tone: 'medium', href: `${dashboardPath}?severity=medium#pending_findings` },
-      { label: SEVERITY_LABELS.low, value: openBySev.low, tone: 'low', href: `${dashboardPath}?severity=low#pending_findings` },
+      { label: SEVERITY_LABELS.critical, value: openBySev.critical, tone: 'critical', href: severityHref('critical') },
+      { label: SEVERITY_LABELS.high, value: openBySev.high, tone: 'high', href: severityHref('high') },
+      { label: SEVERITY_LABELS.medium, value: openBySev.medium, tone: 'medium', href: severityHref('medium') },
+      { label: SEVERITY_LABELS.low, value: openBySev.low, tone: 'low', href: severityHref('low') },
       { label: '死信消息', value: deadLetters, tone: deadLetters > 0 ? 'critical' : 'neutral', href: `${dashboardPath}#dead_letters` },
     ];
 
@@ -534,9 +637,15 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       });
     }
     context_badges.push({
-      label: `待处理发现：${openFindingTotal}`,
+      label: `${agentId ? '当前 Agent ' : ''}待处理发现：${openFindingTotal}`,
       tone: openFindingTotal > 0 ? 'high' : 'neutral',
     });
+    if (agentId) {
+      context_badges.unshift({
+        label: `Agent：${agentId}`,
+        tone: 'neutral',
+      });
+    }
     if (deadLetters > 0) {
       context_badges.push({
         label: `死信消息：${deadLetters}`,
@@ -545,8 +654,18 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     }
 
     const page_actions = [];
-    const latestRunWithFindings = runs.find((run) => (run?.finding_count ?? 0) > 0 && run?.review_id);
-    if (latestRunWithFindings) {
+    if (agentId) {
+      page_actions.push({
+        label: '返回 Agent 列表',
+        href: '/',
+      });
+      page_actions.push({
+        label: '查看全部审计',
+        href: dashboardPath,
+      });
+    }
+    const latestRunWithFindings = visibleRuns.find((run) => (run?.finding_count ?? 0) > 0 && run?.review_id);
+    if (!agentId && latestRunWithFindings) {
       page_actions.push({
         label: '打开最新有发现的审查',
         href: reviewUrl(latestRunWithFindings.review_id),
@@ -559,7 +678,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
         href: findingUrl(highestSeverityOpenFinding.finding_id),
       });
     }
-    const degradedRun = runs.find((run) => run?.status === 'completed_degraded' && run?.review_id);
+    const degradedRun = visibleRuns.find((run) => run?.status === 'completed_degraded' && run?.review_id);
     if (degradedRun) {
       page_actions.push({
         label: '打开最新降级审查',
@@ -599,8 +718,8 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       },
     }));
 
-    const runsWithFindings = runs.filter((run) => (run?.finding_count ?? 0) > 0);
-    const runsWithoutFindings = runs.filter((run) => (run?.finding_count ?? 0) === 0);
+    const runsWithFindings = visibleRuns.filter((run) => (run?.finding_count ?? 0) > 0);
+    const runsWithoutFindings = visibleRuns.filter((run) => (run?.finding_count ?? 0) === 0);
 
     const reviewRowsFor = (rows, { includeSecondary }) => rows.map((run) => ({
       review_id: {
@@ -667,10 +786,12 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
 
     return {
       page: {
-        title: '审计审查总览',
-        subtitle: '查看最近审查、待处理风险和关联证据。',
+        title: agentId ? `Agent 日志审计：${agentId}` : '审计审查总览',
+        subtitle: agentId ? '查看该 Agent 的待处理风险和关联证据。' : '查看最近审查、待处理风险和关联证据。',
         updated_at: updatedAt,
-        breadcrumbs: [{ label: '总览', href: dashboardPath }],
+        breadcrumbs: agentId
+          ? [{ label: 'Agent 列表', href: '/' }, { label: 'Agent 审计', href: agentDashboardUrl(agentId) }]
+          : [{ label: '总览', href: dashboardPath }],
         context_badges,
         page_actions,
       },
@@ -1015,6 +1136,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
   return {
     dashboardUrlFor,
     findingUrlFor,
+    agentIndexPage,
     overviewPage,
     reviewDetailPage,
     findingDetailPage,

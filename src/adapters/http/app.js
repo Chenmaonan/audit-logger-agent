@@ -366,12 +366,25 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
       }
 
       // ===================== Dashboard Pages (v1.4) =====================
+      if (hasReviewDeps && req.method === 'GET' && (url.pathname === '/' || url.pathname === '')) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeDashboard(req);
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
+        const page = typeof visualization.agentIndexPage === 'function'
+          ? visualization.agentIndexPage()
+          : visualization.overviewPage();
+        html(res, 200, renderDashboard(page), cors);
+        return;
+      }
+
       if (hasReviewDeps && req.method === 'GET' && (url.pathname === '/dashboard' || url.pathname === '/dashboard/')) {
         const cors = reviewCors(req);
         const auth = dashboardAuth.authorizeDashboard(req);
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
-        const page = visualization.overviewPage();
+        const agentId = url.searchParams.get('agent_id') || undefined;
+        const page = visualization.overviewPage({ agentId });
         html(res, 200, renderDashboard(page), cors);
         return;
       }
