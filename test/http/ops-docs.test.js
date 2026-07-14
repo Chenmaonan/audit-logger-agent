@@ -15,6 +15,8 @@ test('config.json exposes retention defaults for runtime data and owned files', 
   assert.deepEqual(
     {
       runtimeRunsDays: config.retention.runtimeRunsDays,
+      eventsHours: config.retention.eventsHours,
+      maxEventsPerAgent: config.retention.maxEventsPerAgent,
       waitingStatesDays: config.retention.waitingStatesDays,
       llmUsageDays: config.retention.llmUsageDays,
       logFilesDays: config.retention.logFilesDays,
@@ -23,6 +25,8 @@ test('config.json exposes retention defaults for runtime data and owned files', 
     },
     {
       runtimeRunsDays: 30,
+      eventsHours: 48,
+      maxEventsPerAgent: 200,
       waitingStatesDays: 30,
       llmUsageDays: 90,
       logFilesDays: 14,

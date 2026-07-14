@@ -71,6 +71,10 @@ function makeCandidate(row, category, reason, extras = {}) {
   };
 }
 
+function isToolEvent(row) {
+  return typeof row?.event === 'string' && row.event.startsWith('tool.');
+}
+
 export function createCandidateDetector({ db, riskPolicy } = {}) {
   if (!db) throw new Error('createCandidateDetector: db is required');
   const columns = new Set(db.prepare('PRAGMA table_info(audit_events)').all().map((row) => row.name));
@@ -82,6 +86,7 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
   const highRiskToolPatterns = policy.highRiskToolPatterns ?? [];
   const agentToolAllowlists = policy.agentToolAllowlists ?? {};
   const trustedChannels = policy.trustedChannels ?? [];
+  const traceToolChainStepThreshold = policy.traceToolChainStepThreshold ?? 50;
 
   const selectSql = `
     SELECT id, ts, agent_id, trace_id, span_id, parent_span_id, event, tool_name,
@@ -104,13 +109,33 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
     const repeatBuckets = new Map();
     // For trace_integrity: span_ids that have end/error events.
     const endedSpanIds = new Set();
+    const traceToolEvents = new Map();
     // To avoid duplicate candidates for the same anchor event.
     const emittedEventIds = new Set();
 
-    // First pass: collect ended span_ids and build repeat buckets.
+    // First pass: collect ended span_ids and per-trace tool event counts.
     for (const row of rows) {
       if (row.event === 'tool.end' || row.event === 'tool.error') {
         if (row.span_id) endedSpanIds.add(row.span_id);
+      }
+      if (row.trace_id && isToolEvent(row)) {
+        const bucket = traceToolEvents.get(row.trace_id) ?? [];
+        bucket.push(row);
+        traceToolEvents.set(row.trace_id, bucket);
+      }
+    }
+
+    for (const [traceId, traceRows] of traceToolEvents.entries()) {
+      if (traceRows.length > traceToolChainStepThreshold) {
+        const anchor = traceRows[0];
+        candidates.push(
+          makeCandidate(
+            anchor,
+            'anomalous_call',
+            `trace_id=${traceId} has ${traceRows.length} tool-chain steps, exceeds ${traceToolChainStepThreshold} step threshold`,
+            { min_severity: 'medium' },
+          ),
+        );
       }
     }
 

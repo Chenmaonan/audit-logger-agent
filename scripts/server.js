@@ -248,6 +248,7 @@ const app = createHttpApp({
   visualization: reviewVisualization,
   dashboardAuth,
   toolSemanticMapper,
+  retentionService,
 });
 const portIndex = process.argv.indexOf('--port');
 const portArg = portIndex >= 0 ? Number(process.argv[portIndex + 1]) : 9320;

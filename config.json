@@ -24,7 +24,8 @@
   "retention": {
     "enabled": true,
     "runAtHour": 4,
-    "eventsDays": 90,
+    "eventsHours": 48,
+    "maxEventsPerAgent": 200,
     "runtimeRunsDays": 30,
     "waitingStatesDays": 30,
     "resolvedFindingsDays": 30,
@@ -58,6 +59,7 @@
       "repeatWindowMinutes": 10,
       "repeatThreshold": 5,
       "slowCallDurationMs": 30000,
+      "traceToolChainStepThreshold": 50,
       "highRiskToolPatterns": [
         "*delete*",
         "*write*",

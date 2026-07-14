@@ -77,7 +77,8 @@ function makeConfig(rootDir, overrides = {}) {
     retention: {
       enabled: true,
       runAtHour: 4,
-      eventsDays: 90,
+      eventsHours: 48,
+      maxEventsPerAgent: 200,
       runtimeRunsDays: 30,
       waitingStatesDays: 30,
       resolvedFindingsDays: 30,
@@ -101,18 +102,24 @@ function writeFileWithMtime(filePath, contents, isoTime) {
   fs.utimesSync(filePath, fileTime, fileTime);
 }
 
-function insertEvent(db, id, ts) {
+function insertEvent(db, id, ts, agentId = 'agent') {
+  const suffix = `${agentId}-${id}`;
   db.prepare(`
     INSERT INTO audit_events (
       row_hash, ts, agent_id, trace_id, span_id, parent_span_id, event,
       tool_name, status, result_summary, duration_ms, channel, user_id,
       entity_type, entity_id, llm_intent_json, error_message, tags, raw_json
     ) VALUES (
-      @row_hash, @ts, 'agent', 'trace', @span_id, NULL, 'tool.end',
+      @row_hash, @ts, @agent_id, 'trace', @span_id, NULL, 'tool.end',
       'tool.name', 'OK', NULL, 1, NULL, NULL,
       NULL, NULL, NULL, NULL, NULL, '{}'
     )
-  `).run({ row_hash: `hash-${id}`, ts, span_id: `span-${id}` });
+  `).run({
+    row_hash: agentId === 'agent' ? `hash-${id}` : `hash-${suffix}`,
+    ts,
+    agent_id: agentId,
+    span_id: `span-${suffix}`,
+  });
 }
 
 function insertReviewRun(db, id, startedAt) {
@@ -244,7 +251,7 @@ test('retention dry-run reports expired rows without deleting protected data', (
   });
 
   insertEvent(db, 1, '2026-03-01T00:00:00.000Z');
-  insertEvent(db, 2, '2026-06-20T00:00:00.000Z');
+  insertEvent(db, 2, '2026-07-05T00:00:00.000Z');
   insertReviewRun(db, 'old-run', '2026-04-01T00:00:00.000Z');
   insertReviewRun(db, 'new-run', '2026-06-20T00:00:00.000Z');
   insertFinding(db, 'resolved-old', {
@@ -408,7 +415,7 @@ test('retention deletes expired data in batches and keeps open or acknowledged f
   for (let i = 1; i <= 5; i++) {
     insertEvent(db, i, `2026-03-0${i}T00:00:00.000Z`);
   }
-  insertEvent(db, 99, '2026-07-01T00:00:00.000Z');
+  insertEvent(db, 99, '2026-07-05T00:00:00.000Z');
   insertFinding(db, 'resolved-old', {
     status: 'resolved',
     createdAt: '2026-04-01T00:00:00.000Z',
@@ -435,6 +442,77 @@ test('retention deletes expired data in batches and keeps open or acknowledged f
   assert.deepEqual(
     db.prepare(`SELECT finding_id FROM audit_review_findings ORDER BY finding_id`).all().map((row) => row.finding_id),
     ['acked-old', 'open-old'],
+  );
+
+  db.close();
+  fs.rmSync(rootDir, { recursive: true, force: true });
+});
+
+test('retention removes audit events older than 48 hours per agent', () => {
+  const rootDir = tmpDir();
+  const db = makeDb();
+  const service = createRetentionService({
+    db,
+    config: makeConfig(rootDir),
+    cursorStore: createIngestCursorStore(db),
+    now: () => new Date('2026-07-06T12:00:00.000Z'),
+  });
+
+  insertEvent(db, 'a-old', '2026-07-04T11:59:59.999Z', 'agent-a');
+  insertEvent(db, 'a-boundary', '2026-07-04T12:00:00.000Z', 'agent-a');
+  insertEvent(db, 'a-fresh', '2026-07-05T00:00:00.000Z', 'agent-a');
+  insertEvent(db, 'b-old', '2026-07-04T10:00:00.000Z', 'agent-b');
+  insertEvent(db, 'b-fresh', '2026-07-06T00:00:00.000Z', 'agent-b');
+
+  const result = service.run();
+
+  assert.equal(result.deleted.auditEvents, 2);
+  assert.deepEqual(
+    db.prepare(`SELECT agent_id, row_hash FROM audit_events ORDER BY agent_id, ts`).all(),
+    [
+      { agent_id: 'agent-a', row_hash: 'hash-agent-a-a-boundary' },
+      { agent_id: 'agent-a', row_hash: 'hash-agent-a-a-fresh' },
+      { agent_id: 'agent-b', row_hash: 'hash-agent-b-b-fresh' },
+    ],
+  );
+
+  db.close();
+  fs.rmSync(rootDir, { recursive: true, force: true });
+});
+
+test('retention keeps only the latest 200 audit events for each agent', () => {
+  const rootDir = tmpDir();
+  const db = makeDb();
+  const service = createRetentionService({
+    db,
+    config: makeConfig(rootDir),
+    cursorStore: createIngestCursorStore(db),
+    now: () => new Date('2026-07-06T12:00:00.000Z'),
+  });
+
+  const start = Date.parse('2026-07-05T00:00:00.000Z');
+  for (let i = 1; i <= 205; i++) {
+    insertEvent(db, i, new Date(start + i * 60 * 1000).toISOString(), 'agent-a');
+  }
+  for (let i = 1; i <= 200; i++) {
+    insertEvent(db, i, new Date(start + i * 60 * 1000).toISOString(), 'agent-b');
+  }
+
+  const result = service.run({ batchSize: 2 });
+
+  assert.equal(result.deleted.auditEvents, 5);
+  assert.ok(result.batches.auditEvents.every((n) => n <= 2), 'audit_events delete batches should respect batchSize');
+  assert.deepEqual(
+    db.prepare(`SELECT COUNT(*) AS count FROM audit_events WHERE agent_id = 'agent-a'`).get().count,
+    200,
+  );
+  assert.deepEqual(
+    db.prepare(`SELECT COUNT(*) AS count FROM audit_events WHERE agent_id = 'agent-b'`).get().count,
+    200,
+  );
+  assert.deepEqual(
+    db.prepare(`SELECT row_hash FROM audit_events WHERE agent_id = 'agent-a' ORDER BY ts ASC LIMIT 1`).get().row_hash,
+    'hash-agent-a-6',
   );
 
   db.close();

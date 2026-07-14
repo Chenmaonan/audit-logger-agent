@@ -260,7 +260,7 @@ function mapRuntimeError(error) {
   return { status: 500, body: { error_code: 'internal_error', error: 'Internal server error' } };
 }
 
-export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth, toolSemanticMapper, now = () => new Date() } = {}) {
+export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth, toolSemanticMapper, retentionService, now = () => new Date() } = {}) {
   // Helpers for audit-review routes. These are optional — if not provided
   // (e.g. in the existing runs-api test), the new routes return 503.
   const hasReviewDeps = !!(scheduler && reviewStore && visualization && dashboardAuth);
@@ -438,9 +438,19 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
           config,
           db,
           toolSemanticMapper,
-          onAcceptedBatch: typeof scheduler?.runAfterIngest === 'function'
-            ? () => scheduler.runAfterIngest()
-            : undefined,
+          onAcceptedBatch: () => {
+            if (typeof retentionService?.pruneAuditEvents === 'function') {
+              try {
+                retentionService.pruneAuditEvents();
+              } catch {
+                // Retention failures must not block review scheduling.
+              }
+            }
+            if (typeof scheduler?.runAfterIngest === 'function') {
+              return scheduler.runAfterIngest();
+            }
+            return undefined;
+          },
         });
         return;
       }

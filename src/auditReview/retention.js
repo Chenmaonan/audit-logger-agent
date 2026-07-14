@@ -2,13 +2,17 @@ import fs from 'fs';
 import path from 'path';
 
 const DEFAULT_BATCH_SIZE = 5000;
+const DEFAULT_AUDIT_EVENT_MAX_AGE_HOURS = 48;
+const DEFAULT_AUDIT_EVENT_MAX_PER_AGENT = 200;
+const MS_PER_HOUR = 60 * 60 * 1000;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const TERMINAL_RUN_STATUSES_SQL = `'completed', 'failed', 'cancelled'`;
 
 const DEFAULT_RETENTION = {
   enabled: true,
   runAtHour: 4,
-  eventsDays: 90,
+  eventsHours: DEFAULT_AUDIT_EVENT_MAX_AGE_HOURS,
+  maxEventsPerAgent: DEFAULT_AUDIT_EVENT_MAX_PER_AGENT,
   runtimeRunsDays: 30,
   waitingStatesDays: 30,
   resolvedFindingsDays: 30,
@@ -38,12 +42,26 @@ function cutoffIso(now, days) {
   return new Date(now.getTime() - days * MS_PER_DAY).toISOString();
 }
 
+function cutoffIsoHours(now, hours) {
+  return new Date(now.getTime() - hours * MS_PER_HOUR).toISOString();
+}
+
 function cutoffDay(now, days) {
   return cutoffIso(now, days).slice(0, 10);
 }
 
+function safePositiveNumber(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 function safeLimit(value) {
   return Number.isInteger(value) && value > 0 ? value : DEFAULT_BATCH_SIZE;
+}
+
+function safePositiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function countRows(db, sql, params) {
@@ -249,15 +267,97 @@ export function createRetentionService({ db, config, cursorStore = null, now = (
   if (!db) throw new Error('createRetentionService: db is required');
   if (!config) throw new Error('createRetentionService: config is required');
 
+  function auditEventRetentionParams(cfg, nowDate) {
+    const eventMaxAgeHours = cfg.eventsHours
+      ?? cfg.auditEventsMaxAgeHours
+      ?? (cfg.eventsDays ? cfg.eventsDays * 24 : DEFAULT_AUDIT_EVENT_MAX_AGE_HOURS);
+    return {
+      cutoff: cutoffIsoHours(nowDate, safePositiveNumber(eventMaxAgeHours, DEFAULT_AUDIT_EVENT_MAX_AGE_HOURS)),
+      maxPerAgent: safePositiveInteger(
+        cfg.maxEventsPerAgent ?? cfg.auditEventsMaxPerAgent,
+        DEFAULT_AUDIT_EVENT_MAX_PER_AGENT,
+      ),
+    };
+  }
+
+  function deleteAuditEvents({ cfg, nowDate, batchSize, dryRun }) {
+    const params = auditEventRetentionParams(cfg, nowDate);
+    const deletion = deleteBatched(db, {
+      countSql: `
+        SELECT COUNT(*) AS count
+        FROM audit_events
+        WHERE ts < @cutoff
+           OR rowid IN (
+             SELECT rowid
+             FROM (
+               SELECT
+                 rowid,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY agent_id
+                   ORDER BY ts DESC, rowid DESC
+                 ) AS retained_rank
+               FROM audit_events
+               WHERE ts >= @cutoff
+             )
+             WHERE retained_rank > @maxPerAgent
+           )
+      `,
+      deleteSql: `
+        DELETE FROM audit_events
+        WHERE rowid IN (
+          SELECT rowid
+          FROM audit_events
+          WHERE ts < @cutoff
+             OR rowid IN (
+               SELECT rowid
+               FROM (
+                 SELECT
+                   rowid,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY agent_id
+                     ORDER BY ts DESC, rowid DESC
+                   ) AS retained_rank
+                 FROM audit_events
+                 WHERE ts >= @cutoff
+               )
+               WHERE retained_rank > @maxPerAgent
+             )
+          ORDER BY ts ASC, rowid ASC
+          LIMIT @limit
+        )
+      `,
+      params: {
+        cutoff: params.cutoff,
+        maxPerAgent: params.maxPerAgent,
+      },
+      batchSize,
+      dryRun,
+    });
+    return { ...params, deletion };
+  }
+
+  function pruneAuditEvents({ dryRun = false, batchSize = DEFAULT_BATCH_SIZE } = {}) {
+    const cfg = retentionConfig(config);
+    const size = safeLimit(batchSize);
+    const pruned = deleteAuditEvents({ cfg, nowDate: now(), batchSize: size, dryRun });
+    return {
+      dryRun,
+      cutoff: pruned.cutoff,
+      maxEventsPerAgent: pruned.maxPerAgent,
+      deleted: { auditEvents: pruned.deletion.deleted },
+      batches: { auditEvents: pruned.deletion.batches },
+    };
+  }
+
   function run({ dryRun = false, batchSize = DEFAULT_BATCH_SIZE } = {}) {
     const cfg = retentionConfig(config);
     const size = safeLimit(batchSize);
     const nowDate = now();
-    const eventCutoffIso = cutoffIso(nowDate, cfg.eventsDays);
+    const auditEventsPruned = deleteAuditEvents({ cfg, nowDate, batchSize: size, dryRun });
     const result = {
       dryRun,
       cutoffs: {
-        auditEvents: eventCutoffIso,
+        auditEvents: auditEventsPruned.cutoff,
         agentRuns: cutoffIso(nowDate, cfg.runtimeRunsDays),
         agentRunSteps: cutoffIso(nowDate, cfg.runtimeRunsDays),
         agentWaitingStates: cutoffIso(nowDate, cfg.waitingStatesDays),
@@ -298,18 +398,7 @@ export function createRetentionService({ db, config, cursorStore = null, now = (
     };
 
     const deletions = {
-      auditEvents: deleteBatched(db, {
-        countSql: `SELECT COUNT(*) AS count FROM audit_events WHERE ts < @cutoff`,
-        deleteSql: `
-          DELETE FROM audit_events
-          WHERE rowid IN (
-            SELECT rowid FROM audit_events WHERE ts < @cutoff ORDER BY ts ASC LIMIT @limit
-          )
-        `,
-        params: { cutoff: result.cutoffs.auditEvents },
-        batchSize: size,
-        dryRun,
-      }),
+      auditEvents: auditEventsPruned.deletion,
       agentRunSteps: deleteBatched(db, {
         countSql: `
           SELECT COUNT(*) AS count
@@ -514,7 +603,7 @@ export function createRetentionService({ db, config, cursorStore = null, now = (
     return result;
   }
 
-  return { run };
+  return { run, pruneAuditEvents };
 }
 
 function nextRunDelayMs(now, runAtHour) {

@@ -31,6 +31,9 @@ const CATEGORY_LABELS = {
   trace_integrity: '链路完整性',
   ingest_parse_error: '日志解析错误',
 };
+const TRACE_DISPLAY_STEP_LIMIT = 20;
+const TRACE_ANALYSIS_STEP_LIMIT = 20;
+const TRACE_ABNORMAL_STEP_THRESHOLD = 50;
 
 const OVERVIEW_FINDINGS_COLUMNS = [
   { key: 'title', label: '标题' },
@@ -228,7 +231,7 @@ function lastSeenAtOf(finding) {
 }
 
 function traceSequenceSteps(events) {
-  return orderedTraceEvents(events).map((event, index) => ({
+  return orderedTraceEvents(events).slice(0, TRACE_DISPLAY_STEP_LIMIT).map((event, index) => ({
     order: index + 1,
     timestamp: formatTime(event.ts),
     event: event.event ?? '',
@@ -264,6 +267,7 @@ function compactTraceEventForLlm(event, index) {
 
 function buildTraceAnalysisInput({ finding, traceEvents }) {
   const orderedEvents = orderedTraceEvents(traceEvents);
+  const analysisEvents = orderedEvents.slice(0, TRACE_ANALYSIS_STEP_LIMIT);
   const payload = {
     finding: {
       finding_id: finding.finding_id ?? null,
@@ -282,7 +286,10 @@ function buildTraceAnalysisInput({ finding, traceEvents }) {
           : null
       ),
     },
-    trace_events: orderedEvents.map(compactTraceEventForLlm),
+    trace_event_count: orderedEvents.length,
+    analyzed_trace_event_count: analysisEvents.length,
+    trace_events_truncated: orderedEvents.length > analysisEvents.length,
+    trace_events: analysisEvents.map(compactTraceEventForLlm),
   };
 
   return [
@@ -361,6 +368,22 @@ function traceAnalysisUnavailableSection(message) {
     type: 'callout',
     body: message,
   };
+}
+
+function traceAbnormalSection(totalSteps) {
+  return {
+    id: 'trace_sequence_abnormal',
+    title: '异常情况',
+    type: 'callout',
+    body: `该 Trace 工具链共 ${totalSteps} 步，超过 ${TRACE_ABNORMAL_STEP_THRESHOLD} 步阈值。Dashboard 仅展示前 ${TRACE_DISPLAY_STEP_LIMIT} 步，LLM 链路分析不会继续调用。`,
+  };
+}
+
+function traceSequenceTitle(totalSteps, visibleSteps) {
+  if (totalSteps > visibleSteps) {
+    return `工具调用顺序（显示前 ${visibleSteps} 步，共 ${totalSteps} 步）`;
+  }
+  return `工具调用顺序（共 ${visibleSteps} 步）`;
 }
 
 function insertSectionAfter(sections, anchorId, section) {
@@ -1021,10 +1044,13 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     if (traceSteps.length > 0) {
       sections.push({
         id: 'trace_sequence',
-        title: `工具调用顺序（共 ${traceSteps.length} 步）`,
+        title: traceSequenceTitle(traceEvents.length, traceSteps.length),
         type: 'trace_sequence',
         steps: traceSteps,
       });
+    }
+    if (traceEvents.length > TRACE_ABNORMAL_STEP_THRESHOLD) {
+      sections.push(traceAbnormalSection(traceEvents.length));
     }
     if (traceSteps.length === 0 && isPresent(finding.trace_id)) {
       sections.push({
@@ -1073,6 +1099,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
 
     const traceEvents = orderedTraceEvents(listTraceEvents(finding.trace_id, 200));
     if (traceEvents.length === 0) return page;
+    if (traceEvents.length > TRACE_ABNORMAL_STEP_THRESHOLD) return page;
 
     if (cacheDetailAnalysis && isFreshAnalysisCache(finding)) {
       insertSectionAfter(page.sections, 'trace_sequence', traceAnalysisSection({
@@ -1106,7 +1133,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
         llmError = error;
       }
       if (llmError) throw llmError;
-      const analysis = normalizeTraceAnalysis(raw, traceEvents);
+      const analysis = normalizeTraceAnalysis(raw, traceEvents.slice(0, TRACE_ANALYSIS_STEP_LIMIT));
       if (cacheDetailAnalysis) {
         try {
           reviewStore.saveFindingAnalysis?.(finding.finding_id, { analysis, generatedAt: nowIso() });

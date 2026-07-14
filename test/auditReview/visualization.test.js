@@ -125,6 +125,27 @@ function fakeStore(overrides = {}) {
   };
 }
 
+function traceEvent(index, overrides = {}) {
+  return {
+    id: index,
+    ts: new Date(Date.parse('2026-07-03T10:00:00.000Z') + index * 1000).toISOString(),
+    event: 'tool.end',
+    status: 'OK',
+    tool_name: `tool.${index}`,
+    trace_id: 'trace-critical-1',
+    span_id: `span-${index}`,
+    parent_span_id: null,
+    duration_ms: index,
+    result_summary: `step ${index}`,
+    raw_json: `{"event":"tool.end","id":${index}}`,
+    ...overrides,
+  };
+}
+
+function traceEvents(count) {
+  return Array.from({ length: count }, (_, index) => traceEvent(index + 1));
+}
+
 function createViz(storeOptions = {}, visualizationOptions = {}) {
   return createVisualization({
     reviewStore: fakeStore(storeOptions),
@@ -263,6 +284,22 @@ test('findingDetailPage includes details, raw logs, links, and ordered trace seq
   assert.equal(sequence.steps[1].duration_ms, '640 ms');
 });
 
+test('findingDetailPage limits dashboard trace sequence to first 20 steps and flags over-50 traces', () => {
+  const page = createViz({ traceEvents: traceEvents(60) }).findingDetailPage('f-critical');
+
+  const sequence = page.sections.find((section) => section.id === 'trace_sequence');
+  assert.equal(sequence.title, '工具调用顺序（显示前 20 步，共 60 步）');
+  assert.equal(sequence.steps.length, 20);
+  assert.deepEqual(sequence.steps.map((step) => step.order), Array.from({ length: 20 }, (_, index) => index + 1));
+  assert.equal(sequence.steps[19].tool_name, 'tool.20');
+  assert.equal(JSON.stringify(sequence).includes('tool.21'), false);
+
+  const abnormal = page.sections.find((section) => section.id === 'trace_sequence_abnormal');
+  assert.equal(abnormal.title, '异常情况');
+  assert.ok(abnormal.body.includes('60 步'));
+  assert.ok(abnormal.body.includes('超过 50 步阈值'));
+});
+
 test('findingDetailPage shows a trace fallback callout when no timeline events exist', () => {
   const page = createViz({ traceEvents: [] }).findingDetailPage('f-critical');
   const fallback = page.sections.find((section) => section.id === 'trace_sequence_empty');
@@ -293,6 +330,53 @@ test('findingDetailPageWithAnalysis calls LLM and inserts trace analysis', async
   assert.equal(analysis.title, 'LLM 链路分析');
   assert.equal(analysis.type, 'trace_analysis');
   assert.equal(analysis.purpose, 'delete database row');
+});
+
+test('findingDetailPageWithAnalysis sends only first 20 trace events to LLM', async () => {
+  const calls = [];
+  const llmClient = {
+    async createStructuredResponse(request) {
+      calls.push(request);
+      return {
+        purpose: 'purpose',
+        chain_summary: 'chain',
+        risk_points: [],
+        next_actions: [],
+      };
+    },
+  };
+
+  await createViz({ traceEvents: traceEvents(25) }, { llmClient, model: 'test-model' })
+    .findingDetailPageWithAnalysis('f-critical');
+
+  assert.equal(calls.length, 1);
+  const userMessage = calls[0].input.find((message) => message.role === 'user');
+  const payload = JSON.parse(userMessage.content);
+  assert.equal(payload.trace_event_count, 25);
+  assert.equal(payload.analyzed_trace_event_count, 20);
+  assert.equal(payload.trace_events_truncated, true);
+  assert.equal(payload.trace_events.length, 20);
+  assert.equal(payload.trace_events[19].event_id, 20);
+  assert.equal(JSON.stringify(payload.trace_events).includes('"event_id":21'), false);
+});
+
+test('findingDetailPageWithAnalysis skips LLM for over-50 trace chains', async () => {
+  const calls = [];
+  const llmClient = {
+    async createStructuredResponse(request) {
+      calls.push(request);
+      throw new Error('should not call');
+    },
+  };
+
+  const page = await createViz({ traceEvents: traceEvents(51) }, { llmClient, model: 'test-model' })
+    .findingDetailPageWithAnalysis('f-critical');
+
+  assert.equal(calls.length, 0);
+  const abnormal = page.sections.find((section) => section.id === 'trace_sequence_abnormal');
+  assert.equal(abnormal.title, '异常情况');
+  assert.ok(abnormal.body.includes('51 步'));
+  assert.equal(page.sections.some((section) => section.id === 'trace_llm_analysis'), false);
 });
 
 test('findingDetailPageWithAnalysis reuses cached analysis without calling LLM', async () => {
