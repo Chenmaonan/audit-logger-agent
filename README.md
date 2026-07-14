@@ -35,6 +35,24 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:9320/health'
 
 默认监听 `127.0.0.1:9320`。`/health` 返回正常状态且数据库可写，即表示服务可用。
 
+## 当前 Dokploy 部署
+
+当前服务已部署在 Dokploy，公开访问基地址为：
+
+```text
+http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me
+```
+
+常用入口：
+
+| 入口 | 地址 |
+| --- | --- |
+| Dashboard | `http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me/dashboard` |
+| 健康检查 | `http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me/health` |
+| Agent 日志发送 | `http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me/v1/ingest` |
+
+上游 Agent 的 `AUDIT_INGEST_URL` 应配置为上述 Agent 日志发送地址。`/v1/ingest` 当前没有内建认证，生产环境应只允许可信 Agent 或受控网关访问该地址。
+
 ## 使用入口
 
 | 入口 | 用途 |
