@@ -27,6 +27,100 @@ import { createAuditReviewScheduler } from '../../src/auditReview/scheduler.js';
 import { createToolSemanticMapper } from '../../src/auditReview/toolSemanticMapper.js';
 import { createHttpApp } from '../../src/adapters/http/app.js';
 
+test('dashboard routes pass normalized finding filters to visualization', async () => {
+  const calls = [];
+  const page = {
+    page: { title: '过滤参数测试' },
+    summary_metrics: [],
+    filters: [],
+    sections: [],
+  };
+  const visualization = {
+    agentIndexPage() {
+      return page;
+    },
+    overviewPage(filters) {
+      calls.push({ route: 'overview', filters });
+      return page;
+    },
+    reviewDetailPage(reviewId, filters) {
+      calls.push({ route: 'review', reviewId, filters });
+      return page;
+    },
+  };
+  const dashboardAuth = createDashboardAuth({
+    config: { auditReview: { http: { allowedOrigins: [] } } },
+    env: {},
+  });
+  const app = createHttpApp({
+    db: {},
+    config: {},
+    scheduler: {},
+    reviewStore: {
+      getRun(reviewId) {
+        return reviewId === 'review-1' ? { review_id: reviewId } : null;
+      },
+    },
+    visualization,
+    dashboardAuth,
+  });
+
+  await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
+  const { port } = app.address();
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    const overview = await fetch(
+      `${baseUrl}/dashboard?agent_id=agent%2Fone&severity=high&category=failed_call&status=resolved&review_id=review-1`,
+    );
+    assert.equal(overview.status, 200);
+    assert.equal(overview.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(calls.shift(), {
+      route: 'overview',
+      filters: {
+        agentId: 'agent/one',
+        severity: 'high',
+        category: 'failed_call',
+        status: 'resolved',
+        reviewId: 'review-1',
+      },
+    });
+
+    const empty = await fetch(
+      `${baseUrl}/dashboard?agent_id=&severity=&category=&status=&review_id=`,
+    );
+    assert.equal(empty.status, 200);
+    assert.deepEqual(calls.shift(), {
+      route: 'overview',
+      filters: {
+        agentId: undefined,
+        severity: undefined,
+        category: undefined,
+        status: undefined,
+        reviewId: undefined,
+      },
+    });
+
+    const review = await fetch(
+      `${baseUrl}/dashboard/audit-reviews/review-1?agent_id=agent-two&severity=medium&category=repeated_call&status=open`,
+    );
+    assert.equal(review.status, 200);
+    assert.equal(review.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(calls.shift(), {
+      route: 'review',
+      reviewId: 'review-1',
+      filters: {
+        agentId: 'agent-two',
+        severity: 'medium',
+        category: 'repeated_call',
+        status: 'open',
+      },
+    });
+  } finally {
+    await new Promise((resolve) => app.close(resolve));
+  }
+});
+
 function makeUpstreamEvent(overrides = {}) {
   return {
     ts: '2026-07-06T07:33:08.200Z',
@@ -406,12 +500,15 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /v1/audit-findings -> >= 1 finding
     // ------------------------------------------------------------------
     let findingId;
+    let findingRecord;
     {
       const res = await fetch(`${baseUrl}/v1/audit-findings`, { headers: bearerHeaders });
       assert.equal(res.status, 200);
       const body = await res.json();
       assert.ok(body.count >= 1, 'should have at least 1 finding');
-      findingId = body.results[0].finding_id;
+      findingRecord = body.results.find((finding) => finding.status === 'open');
+      assert.ok(findingRecord, 'should have at least 1 open finding for dashboard filtering');
+      findingId = findingRecord.finding_id;
       assert.ok(findingId, 'finding should have finding_id');
     }
 
@@ -463,8 +560,8 @@ test('audit review HTTP integration smoke test', async () => {
       assert.equal(html.includes('Severity'), false, 'dashboard should not contain English Severity');
       assert.equal(html.includes('Confidence'), false, 'dashboard should not contain English Confidence');
       assert.equal(html.includes('Data source'), false, 'dashboard should not contain Data source');
-      assert.ok(html.includes('Trace ID'), 'dashboard should contain trace link column');
-      assert.ok(html.includes('#trace_sequence'), 'dashboard should link trace ids to the finding trace sequence');
+      assert.ok(html.includes(findingRecord.title), 'dashboard should include the default open finding');
+      assert.ok(html.includes('/dashboard/audit-findings/'), 'dashboard should link to finding detail evidence');
       assert.doesNotMatch(html, MOJIBAKE_PATTERN);
 
       const filtered = await fetch(`${baseUrl}/dashboard?agent_id=agent-test`, { headers: bearerHeaders });
@@ -479,6 +576,46 @@ test('audit review HTTP integration smoke test', async () => {
       assert.ok(filteredHtml.includes('agent-test'), 'filtered dashboard should contain the agent id');
       assert.ok(filteredHtml.includes('db.delete'), 'filtered dashboard should contain the agent finding tool');
       assert.doesNotMatch(filteredHtml, MOJIBAKE_PATTERN);
+
+      const matchingFilters = new URLSearchParams({
+        agent_id: findingRecord.agent_id,
+        severity: findingRecord.severity,
+        category: findingRecord.category,
+        status: 'open',
+        review_id: findingRecord.review_id,
+      });
+      const matching = await fetch(`${baseUrl}/dashboard?${matchingFilters}`, { headers: bearerHeaders });
+      assert.equal(matching.status, 200, 'GET dashboard with matching filters should be 200');
+      assert.equal(matching.headers.get('cache-control'), 'no-store');
+      const matchingHtml = await matching.text();
+      assert.ok(matchingHtml.includes(findingRecord.title), 'matching filters should retain the finding');
+      assert.equal(matchingHtml.includes('test-token-123'), false, 'filtered dashboard must not expose the API token');
+
+      for (const [filterName, filterValue] of [
+        ['agent_id', 'other-agent'],
+        ['severity', 'critical'],
+        ['category', 'failed_call'],
+        ['status', 'resolved'],
+        ['review_id', 'other-review'],
+      ]) {
+        const params = new URLSearchParams({
+          agent_id: findingRecord.agent_id,
+          severity: findingRecord.severity,
+          category: findingRecord.category,
+          status: 'open',
+          review_id: findingRecord.review_id,
+        });
+        params.set(filterName, filterValue);
+        const excluded = await fetch(`${baseUrl}/dashboard?${params}`, { headers: bearerHeaders });
+        assert.equal(excluded.status, 200, `GET dashboard with non-matching ${filterName} should be 200`);
+        const excludedHtml = await excluded.text();
+        assert.equal(
+          excludedHtml.includes(findingRecord.title),
+          false,
+          `non-matching ${filterName} should exclude the finding`,
+        );
+        assert.doesNotMatch(excludedHtml, MOJIBAKE_PATTERN);
+      }
     }
 
     // ------------------------------------------------------------------
@@ -491,9 +628,26 @@ test('audit review HTTP integration smoke test', async () => {
       const html = await res.text();
       assert.ok(html.includes('<html'), 'review detail html should contain <html');
       assert.ok(html.includes('审查批次'), 'review detail should contain Chinese review title');
-      assert.ok(html.includes('Trace ID'), 'review detail should contain trace link column');
-      assert.ok(html.includes('#trace_sequence'), 'review detail should link trace ids to the finding trace sequence');
       assert.doesNotMatch(html, MOJIBAKE_PATTERN);
+
+      const matching = await fetch(
+        `${baseUrl}/dashboard/audit-reviews/${findingRecord.review_id}?agent_id=${encodeURIComponent(findingRecord.agent_id)}&severity=${encodeURIComponent(findingRecord.severity)}&category=${encodeURIComponent(findingRecord.category)}&status=open`,
+        { headers: bearerHeaders },
+      );
+      assert.equal(matching.status, 200, 'GET filtered review detail should be 200');
+      assert.equal(matching.headers.get('cache-control'), 'no-store');
+      const matchingHtml = await matching.text();
+      assert.ok(matchingHtml.includes(findingRecord.title), 'matching review filters should retain the finding');
+      assert.equal(matchingHtml.includes('test-token-123'), false, 'filtered review must not expose the API token');
+
+      const excluded = await fetch(
+        `${baseUrl}/dashboard/audit-reviews/${findingRecord.review_id}?severity=critical`,
+        { headers: bearerHeaders },
+      );
+      assert.equal(excluded.status, 200, 'GET review detail with non-matching severity should be 200');
+      const excludedHtml = await excluded.text();
+      assert.equal(excludedHtml.includes(findingRecord.title), false, 'non-matching review filter should exclude the finding');
+      assert.doesNotMatch(excludedHtml, MOJIBAKE_PATTERN);
     }
 
     // ------------------------------------------------------------------

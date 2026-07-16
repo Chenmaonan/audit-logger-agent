@@ -200,6 +200,21 @@ function parseUrl(req) {
   return new URL(req.url, 'http://127.0.0.1');
 }
 
+function optionalSearchParam(url, name) {
+  return url.searchParams.get(name) || undefined;
+}
+
+function dashboardFindingFilters(url, { includeReviewId = false } = {}) {
+  const filters = {
+    agentId: optionalSearchParam(url, 'agent_id'),
+    severity: optionalSearchParam(url, 'severity'),
+    category: optionalSearchParam(url, 'category'),
+    status: optionalSearchParam(url, 'status'),
+  };
+  if (includeReviewId) filters.reviewId = optionalSearchParam(url, 'review_id');
+  return filters;
+}
+
 function isNonEmptyString(value) {
   return typeof value === 'string' && value.trim() !== '';
 }
@@ -383,8 +398,8 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         const auth = dashboardAuth.authorizeDashboard(req);
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
-        const agentId = url.searchParams.get('agent_id') || undefined;
-        const page = visualization.overviewPage({ agentId });
+        const filters = dashboardFindingFilters(url, { includeReviewId: true });
+        const page = visualization.overviewPage(filters);
         html(res, 200, renderDashboard(page), cors);
         return;
       }
@@ -397,7 +412,8 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         const reviewId = decodeURIComponent(url.pathname.split('/').pop());
         const run = reviewStore.getRun(reviewId);
         if (!run) { html(res, 404, '<h1>Review not found</h1>', cors); return; }
-        const page = visualization.reviewDetailPage(reviewId);
+        const filters = dashboardFindingFilters(url);
+        const page = visualization.reviewDetailPage(reviewId, filters);
         html(res, 200, renderDashboard(page), cors);
         return;
       }

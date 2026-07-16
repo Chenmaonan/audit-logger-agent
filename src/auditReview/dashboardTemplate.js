@@ -5,10 +5,10 @@
 const SEVERITY_TONES = {
   critical: { color: '#B42318', bg: '#fdecea', label: '严重' },
   high: { color: '#C2410C', bg: '#fff1e8', label: '高风险' },
-  medium: { color: '#B7791F', bg: '#fff8e1', label: '中风险' },
-  low: { color: '#475569', bg: '#f1f5f9', label: '低风险' },
+  medium: { color: '#A66B00', bg: '#fff8e1', label: '中风险' },
+  low: { color: '#526173', bg: '#f1f5f9', label: '低风险' },
   neutral: { color: '#475467', bg: '#f5f7fa', label: '信息' },
-  success: { color: '#15803D', bg: '#ecfdf5', label: '成功' },
+  success: { color: '#16805D', bg: '#ecfdf5', label: '成功' },
 };
 
 function escapeHtml(str) {
@@ -22,7 +22,7 @@ function escapeHtml(str) {
 }
 
 function hasValue(value) {
-  return value !== null && value !== undefined && value !== '' && value !== 0;
+  return value !== null && value !== undefined && value !== '';
 }
 
 function visibleMetrics(metrics = []) {
@@ -51,8 +51,8 @@ function toneFor(tone) {
 }
 
 function renderStatusTag(text, toneKey) {
-  const tone = toneFor(toneKey);
-  return `<span class="status-tag" style="color:${tone.color};background:${tone.bg}">${escapeHtml(text)}</span>`;
+  const tone = escapeHtml(toneKey ?? 'neutral');
+  return `<span class="status-tag" data-tone="${tone}"><span class="status-marker" aria-hidden="true"></span><span>${escapeHtml(text)}</span></span>`;
 }
 
 function renderSecondaryText(secondary) {
@@ -93,17 +93,52 @@ function renderSectionIdAttr(id) {
   return hasValue(id) ? ` id="${escapeHtml(id)}"` : '';
 }
 
+function columnKeyClass(column) {
+  const key = String(column?.key ?? 'value')
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return `column-${key || 'value'}`;
+}
+
+function columnPriorityClass(column) {
+  const priority = ['primary', 'secondary', 'metadata'].includes(column?.priority)
+    ? column.priority
+    : 'primary';
+  return `column-priority-${priority}`;
+}
+
+function renderColumnClass(column) {
+  return `${columnKeyClass(column)} ${columnPriorityClass(column)}`;
+}
+
+function renderDataSection({ id, title, className = '', body, collapsible = false }) {
+  const classes = ['data-section', className, collapsible ? 'collapsible-section' : '']
+    .filter(Boolean)
+    .join(' ');
+  if (collapsible) {
+    return `<details${renderSectionIdAttr(id)} class="${classes}">
+    <summary class="section-summary"><span class="section-title">${title || '详细信息'}</span><span class="section-summary-hint">展开</span></summary>
+    ${body}
+  </details>`;
+  }
+  return `<section${renderSectionIdAttr(id)} class="${classes}">
+    ${title ? `<h2 class="section-title">${title}</h2>` : ''}
+    ${body}
+  </section>`;
+}
+
 function renderSummaryMetric(metric) {
   const tone = toneFor(metric.tone);
   const value = escapeHtml(metric.value);
   const label = escapeHtml(metric.label ?? tone.label ?? '');
-  const cardContent = `<div class="metric-card" data-tone="${escapeHtml(metric.tone ?? 'neutral')}" style="border-top: 3px solid ${tone.color}; background:${tone.bg}">
-    <div class="metric-value" style="color:${tone.color}">${value}</div>
+  const cardContent = `<div class="summary-metric" data-tone="${escapeHtml(metric.tone ?? 'neutral')}">
+    <div class="metric-value">${value}</div>
     <div class="metric-label">${label}</div>
   </div>`;
 
   if (metric.href) {
-    return `<a href="${escapeHtml(metric.href)}" class="metric-card-link">${cardContent}</a>`;
+    return `<a href="${escapeHtml(metric.href)}" class="summary-metric-link">${cardContent}</a>`;
   }
 
   return cardContent;
@@ -112,25 +147,35 @@ function renderSummaryMetric(metric) {
 function renderSummaryMetrics(metrics) {
   const visible = visibleMetrics(metrics);
   if (!Array.isArray(visible) || visible.length === 0) return '';
-  return `<div class="summary-metrics">${visible.map(renderSummaryMetric).join('\n')}</div>`;
+  return `<section class="summary-metrics" aria-label="概要指标">${visible.map(renderSummaryMetric).join('\n')}</section>`;
 }
 
-function renderSeverityLegend() {
-  const items = Object.entries(SEVERITY_TONES)
-    .filter(([key]) => key !== 'neutral')
-    .map(([, tone]) => `<span class="legend-item"><span class="legend-dot" style="background:${tone.color}"></span>${tone.label}</span>`)
-    .join('');
-  return `<div class="severity-legend">${items}</div>`;
-}
-
-function renderFilterBar(filters) {
+function renderFilterBar(filters, clearFiltersHref) {
   if (!Array.isArray(filters) || filters.length === 0) return '';
-  const selects = filters.map((f) => {
-    const id = escapeHtml(f.id ?? '');
-    const label = escapeHtml(f.label ?? f.id ?? '');
-    return `<div class="filter-item"><label for="filter-${id}">${label}</label><select id="filter-${id}" name="${id}" disabled><option value="">全部</option></select></div>`;
-  }).join('\n');
-  return `<div class="filter-bar">${selects}</div>`;
+  const groups = filters.map((filter) => {
+    const label = escapeHtml(filter.label ?? filter.id ?? '');
+    const options = Array.isArray(filter.options)
+      ? filter.options.filter((option) => hasValue(option?.href))
+      : [];
+    if (options.length === 0 && !hasValue(filter.clear_href)) return '';
+
+    const links = options.map((option) => {
+      const isActive = option.active === true || String(option.value ?? '') === String(filter.value ?? '');
+      const activeClass = isActive ? ' active' : '';
+      const current = isActive ? ' aria-current="true"' : '';
+      return `<a href="${escapeHtml(option.href)}" class="filter-option${activeClass}"${current}>${escapeHtml(option.label ?? option.value ?? '')}</a>`;
+    }).join('');
+    const clearLink = hasValue(filter.clear_href)
+      ? `<a href="${escapeHtml(filter.clear_href)}" class="filter-clear">清除${label}</a>`
+      : '';
+    return `<div class="filter-group"><span class="filter-label">${label}</span><div class="filter-options">${links}${clearLink}</div></div>`;
+  }).filter(Boolean).join('\n');
+  if (!groups) return '';
+
+  const clearAll = hasValue(clearFiltersHref)
+    ? `<a href="${escapeHtml(clearFiltersHref)}" class="filter-clear-all">清除全部筛选</a>`
+    : '';
+  return `<nav class="filter-bar" aria-label="审计筛选">${groups}${clearAll}</nav>`;
 }
 
 function renderBreadcrumbs(breadcrumbs) {
@@ -153,8 +198,8 @@ function renderBreadcrumbs(breadcrumbs) {
 function renderContextBadges(badges) {
   if (!Array.isArray(badges) || badges.length === 0) return '';
   return `<div class="context-badges">${badges.map((badge) => {
-    const tone = toneFor(badge.tone);
-    return `<span class="context-badge" style="color:${tone.color};background:${tone.bg}">${escapeHtml(badge.label ?? '')}</span>`;
+    const tone = escapeHtml(badge.tone ?? 'neutral');
+    return `<span class="context-badge" data-tone="${tone}"><span class="status-marker" aria-hidden="true"></span><span>${escapeHtml(badge.label ?? '')}</span></span>`;
   }).join('')}</div>`;
 }
 
@@ -176,19 +221,20 @@ function renderTableSection(section) {
   if (rows.length === 0) return '';
 
   const thead = columns.length > 0
-    ? `<tr>${columns.map((c) => `<th>${escapeHtml(c.label ?? c.key ?? '')}</th>`).join('')}</tr>`
-    : '<tr><th></th></tr>';
+    ? `<tr>${columns.map((c) => `<th scope="col" class="${renderColumnClass(c)}">${escapeHtml(c.label ?? c.key ?? '')}</th>`).join('')}</tr>`
+    : '<tr><th scope="col"></th></tr>';
   const tbody = rows.map((row) => {
     if (columns.length > 0) {
-      return `<tr>${columns.map((c) => `<td>${renderTableCellValue(row?.[c.key])}</td>`).join('')}</tr>`;
+      return `<tr>${columns.map((c) => `<td class="${renderColumnClass(c)}">${renderTableCellValue(row?.[c.key])}</td>`).join('')}</tr>`;
     }
     return `<tr><td>${escapeHtml(row ?? '')}</td></tr>`;
   }).join('');
 
-  return `<section${renderSectionIdAttr(id)} class="data-section">
-    <h3>${title}</h3>
-    <div class="table-scroll"><table id="${tableId}" class="data-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table></div>
-  </section>`;
+  return renderDataSection({
+    id,
+    title,
+    body: `<div class="table-scroll" tabindex="0" role="region" aria-label="${title}"><table id="${tableId}" class="data-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table></div>`,
+  });
 }
 
 function isMonoMetaItem(item) {
@@ -210,10 +256,12 @@ function renderDefinitionListSection(section) {
     return `<div class="meta-row"><span class="meta-key">${label}</span><span class="${valueClass}">${value}</span></div>`;
   }).join('');
 
-  return `<section${renderSectionIdAttr(id)} class="data-section">
-    <h3>${title}</h3>
-    <div id="meta-${escapedId}" class="metadata-block">${rows}</div>
-  </section>`;
+  return renderDataSection({
+    id,
+    title,
+    collapsible: section.collapsible === true,
+    body: `<div id="meta-${escapedId}" class="metadata-block">${rows}</div>`,
+  });
 }
 
 function renderLinkListSection(section) {
@@ -228,10 +276,7 @@ function renderLinkListSection(section) {
     return `<li><a href="${href}" class="section-link">${text}</a></li>`;
   }).join('');
 
-  return `<section${renderSectionIdAttr(id)} class="data-section">
-    <h3>${title}</h3>
-    <ul class="link-list">${items}</ul>
-  </section>`;
+  return renderDataSection({ id, title, body: `<ul class="link-list">${items}</ul>` });
 }
 
 function renderCalloutSection(section) {
@@ -239,10 +284,12 @@ function renderCalloutSection(section) {
   const title = escapeHtml(section.title ?? '');
   const body = escapeHtml(section.body ?? '');
   if (!title && !body) return '';
-  return `<section${renderSectionIdAttr(id)} class="data-section callout">
-    ${title ? `<h3>${title}</h3>` : ''}
-    ${body ? `<div class="callout-body">${body}</div>` : ''}
-  </section>`;
+  return renderDataSection({
+    id,
+    title,
+    className: 'callout',
+    body: body ? `<div class="callout-body">${body}</div>` : '',
+  });
 }
 
 function renderRawLogListSection(section) {
@@ -256,10 +303,13 @@ function renderRawLogListSection(section) {
       <pre class="raw-log-pre"><code>${escapeHtml(snippet.body)}</code></pre>
     </article>`).join('');
 
-  return `<section${renderSectionIdAttr(id)} class="data-section raw-log-section">
-    <h3>${title}</h3>
-    <div class="raw-log-list">${items}</div>
-  </section>`;
+  return renderDataSection({
+    id,
+    title,
+    className: 'raw-log-section',
+    collapsible: section.collapsible !== false,
+    body: `<div class="raw-log-list">${items}</div>`,
+  });
 }
 
 function renderTraceSequenceSection(section) {
@@ -294,10 +344,12 @@ function renderTraceSequenceSection(section) {
       </li>`;
   }).join('');
 
-  return `<section${renderSectionIdAttr(id)} class="data-section trace-sequence-section">
-    <h3>${title}</h3>
-    <ol class="trace-sequence">${items}</ol>
-  </section>`;
+  return renderDataSection({
+    id,
+    title,
+    className: 'trace-sequence-section',
+    body: `<ol class="trace-sequence">${items}</ol>`,
+  });
 }
 
 function renderTraceAnalysisSection(section) {
@@ -311,16 +363,18 @@ function renderTraceAnalysisSection(section) {
     ? `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
     : '';
 
-  return `<section${renderSectionIdAttr(id)} class="data-section trace-analysis-section">
-    <h3>${title}</h3>
-    <div class="trace-analysis-grid">
+  return renderDataSection({
+    id,
+    title,
+    className: 'trace-analysis-section',
+    body: `<div class="trace-analysis-grid">
       ${hasValue(section.purpose) ? `<div class="trace-analysis-block"><div class="trace-analysis-label">调用目的</div><p>${escapeHtml(section.purpose)}</p></div>` : ''}
       ${hasValue(section.chain_summary) ? `<div class="trace-analysis-block"><div class="trace-analysis-label">链路解读</div><p>${escapeHtml(section.chain_summary)}</p></div>` : ''}
       ${riskPoints.length > 0 ? `<div class="trace-analysis-block"><div class="trace-analysis-label">风险点</div>${renderList(riskPoints)}</div>` : ''}
       ${nextActions.length > 0 ? `<div class="trace-analysis-block"><div class="trace-analysis-label">建议动作</div>${renderList(nextActions)}</div>` : ''}
     </div>
-    ${hasValue(section.model) ? `<div class="trace-analysis-model mono">模型：${escapeHtml(section.model)}</div>` : ''}
-  </section>`;
+    ${hasValue(section.model) ? `<div class="trace-analysis-model mono">模型：${escapeHtml(section.model)}</div>` : ''}`,
+  });
 }
 
 function renderSection(section) {
@@ -357,8 +411,10 @@ export function renderDashboard(templateInput) {
   const subtitle = escapeHtml(page.subtitle ?? '');
   const updatedAt = escapeHtml(page.updated_at ?? '');
   const metrics = renderSummaryMetrics(templateInput?.summary_metrics);
-  const legend = renderSeverityLegend();
-  const filters = renderFilterBar(templateInput?.filters);
+  const filters = renderFilterBar(
+    templateInput?.filters,
+    templateInput?.clear_filters_href ?? page.clear_filters_href,
+  );
   const breadcrumbs = renderBreadcrumbs(page.breadcrumbs);
   const contextBadges = renderContextBadges(page.context_badges);
   const pageActions = renderPageActions(page.page_actions);
@@ -372,31 +428,61 @@ export function renderDashboard(templateInput) {
 <title>${title}</title>
 <style>
 :root {
-  --bg: #F8FAFC;
-  --surface: #FFFFFF;
-  --surface-muted: #EAEFF3;
-  --border: #E2E8F0;
-  --text: #1E293B;
-  --text-muted: #64748B;
-  --accent: #2563EB;
+  --surface-canvas: #F5F7FA;
+  --surface-panel: #FFFFFF;
+  --surface-subtle: #EEF2F6;
+  --surface-inverse: #172033;
+  --surface-code: #111827;
+  --text-primary: #172033;
+  --text-secondary: #667085;
+  --text-inverse: #F8FAFC;
+  --text-code: #E5E7EB;
+  --border-default: #D8DEE8;
+  --action-primary: #2F5D8A;
+  --action-primary-hover: #244A70;
+  --status-critical: #B42318;
+  --status-critical-bg: #FDECEA;
+  --status-high: #C2410C;
+  --status-high-bg: #FFF1E8;
+  --status-medium: #A66B00;
+  --status-medium-bg: #FFF8E1;
+  --status-low: #526173;
+  --status-low-bg: #F1F5F9;
+  --status-success: #16805D;
+  --status-success-bg: #ECFDF5;
+  --status-neutral: #475467;
+  --status-neutral-bg: #F5F7FA;
+  --component-radius: 6px;
+  --component-transition: 180ms ease;
+  --tone-color: var(--status-neutral);
+  --tone-bg: var(--status-neutral-bg);
+  --bg: var(--surface-canvas);
+  --surface: var(--surface-panel);
+  --surface-muted: var(--surface-subtle);
+  --border: var(--border-default);
+  --text: var(--text-primary);
+  --text-muted: var(--text-secondary);
+  --accent: var(--action-primary);
   --primary: var(--accent);
-  --critical: #B42318;
-  --high: #C2410C;
-  --medium: #B7791F;
-  --low: #475569;
-  --success: #15803D;
+  --critical: var(--status-critical);
+  --high: var(--status-high);
+  --medium: var(--status-medium);
+  --low: var(--status-low);
+  --success: var(--status-success);
 }
 * { box-sizing: border-box; }
 body {
   margin: 0;
-  font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  min-width: 0;
+  overflow-x: hidden;
+  font-family: "Noto Sans SC", "Source Han Sans SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   background: var(--bg);
   color: var(--text);
   line-height: 1.5;
 }
 a {
   color: inherit;
-  transition: color 180ms ease, background-color 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+  transition: color var(--component-transition), background-color var(--component-transition), border-color var(--component-transition), opacity var(--component-transition);
 }
 a:hover {
   text-decoration: underline;
@@ -406,42 +492,9 @@ a:hover {
   outline-offset: 2px;
 }
 .mono {
-  font-family: "JetBrains Mono", "Cascadia Code", monospace;
+  font-family: "JetBrains Mono", "Cascadia Code", "Consolas", monospace;
 }
-.header-bar {
-  background: linear-gradient(180deg, rgba(37, 99, 235, 0.08) 0%, rgba(255, 255, 255, 0.96) 100%);
-  border-bottom: 1px solid var(--border);
-  padding: 20px 24px;
-}
-.header-shell {
-  max-width: 1200px;
-  margin: 0 auto;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-}
-.header-copy {
-  min-width: 0;
-}
-.header-meta {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 12px;
-}
-.header-bar .header-title { font-size: 24px; font-weight: 700; }
-.header-bar .header-subtitle { font-size: 14px; color: var(--text-muted); margin-top: 4px; }
 .container { padding: 24px; max-width: 1200px; margin: 0 auto; }
-.time-range-bar {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  font-size: 13px;
-  color: var(--text-muted);
-  margin-bottom: 12px;
-}
-.time-range-bar .updated { margin-left: auto; }
 .breadcrumbs {
   display: flex;
   flex-wrap: wrap;
@@ -493,7 +546,6 @@ a:hover {
   background: var(--surface);
   color: var(--text);
   text-decoration: none;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
 }
 .page-action.primary {
   background: var(--accent);
@@ -509,59 +561,24 @@ a:hover {
   gap: 16px;
   margin-bottom: 16px;
 }
-.metric-card-link {
-  display: block;
-  color: inherit;
-  text-decoration: none;
-}
-.metric-card {
-  min-height: 104px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 16px;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
-  transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
-}
-.metric-card-link:hover .metric-card,
-.metric-card-link:focus-visible .metric-card {
-  box-shadow: 0 6px 18px rgba(37, 99, 235, 0.10);
-  border-color: rgba(37, 99, 235, 0.28);
-}
 .metric-value { font-size: 28px; font-weight: 700; }
 .metric-label { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
-.severity-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 16px;
-  align-items: center;
-  font-size: 13px;
-  color: var(--text-muted);
-  margin-bottom: 16px;
-}
-.legend-item { display: inline-flex; align-items: center; gap: 6px; }
-.legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
 .filter-bar {
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--component-radius);
   padding: 12px 16px;
   margin-bottom: 24px;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
 }
-.filter-item { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
-.filter-item label { color: var(--text-muted); }
-.filter-item select { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: #fff; color: var(--text-muted); min-height: 44px; }
 .data-section {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--component-radius);
   padding: 16px;
   margin-bottom: 16px;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
 }
 .data-section h3 { margin: 0 0 12px 0; font-size: 16px; }
 .table-scroll {
@@ -705,7 +722,324 @@ a:hover {
 .empty-state, .empty, .error-state, .error { color: var(--text-muted); font-size: 13px; padding: 12px; }
 .error-state, .error { color: var(--critical); }
 footer { text-align: center; color: var(--text-muted); font-size: 12px; padding: 24px; }
+.skip-link {
+  position: fixed;
+  top: 8px;
+  left: 8px;
+  z-index: 100;
+  padding: 10px 14px;
+  border-radius: 4px;
+  background: var(--surface-panel);
+  color: var(--action-primary);
+  font-weight: 700;
+  transform: translateY(-160%);
+  text-decoration: none;
+}
+.skip-link:focus { transform: translateY(0); }
+.app-bar {
+  background: var(--surface-inverse);
+  color: var(--text-inverse);
+  border-bottom: 1px solid #283449;
+}
+.app-bar-shell {
+  max-width: 1200px;
+  min-height: 64px;
+  margin: 0 auto;
+  padding: 10px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+}
+.app-identity {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.app-brand {
+  flex: none;
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  text-decoration: none;
+}
+.app-page {
+  min-width: 0;
+  overflow: hidden;
+  color: #CBD5E1;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.app-separator { color: #64748B; }
+.app-nav {
+  margin-right: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+.app-nav-link {
+  min-height: 40px;
+  padding: 8px 10px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 4px;
+  color: #CBD5E1;
+  font-size: 13px;
+  text-decoration: none;
+}
+.app-nav-link:hover,
+.app-nav-link:focus-visible {
+  background: #27344A;
+  color: var(--text-inverse);
+  text-decoration: none;
+}
+.app-meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  color: #CBD5E1;
+  font-size: 12px;
+}
+.updated-at { white-space: nowrap; }
+.container {
+  width: 100%;
+  min-width: 0;
+}
+.context-header {
+  margin-bottom: 20px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+}
+.context-copy { min-width: 0; }
+.page-title {
+  margin: 0;
+  font-size: clamp(24px, 3vw, 28px);
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+}
+.page-subtitle {
+  max-width: 720px;
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+.context-badge,
+.status-tag {
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--tone-color);
+  border-radius: 4px;
+  background: var(--tone-bg);
+  color: var(--tone-color);
+}
+.status-marker {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+}
+[data-tone="critical"] { --tone-color: var(--status-critical); --tone-bg: var(--status-critical-bg); }
+[data-tone="high"] { --tone-color: var(--status-high); --tone-bg: var(--status-high-bg); }
+[data-tone="medium"] { --tone-color: var(--status-medium); --tone-bg: var(--status-medium-bg); }
+[data-tone="low"] { --tone-color: var(--status-low); --tone-bg: var(--status-low-bg); }
+[data-tone="success"] { --tone-color: var(--status-success); --tone-bg: var(--status-success-bg); }
+[data-tone="neutral"] { --tone-color: var(--status-neutral); --tone-bg: var(--status-neutral-bg); }
+.page-actions { margin-bottom: 0; flex: none; }
+.page-action {
+  border-radius: var(--component-radius);
+  border-color: var(--border-default);
+  box-shadow: none;
+}
+.page-action.primary {
+  background: var(--action-primary);
+  border-color: var(--action-primary);
+  color: var(--text-inverse);
+}
+.page-action.primary:hover { background: var(--action-primary-hover); }
+.summary-metrics {
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 0;
+  margin: 0 0 20px;
+  overflow: hidden;
+  border: 1px solid var(--border-default);
+  border-radius: var(--component-radius);
+  background: var(--surface-panel);
+}
+.summary-metric-link {
+  min-width: 0;
+  display: block;
+  color: inherit;
+  text-decoration: none;
+}
+.summary-metric {
+  position: relative;
+  min-height: 88px;
+  height: 100%;
+  padding: 14px 16px 12px;
+  border-right: 1px solid var(--border-default);
+  background: var(--surface-panel);
+}
+.summary-metric::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 3px;
+  background: var(--tone-color);
+}
+.summary-metric-link:hover .summary-metric,
+.summary-metric-link:focus-visible .summary-metric { background: var(--surface-subtle); }
+.metric-value {
+  color: var(--tone-color);
+  font-size: 26px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+}
+.metric-label { margin-top: 2px; color: var(--text-secondary); font-size: 12px; }
+.filter-bar {
+  margin: 0 0 20px;
+  padding: 12px 14px;
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--component-radius);
+  background: var(--surface-panel);
+  box-shadow: none;
+}
+.filter-group {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+.filter-label { color: var(--text-secondary); font-size: 12px; font-weight: 700; }
+.filter-options { min-width: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.filter-option,
+.filter-clear,
+.filter-clear-all {
+  min-height: 32px;
+  padding: 5px 9px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  color: var(--action-primary);
+  font-size: 12px;
+  text-decoration: none;
+}
+.filter-option.active {
+  border-color: var(--action-primary);
+  background: var(--action-primary);
+  color: var(--text-inverse);
+}
+.filter-clear,
+.filter-clear-all { border-color: transparent; }
+.filter-clear-all { justify-self: start; }
+.data-section {
+  min-width: 0;
+  border-radius: var(--component-radius);
+  box-shadow: none;
+}
+.section-title {
+  display: block;
+  margin: 0 0 12px;
+  color: var(--text-primary);
+  font-size: 17px;
+  font-weight: 700;
+}
+.collapsible-section { padding: 0; }
+.section-summary {
+  min-height: 52px;
+  padding: 12px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  cursor: pointer;
+  list-style: none;
+}
+.section-summary::-webkit-details-marker { display: none; }
+.section-summary .section-title { margin: 0; }
+.section-summary-hint { color: var(--text-secondary); font-size: 12px; }
+.collapsible-section[open] .section-summary { border-bottom: 1px solid var(--border-default); }
+.collapsible-section[open] .section-summary-hint { visibility: hidden; }
+.collapsible-section[open] .section-summary-hint::after { content: "收起"; visibility: visible; }
+.collapsible-section > :not(summary) { margin: 16px; }
+.table-scroll {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+}
+.data-table { min-width: 640px; border-collapse: separate; border-spacing: 0; }
+.data-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.data-table tbody tr:last-child td { border-bottom: 0; }
+.metadata-block { font-size: 13px; }
+.meta-row { border-bottom-color: var(--border-default); }
+.meta-row:last-child { border-bottom: 0; }
+.raw-log-pre {
+  border-color: #334155;
+  border-radius: var(--component-radius);
+  background: var(--surface-code);
+  color: var(--text-code);
+}
+.raw-log-pre code { font-family: "JetBrains Mono", "Cascadia Code", "Consolas", monospace; }
+.callout { border-left: 3px solid var(--action-primary); }
+.trace-step { position: relative; }
+.trace-step:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  top: 28px;
+  bottom: -12px;
+  left: 13px;
+  width: 2px;
+  background: var(--border-default);
+}
+.trace-step-index {
+  position: relative;
+  z-index: 1;
+  border: 2px solid var(--surface-panel);
+  border-radius: 50%;
+  background: var(--action-primary);
+  color: var(--text-inverse);
+}
+.trace-step-body { border-bottom: 0; }
 @media (max-width: 768px) {
+  .app-bar-shell {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 12px 16px;
+  }
+  .app-nav {
+    justify-content: flex-start;
+    margin-right: 0;
+    overflow-x: auto;
+  }
+  .app-meta {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+  .context-header {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 14px;
+  }
   .header-shell,
   .header-meta {
     align-items: stretch;
@@ -723,6 +1057,12 @@ footer { text-align: center; color: var(--text-muted); font-size: 12px; padding:
   .container {
     padding: 16px;
   }
+  .column-priority-metadata { display: none; }
+  .data-table { min-width: 520px; }
+  .filter-group {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
   .meta-row {
     flex-direction: column;
     gap: 4px;
@@ -731,28 +1071,61 @@ footer { text-align: center; color: var(--text-muted); font-size: 12px; padding:
     width: auto;
   }
 }
+@media (max-width: 375px) {
+  .app-page,
+  .app-separator { display: none; }
+  .app-nav-link { padding-inline: 8px; }
+  .container { padding: 12px; }
+  .summary-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .summary-metric {
+    min-height: 80px;
+    padding: 12px;
+  }
+  .data-section { padding: 12px; }
+  .collapsible-section { padding: 0; }
+  .data-table { min-width: 440px; }
+  .column-priority-metadata { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
 </style>
 </head>
 <body>
-<header class="header-bar">
-  <div class="header-shell">
-    <div class="header-copy">
-      <div class="header-title">${title}</div>
-      ${subtitle ? `<div class="header-subtitle">${subtitle}</div>` : ''}
+<a class="skip-link" href="#main-content">跳到主要内容</a>
+<header class="app-bar">
+  <div class="app-bar-shell">
+    <div class="app-identity">
+      <a href="/" class="app-brand">Audit Logger Agent</a>
+      <span class="app-separator" aria-hidden="true">/</span>
+      <span class="app-page">${title}</span>
     </div>
-    <div class="header-meta">
+    <nav class="app-nav" aria-label="主导航">
+      <a href="/" class="app-nav-link">Agent</a>
+      <a href="/dashboard#pending_findings" class="app-nav-link">风险发现</a>
+      <a href="/dashboard#reviews_with_findings" class="app-nav-link">审查批次</a>
+    </nav>
+    <div class="app-meta">
       ${contextBadges}
+      <span class="updated-at">更新时间：${updatedAt}</span>
     </div>
   </div>
 </header>
-<main class="container">
-  <div class="time-range-bar">
-    <span>更新时间：${updatedAt}</span>
-  </div>
-  ${breadcrumbs}
-  ${pageActions}
+<main id="main-content" class="container">
+  <header class="context-header">
+    <div class="context-copy">
+      ${breadcrumbs}
+      <h1 id="page-title" class="page-title">${title}</h1>
+      ${subtitle ? `<p class="page-subtitle">${subtitle}</p>` : ''}
+    </div>
+    ${pageActions}
+  </header>
   ${metrics}
-  ${legend}
   ${filters}
   ${sections}
 </main>
