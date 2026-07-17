@@ -245,6 +245,30 @@ function parseErrorFindings(parseErrors, reviewId, riskPolicyVersion, reviewerVe
   return findings;
 }
 
+function withRawJsonSnapshots(reviewStore, findings) {
+  const eventIds = [...new Set(findings.flatMap((finding) =>
+    Array.isArray(finding.evidence_event_ids) ? finding.evidence_event_ids : []))];
+  const rawById = new Map(
+    reviewStore.listRawEventsByIds({ eventIds, limit: eventIds.length })
+      .map((row) => [row.id, row.raw_json]),
+  );
+  return findings.map((finding) => {
+    let evidence;
+    try {
+      evidence = JSON.parse(finding.evidence_json ?? '[]');
+    } catch {
+      evidence = [];
+    }
+    return {
+      ...finding,
+      evidence_json: JSON.stringify(evidence.map((item) => ({
+        ...item,
+        raw_json: item?.event_id == null ? null : (rawById.get(item.event_id) ?? null),
+      }))),
+    };
+  });
+}
+
 export function createAuditReviewScheduler({
   db,
   config,
@@ -547,14 +571,6 @@ export function createAuditReviewScheduler({
         reviewerVersion,
         agentsConfig,
       );
-      for (const f of parseFindings) {
-        try {
-          reviewStore.upsertFinding(f);
-          findingCount++;
-        } catch {
-          // ignore individual finding failures
-        }
-      }
 
       // 7. LLM review.
       const llmDay = windowTo.slice(0, 10);
@@ -661,14 +677,20 @@ export function createAuditReviewScheduler({
         );
       }
 
-      for (const f of findingsToPersist) {
-        try {
-          reviewStore.upsertFinding(f);
-          findingCount++;
-        } catch {
-          // ignore individual finding failures
-        }
-      }
+      findingsToPersist.push(...parseFindings);
+      findingsToPersist = withRawJsonSnapshots(reviewStore, findingsToPersist);
+      const persistedResult = reviewStore.persistReviewResult(reviewId, {
+        findings: findingsToPersist,
+        observedAt: windowTo,
+        status,
+        scannedFiles: ingestResult.scannedFiles,
+        insertedEvents: ingestResult.inserted,
+        parseErrorCount: ingestResult.parseErrors.length,
+        candidateEventCount: candidates.candidates.length,
+        llmModel,
+        errorCode,
+      });
+      findingCount = persistedResult.findingCount;
 
       // 9. Notify.
       try {
@@ -702,13 +724,11 @@ export function createAuditReviewScheduler({
         notifier.enqueue({ reviewId, run, review: reviewForNotify, dashboardUrl });
 
         // Enqueue individual high/critical findings.
-        const highFindings = reviewStore.listFindings({ limit: 1000, severity: 'high' });
-        const criticalFindings = reviewStore.listFindings({ limit: 1000, severity: 'critical' });
+        const highFindings = reviewStore.listFindings({ reviewId, limit: 1000, severity: 'high' });
+        const criticalFindings = reviewStore.listFindings({ reviewId, limit: 1000, severity: 'critical' });
         const persistedFindings = [...highFindings, ...criticalFindings];
         for (const pf of persistedFindings) {
-          if (pf.review_id === reviewId) {
-            notifier.enqueueFinding({ finding: pf, reviewId, run, dashboardUrl });
-          }
+          notifier.enqueueFinding({ finding: pf, reviewId, run, dashboardUrl });
         }
         logAudit(
           'review.notification.enqueued',
@@ -725,17 +745,7 @@ export function createAuditReviewScheduler({
         );
       }
 
-      // 10. Finish run.
-      reviewStore.finishRun(reviewId, {
-        status,
-        scannedFiles: ingestResult.scannedFiles,
-        insertedEvents: ingestResult.inserted,
-        parseErrorCount: ingestResult.parseErrors.length,
-        candidateEventCount: candidates.candidates.length,
-        findingCount,
-        llmModel,
-        errorCode,
-      });
+      // 10. The run was completed atomically with findings and occurrences.
       logAudit(
         'review.completed',
         status === 'completed' ? 'OK' : 'INTERNAL',

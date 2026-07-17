@@ -52,7 +52,42 @@ CREATE TABLE IF NOT EXISTS audit_review_findings (
   analysis_generated_at TEXT,
   risk_policy_version TEXT NOT NULL,
   prompt_version TEXT,
-  reviewer_version TEXT NOT NULL
+  reviewer_version TEXT NOT NULL,
+  first_review_id TEXT,
+  last_review_id TEXT,
+  max_severity TEXT,
+  state_version INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS audit_review_finding_occurrences (
+  occurrence_id TEXT PRIMARY KEY,
+  finding_id TEXT NOT NULL,
+  review_id TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  title TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  recommendation TEXT,
+  evidence_event_ids_json TEXT NOT NULL,
+  evidence_json TEXT,
+  observed_at TEXT NOT NULL,
+  is_new INTEGER NOT NULL DEFAULT 0,
+  severity_escalated INTEGER NOT NULL DEFAULT 0,
+  reopened INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (finding_id) REFERENCES audit_review_findings(finding_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS audit_finding_actions (
+  action_id TEXT PRIMARY KEY,
+  finding_id TEXT NOT NULL,
+  action_type TEXT NOT NULL,
+  from_status TEXT NOT NULL,
+  to_status TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  note TEXT,
+  snoozed_until TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (finding_id) REFERENCES audit_review_findings(finding_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS audit_llm_usage (
@@ -90,6 +125,18 @@ ON audit_review_findings(review_id);
 
 CREATE INDEX IF NOT EXISTS idx_audit_review_findings_severity
 ON audit_review_findings(severity, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_review_occurrences_review_finding
+ON audit_review_finding_occurrences(review_id, finding_id);
+
+CREATE INDEX IF NOT EXISTS idx_audit_review_occurrences_finding_observed
+ON audit_review_finding_occurrences(finding_id, observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_audit_review_occurrences_review_severity
+ON audit_review_finding_occurrences(review_id, severity);
+
+CREATE INDEX IF NOT EXISTS idx_audit_finding_actions_finding_created
+ON audit_finding_actions(finding_id, created_at DESC);
 `;
 
 function tableColumns(db, tableName) {
@@ -109,5 +156,39 @@ export function ensureReviewSchema(db) {
   addColumnIfMissing(db, 'audit_review_findings', 'entity_id', 'TEXT');
   addColumnIfMissing(db, 'audit_review_findings', 'llm_analysis_json', 'TEXT');
   addColumnIfMissing(db, 'audit_review_findings', 'analysis_generated_at', 'TEXT');
+  addColumnIfMissing(db, 'audit_review_findings', 'first_review_id', 'TEXT');
+  addColumnIfMissing(db, 'audit_review_findings', 'last_review_id', 'TEXT');
+  addColumnIfMissing(db, 'audit_review_findings', 'max_severity', 'TEXT');
+  addColumnIfMissing(db, 'audit_review_findings', 'state_version', 'INTEGER NOT NULL DEFAULT 1');
+  db.exec(`
+    UPDATE audit_review_findings
+    SET first_review_id = COALESCE(first_review_id, review_id),
+        last_review_id = COALESCE(last_review_id, review_id),
+        max_severity = COALESCE(max_severity, severity),
+        state_version = COALESCE(state_version, 1);
+
+    INSERT OR IGNORE INTO audit_review_finding_occurrences (
+      occurrence_id, finding_id, review_id, severity, title, summary, recommendation,
+      evidence_event_ids_json, evidence_json, observed_at,
+      is_new, severity_escalated, reopened, created_at
+    )
+    SELECT
+      'occ_' || finding_id,
+      finding_id,
+      review_id,
+      severity,
+      title,
+      summary,
+      recommendation,
+      evidence_event_ids_json,
+      evidence_json,
+      last_seen_at,
+      1,
+      0,
+      0,
+      created_at
+    FROM audit_review_findings;
+  `);
   db.exec(REVIEW_INDEXES);
+  db.pragma('foreign_keys = ON');
 }

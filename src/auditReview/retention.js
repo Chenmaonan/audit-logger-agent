@@ -85,6 +85,49 @@ function deleteBatched(db, { countSql, deleteSql, params, batchSize, dryRun }) {
   return { deleted: batches.reduce((sum, n) => sum + n, 0), batches };
 }
 
+function deleteResolvedFindings(db, { cutoff, batchSize, dryRun }) {
+  const params = { cutoff };
+  const total = countRows(db, `
+    SELECT COUNT(*) AS count
+    FROM audit_review_findings
+    WHERE status = 'resolved' AND resolved_at IS NOT NULL AND resolved_at < @cutoff
+  `, params);
+  if (dryRun || total === 0) {
+    return { deleted: total, batches: [] };
+  }
+
+  const selectIds = db.prepare(`
+    SELECT finding_id
+    FROM audit_review_findings
+    WHERE status = 'resolved' AND resolved_at IS NOT NULL AND resolved_at < @cutoff
+    ORDER BY resolved_at ASC, finding_id ASC
+    LIMIT @limit
+  `);
+  const deleteActions = db.prepare(`DELETE FROM audit_finding_actions WHERE finding_id = ?`);
+  const deleteOccurrences = db.prepare(`DELETE FROM audit_review_finding_occurrences WHERE finding_id = ?`);
+  const deleteFinding = db.prepare(`DELETE FROM audit_review_findings WHERE finding_id = ?`);
+  const deleteBatch = db.transaction((findingIds) => {
+    let deleted = 0;
+    for (const findingId of findingIds) {
+      deleteActions.run(findingId);
+      deleteOccurrences.run(findingId);
+      deleted += deleteFinding.run(findingId).changes;
+    }
+    return deleted;
+  });
+
+  const batches = [];
+  while (true) {
+    const findingIds = selectIds.all({ cutoff, limit: batchSize }).map((row) => row.finding_id);
+    if (findingIds.length === 0) break;
+    const deleted = deleteBatch(findingIds);
+    if (deleted === 0) break;
+    batches.push(deleted);
+    if (deleted < batchSize) break;
+  }
+  return { deleted: batches.reduce((sum, n) => sum + n, 0), batches };
+}
+
 function resolveMaybeRelative(baseDir, value) {
   if (!value) return null;
   return path.isAbsolute(value) ? value : path.resolve(baseDir, value);
@@ -482,15 +525,53 @@ export function createRetentionService({ db, config, cursorStore = null, now = (
         batchSize: size,
         dryRun,
       }),
+      resolvedFindings: deleteResolvedFindings(db, {
+        cutoff: result.cutoffs.resolvedFindings,
+        batchSize: size,
+        dryRun,
+      }),
       reviewRuns: deleteBatched(db, {
-        countSql: `SELECT COUNT(*) AS count FROM audit_review_runs WHERE started_at < @cutoff`,
+        countSql: `
+          SELECT COUNT(*) AS count
+          FROM audit_review_runs runs
+          WHERE runs.started_at < @cutoff
+            AND NOT EXISTS (
+              SELECT 1
+              FROM audit_review_finding_occurrences occurrences
+              INNER JOIN audit_review_findings findings ON findings.finding_id = occurrences.finding_id
+              WHERE occurrences.review_id = runs.review_id
+                AND NOT (
+                  findings.status = 'resolved'
+                  AND findings.resolved_at IS NOT NULL
+                  AND findings.resolved_at < @resolvedFindingCutoff
+                )
+            )
+        `,
         deleteSql: `
           DELETE FROM audit_review_runs
           WHERE rowid IN (
-            SELECT rowid FROM audit_review_runs WHERE started_at < @cutoff ORDER BY started_at ASC LIMIT @limit
+            SELECT runs.rowid
+            FROM audit_review_runs runs
+            WHERE runs.started_at < @cutoff
+              AND NOT EXISTS (
+                SELECT 1
+                FROM audit_review_finding_occurrences occurrences
+                INNER JOIN audit_review_findings findings ON findings.finding_id = occurrences.finding_id
+                WHERE occurrences.review_id = runs.review_id
+                  AND NOT (
+                    findings.status = 'resolved'
+                    AND findings.resolved_at IS NOT NULL
+                    AND findings.resolved_at < @resolvedFindingCutoff
+                  )
+              )
+            ORDER BY runs.started_at ASC, runs.review_id ASC
+            LIMIT @limit
           )
         `,
-        params: { cutoff: result.cutoffs.reviewRuns },
+        params: {
+          cutoff: result.cutoffs.reviewRuns,
+          resolvedFindingCutoff: result.cutoffs.resolvedFindings,
+        },
         batchSize: size,
         dryRun,
       }),
@@ -507,26 +588,6 @@ export function createRetentionService({ db, config, cursorStore = null, now = (
           )
         `,
         params: { cutoffDay: result.cutoffs.auditLlmUsage },
-        batchSize: size,
-        dryRun,
-      }),
-      resolvedFindings: deleteBatched(db, {
-        countSql: `
-          SELECT COUNT(*) AS count
-          FROM audit_review_findings
-          WHERE status = 'resolved' AND resolved_at IS NOT NULL AND resolved_at < @cutoff
-        `,
-        deleteSql: `
-          DELETE FROM audit_review_findings
-          WHERE rowid IN (
-            SELECT rowid
-            FROM audit_review_findings
-            WHERE status = 'resolved' AND resolved_at IS NOT NULL AND resolved_at < @cutoff
-            ORDER BY resolved_at ASC
-            LIMIT @limit
-          )
-        `,
-        params: { cutoff: result.cutoffs.resolvedFindings },
         batchSize: size,
         dryRun,
       }),

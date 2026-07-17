@@ -155,6 +155,38 @@ function insertFinding(db, id, { status, createdAt, resolvedAt = null, acknowled
   });
 }
 
+function insertOccurrence(db, id, { findingId, reviewId, observedAt, evidenceJson = '[]' }) {
+  db.prepare(`
+    INSERT INTO audit_review_finding_occurrences (
+      occurrence_id, finding_id, review_id, severity, title, summary,
+      recommendation, evidence_event_ids_json, evidence_json, observed_at,
+      is_new, severity_escalated, reopened, created_at
+    ) VALUES (
+      @occurrence_id, @finding_id, @review_id, 'medium', 'title', 'summary',
+      NULL, '[]', @evidence_json, @observed_at,
+      1, 0, 0, @observed_at
+    )
+  `).run({
+    occurrence_id: id,
+    finding_id: findingId,
+    review_id: reviewId,
+    observed_at: observedAt,
+    evidence_json: evidenceJson,
+  });
+}
+
+function insertFindingAction(db, id, { findingId, createdAt }) {
+  db.prepare(`
+    INSERT INTO audit_finding_actions (
+      action_id, finding_id, action_type, from_status, to_status,
+      actor, note, snoozed_until, created_at
+    ) VALUES (
+      @action_id, @finding_id, 'resolve', 'open', 'resolved',
+      'operator', 'fixed', NULL, @created_at
+    )
+  `).run({ action_id: id, finding_id: findingId, created_at: createdAt });
+}
+
 function insertOutbox(db, id, { status, createdAt }) {
   db.prepare(`
     INSERT INTO agent_outbox_events (
@@ -443,6 +475,72 @@ test('retention deletes expired data in batches and keeps open or acknowledged f
     db.prepare(`SELECT finding_id FROM audit_review_findings ORDER BY finding_id`).all().map((row) => row.finding_id),
     ['acked-old', 'open-old'],
   );
+
+  db.close();
+  fs.rmSync(rootDir, { recursive: true, force: true });
+});
+
+test('retention keeps review evidence for active findings and atomically removes expired resolved history', () => {
+  const rootDir = tmpDir();
+  const db = makeDb();
+  const service = createRetentionService({
+    db,
+    config: makeConfig(rootDir),
+    cursorStore: createIngestCursorStore(db),
+    now: () => new Date('2026-07-06T12:00:00.000Z'),
+  });
+
+  insertReviewRun(db, 'active-old-review', '2026-04-01T00:00:00.000Z');
+  insertReviewRun(db, 'resolved-old-review', '2026-04-02T00:00:00.000Z');
+  insertEvent(db, 'snapshot-source', '2026-04-01T00:00:00.000Z');
+  insertFinding(db, 'active-finding', {
+    status: 'open',
+    createdAt: '2026-04-01T00:00:00.000Z',
+  });
+  insertFinding(db, 'expired-resolved-finding', {
+    status: 'resolved',
+    createdAt: '2026-04-02T00:00:00.000Z',
+    resolvedAt: '2026-05-01T00:00:00.000Z',
+  });
+  insertOccurrence(db, 'occ-active', {
+    findingId: 'active-finding',
+    reviewId: 'active-old-review',
+    observedAt: '2026-04-01T00:00:00.000Z',
+    evidenceJson: '[{"event_id":1,"raw_json":"{\\"source\\":\\"retained-snapshot\\"}"}]',
+  });
+  insertOccurrence(db, 'occ-resolved', {
+    findingId: 'expired-resolved-finding',
+    reviewId: 'resolved-old-review',
+    observedAt: '2026-04-02T00:00:00.000Z',
+  });
+  insertFindingAction(db, 'act-resolved', {
+    findingId: 'expired-resolved-finding',
+    createdAt: '2026-05-01T00:00:00.000Z',
+  });
+
+  const result = service.run({ batchSize: 1 });
+
+  assert.equal(result.deleted.resolvedFindings, 1);
+  assert.equal(result.deleted.reviewRuns, 1);
+  assert.equal(result.deleted.auditEvents, 1);
+  assert.equal(count(db, 'audit_events'), 0);
+  assert.deepEqual(
+    db.prepare(`SELECT review_id FROM audit_review_runs ORDER BY review_id`).all().map((row) => row.review_id),
+    ['active-old-review'],
+  );
+  assert.deepEqual(
+    db.prepare(`SELECT finding_id FROM audit_review_findings ORDER BY finding_id`).all().map((row) => row.finding_id),
+    ['active-finding'],
+  );
+  assert.deepEqual(
+    db.prepare(`SELECT occurrence_id FROM audit_review_finding_occurrences ORDER BY occurrence_id`).all().map((row) => row.occurrence_id),
+    ['occ-active'],
+  );
+  assert.equal(
+    JSON.parse(db.prepare(`SELECT evidence_json FROM audit_review_finding_occurrences WHERE occurrence_id = 'occ-active'`).get().evidence_json)[0].raw_json,
+    '{"source":"retained-snapshot"}',
+  );
+  assert.equal(count(db, 'audit_finding_actions'), 0);
 
   db.close();
   fs.rmSync(rootDir, { recursive: true, force: true });

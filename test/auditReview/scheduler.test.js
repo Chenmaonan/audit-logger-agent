@@ -320,7 +320,8 @@ test('scheduler.runOnce happy path: creates completed run, persists findings, re
     ts: '2026-07-03T10:00:01.000Z',
     tool_name: 'some.query',
     status: 'INTERNAL',
-        event: 'tool.end',
+    event: 'tool.end',
+    raw_json: '{"source":"raw-snapshot"}',
   });
 
   const deps = buildRealDeps(db);
@@ -347,6 +348,10 @@ test('scheduler.runOnce happy path: creates completed run, persists findings, re
   assert.equal(firstFinding.evidence[0].agent_id, 'mt-agent');
   assert.ok(firstFinding.evidence[0].agent_name, 'evidence should carry agent_name');
   assert.ok(firstFinding.evidence[0].log_detail, 'evidence should carry log_detail');
+  const occurrences = deps.reviewStore.listReviewOccurrences({ reviewId: result.reviewId });
+  assert.equal(run.finding_count, occurrences.length);
+  assert.equal(occurrences.length, 1);
+  assert.equal(occurrences[0].evidence[0].raw_json, '{"source":"raw-snapshot"}');
 
   // Lock should be released.
   const lock = deps.lockStore.getLock('audit_review_scheduler');
@@ -359,6 +364,82 @@ test('scheduler.runOnce happy path: creates completed run, persists findings, re
   assert.ok(events.includes('review.completed'), 'should log review.completed');
   assert.ok(events.includes('review.ingest.completed'), 'should log review.ingest.completed');
 
+  db.close();
+});
+
+test('scheduler.runOnce merges duplicate finding hashes into one occurrence and snapshots all raw evidence', async () => {
+  const db = makeDb();
+  insertEvent(db, 1, {
+    ts: '2026-07-03T10:00:01.000Z',
+    status: 'INTERNAL',
+    event: 'tool.end',
+    raw_json: '{"event":1}',
+  });
+  insertEvent(db, 2, {
+    ts: '2026-07-03T10:00:02.000Z',
+    status: 'INTERNAL',
+    event: 'tool.end',
+    raw_json: '{"event":2}',
+  });
+  const llmClient = makeFakeLlmClient({
+    type: 'audit_review',
+    review_id: 'fake',
+    window: { from: '2026-07-03T10:00:00.000Z', to: '2026-07-03T10:30:00.000Z' },
+    summary: {
+      title: '重复结果',
+      overview: '同一问题引用两条证据。',
+      severity_counts: { critical: 0, high: 1, medium: 1, low: 0 },
+    },
+    findings: [
+      {
+        category: 'failed_call',
+        severity: 'medium',
+        agent_id: 'mt-agent',
+        tool_name: 'some.tool',
+        trace_id: 'trace-1',
+        entity: null,
+        title: '工具失败',
+        summary: '第一条证据',
+        recommendation: '检查工具',
+        evidence_event_ids: [1],
+        requires_action: false,
+      },
+      {
+        category: 'failed_call',
+        severity: 'high',
+        agent_id: 'mt-agent',
+        tool_name: 'some.tool',
+        trace_id: 'trace-1',
+        entity: null,
+        title: '工具持续失败',
+        summary: '第二条证据',
+        recommendation: '立即检查工具',
+        evidence_event_ids: [2],
+        requires_action: true,
+      },
+    ],
+  });
+  const deps = buildRealDeps(db, { llmClient });
+  const scheduler = createAuditReviewScheduler({
+    db,
+    ...deps,
+    now: () => new Date('2026-07-03T10:30:00.000Z'),
+  });
+
+  const result = await scheduler.runOnce({ triggerType: 'scheduled' });
+
+  assert.equal(result.status, 'completed');
+  const run = deps.reviewStore.getRun(result.reviewId);
+  const occurrences = deps.reviewStore.listReviewOccurrences({ reviewId: result.reviewId });
+  assert.equal(run.finding_count, 1);
+  assert.equal(occurrences.length, 1);
+  assert.equal(occurrences[0].severity, 'high');
+  assert.deepEqual(occurrences[0].evidence_event_ids, [1, 2]);
+  assert.deepEqual(occurrences[0].evidence.map((item) => item.raw_json), [
+    '{"event":1}',
+    '{"event":2}',
+  ]);
+  assert.equal(deps.reviewStore.listFindings({ reviewId: result.reviewId }).length, 1);
   db.close();
 });
 
