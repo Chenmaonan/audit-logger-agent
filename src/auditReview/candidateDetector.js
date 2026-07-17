@@ -75,6 +75,20 @@ function isToolEvent(row) {
   return typeof row?.event === 'string' && row.event.startsWith('tool.');
 }
 
+function isUnknownToolEvent(row) {
+  if (row?.event !== 'unknown' || typeof row.raw_json !== 'string') return false;
+  try {
+    const rawEvent = JSON.parse(row.raw_json)?.event;
+    return typeof rawEvent === 'string' && rawEvent.startsWith('tool.');
+  } catch {
+    return false;
+  }
+}
+
+function isToolRiskEvent(row) {
+  return isToolEvent(row) || isUnknownToolEvent(row);
+}
+
 export function createCandidateDetector({ db, riskPolicy } = {}) {
   if (!db) throw new Error('createCandidateDetector: db is required');
   const columns = new Set(db.prepare('PRAGMA table_info(audit_events)').all().map((row) => row.name));
@@ -91,7 +105,7 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
   const selectSql = `
     SELECT id, ts, agent_id, trace_id, span_id, parent_span_id, event, tool_name,
            status, result_summary, duration_ms, channel, user_id, entity_type,
-           entity_id, error_message, ${selectOrNull('mapped_tool_type')},
+           entity_id, error_message, raw_json, ${selectOrNull('mapped_tool_type')},
            ${selectOrNull('mapping_status')}, ${selectOrNull('mapping_reason')}
     FROM audit_events
     WHERE ts >= @from AND ts <= @to
@@ -105,13 +119,11 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
     const totalEvents = rows.length;
 
     const candidates = [];
-    // For repeated_call sliding window: key -> array of { tsMs, row } (sorted ascending).
+    // For repeated_call sliding window: key -> unique tool invocations (sorted ascending).
     const repeatBuckets = new Map();
     // For trace_integrity: span_ids that have end/error events.
     const endedSpanIds = new Set();
     const traceToolEvents = new Map();
-    // To avoid duplicate candidates for the same anchor event.
-    const emittedEventIds = new Set();
 
     // First pass: collect ended span_ids and per-trace tool event counts.
     for (const row of rows) {
@@ -139,43 +151,42 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
       }
     }
 
-    // Repeated-call: for each event, push into its bucket and check threshold.
-    // Emit at most one candidate per key when threshold first reached within the window.
-    const repeatEmittedKeys = new Set();
+    // Repeated-call: retain the latest qualifying candidate for each key.
+    const repeatedCandidates = new Map();
     for (const row of rows) {
+      if (!isToolRiskEvent(row)) continue;
       const tsMs = toEpochMs(row.ts);
       if (tsMs == null) continue;
       const key = `${row.agent_id}|${row.tool_name}|${row.entity_type ?? ''}|${row.entity_id ?? ''}`;
       const bucket = repeatBuckets.get(key) ?? [];
+      const invocationKey = row.span_id ? `span:${row.span_id}` : `event:${row.id}`;
       // Drop timestamps older than (tsMs - repeatWindowMs).
       const cutoff = tsMs - repeatWindowMs;
       const kept = [];
       for (const entry of bucket) {
-        if (entry.tsMs >= cutoff) kept.push(entry);
+        if (entry.tsMs >= cutoff && entry.invocationKey !== invocationKey) kept.push(entry);
       }
-      kept.push({ tsMs, row });
+      kept.push({ tsMs, row, invocationKey });
       repeatBuckets.set(key, kept);
 
-      if (!repeatEmittedKeys.has(key) && kept.length >= repeatThreshold) {
-        repeatEmittedKeys.add(key);
-        const anchor = kept[0].row;
-        if (!emittedEventIds.has(anchor.id)) {
-          emittedEventIds.add(anchor.id);
-          candidates.push(
-            makeCandidate(
-              anchor,
-              'repeated_call',
-              `${kept.length} calls to same agent/tool/entity within ${Math.round(repeatWindowMs / 60000)} min window`,
-            ),
-          );
-        }
+      if (kept.length >= repeatThreshold) {
+        repeatedCandidates.set(
+          key,
+          makeCandidate(
+            row,
+            'repeated_call',
+            `${kept.length} calls to same agent/tool/entity within ${Math.round(repeatWindowMs / 60000)} min window`,
+          ),
+        );
       }
     }
+    candidates.push(...repeatedCandidates.values());
 
-    // Second pass: apply per-event rules (failed, high-risk, slow, channel, trace_integrity, unknown tool).
-    // Reset emittedEventIds tracking is not needed; we want all distinct category candidates.
+    // Second pass: apply per-tool-event rules (failed, high-risk, slow, channel, trace_integrity, unknown tool).
     // We allow the same event_id to appear under multiple categories (e.g., a slow high-risk call).
     for (const row of rows) {
+      if (!isToolRiskEvent(row)) continue;
+
       // 1. failed_call
       if (row.status !== 'OK') {
         candidates.push(

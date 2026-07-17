@@ -966,7 +966,7 @@ test('audit review HTTP integration smoke test', async () => {
   }
 });
 
-test('audit review ingests all events and sends mapped tool semantics to detector/LLM', async () => {
+test('audit review ingests all events and reviews canonical or unknown tool lifecycle events', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-review-alias-'));
   const dbPath = path.join(tmpDir, 'test.db');
   const db = openDb(dbPath);

@@ -158,8 +158,8 @@ test('detect emits failed_call, repeated_call, high_risk_permission, anomalous_c
   // repeated_call should be emitted exactly once with count >= 5
   const repeated = candidates.filter((c) => c.category === 'repeated_call');
   assert.equal(repeated.length, 1);
-  // Emitted when the sliding window first reaches the threshold (5).
-  assert.match(repeated[0].reason, /5 calls/);
+  // Anchored to the latest event that still satisfies the sliding-window threshold.
+  assert.match(repeated[0].reason, /6 calls/);
   assert.equal(repeated[0].entity_type, 'product');
   assert.equal(repeated[0].entity_id, 'prod-1');
   assert.equal(Object.hasOwn(repeated[0], 'product_id'), false);
