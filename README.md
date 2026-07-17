@@ -68,7 +68,7 @@ http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me
 ## 文档
 
 - [Dokploy 部署说明](docs/dokploy-deployment.md)：生产部署、变量、域名、网络边界、Dashboard 和备份恢复。
-- [其他 Agent 接入日志审计服务指南](docs/agent-audit-log-integration-guide.md)：供编码 Agent 改造上游 Agent 的事件契约、可靠投递和验收要求。
+- [其他 Agent 接入日志审计服务指南](docs/agent-audit-log-integration-guide.md)：可直接交给编码 Agent 执行，覆盖仓库审计、日志字段契约、自动改造流程、真实发送和 Dashboard 验收。
 - [功能优化路线图与 P0 实施规格](docs/functionality-optimization-plan.md)：先完成 Finding 数据一致性、证据快照和处置闭环，再按真实规模进入审查队列、分页、评测和运营阶段。
 
 ## 运行边界
