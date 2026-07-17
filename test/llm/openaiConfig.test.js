@@ -45,8 +45,26 @@ test('OpenAI config defaults base URL and timeout only', () => {
   });
 
   assert.equal(config.baseURL, 'https://api.openai.com/v1');
-  assert.equal(config.timeoutMs, 30000);
+  assert.equal(config.timeoutMs, 900000);
   assert.equal(config.maxConcurrency, 2);
+  assert.equal(config.maxOutputTokens, 1200);
+  assert.equal(config.reasoningEffort, 'low');
+});
+
+test('OpenAI config loads output and reasoning controls from environment', () => {
+  const config = loadOpenAIConfig({
+    env: {
+      AUDIT_AGENT_LLM_API_KEY: 'sk-test-redacted',
+      AUDIT_AGENT_LLM_MODEL: 'gpt-test-planner',
+      AUDIT_AGENT_LLM_MAX_OUTPUT_TOKENS: '800',
+      AUDIT_AGENT_LLM_REASONING_EFFORT: 'minimal',
+    },
+    appConfig: {},
+    projectRoot: os.tmpdir(),
+  });
+
+  assert.equal(config.maxOutputTokens, 800);
+  assert.equal(config.reasoningEffort, 'minimal');
 });
 
 test('OpenAI config loads max concurrency from audit review budget', () => {

@@ -58,20 +58,33 @@ function parseOutputText(response) {
 export function createOpenAIResponsesClient({
   apiKey,
   baseURL,
-  timeoutMs = 30000,
+  timeoutMs = 900000,
   maxConcurrency = 2,
+  maxOutputTokens,
+  reasoningEffort,
   openaiClient,
 } = {}) {
   const client = openaiClient ?? new OpenAI({ apiKey, baseURL, timeout: timeoutMs });
   const runWithGate = createConcurrencyGate(positiveInteger(maxConcurrency, 2));
+  const outputLimit = positiveInteger(maxOutputTokens, null);
+  const effort = typeof reasoningEffort === 'string' && reasoningEffort.trim() !== ''
+    ? reasoningEffort.trim()
+    : null;
 
   return {
     async createStructuredResponse({ model, input, schema, signal }) {
-      const response = await runWithGate(() => client.responses.create({
+      const body = {
         model,
         input,
         text: { format: schema },
-      }, signal ? { signal } : undefined));
+      };
+      if (outputLimit) body.max_output_tokens = outputLimit;
+      if (effort) body.reasoning = { effort };
+
+      const response = await runWithGate(() => client.responses.create(
+        body,
+        signal ? { signal } : undefined,
+      ));
 
       return parseOutputText(response);
     },

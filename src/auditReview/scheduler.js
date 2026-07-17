@@ -25,6 +25,11 @@ function estimateTokensForReview({ reviewId, window, candidates }) {
   return estimateTokensForPayload({ review_id: reviewId, window, candidates: candidates ?? [] });
 }
 
+function positiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
 function reviewIdFor(now) {
   const ts = now.toISOString().replace(/[:.]/g, '-');
   return `review_${ts}_${crypto.randomUUID().slice(0, 8)}`;
@@ -292,6 +297,7 @@ export function createAuditReviewScheduler({
   const riskPolicyVersion = auditConfig.riskPolicy?.version ?? 'risk-policy-v1';
   const promptVersion = auditConfig.llmReview?.promptVersion ?? 'audit-review-prompt-v1';
   const reviewerVersion = auditConfig.llmReview?.reviewerVersion ?? 'audit-reviewer-v1';
+  const maxCandidatesPerLlmReview = positiveInteger(auditConfig.llmReview?.maxCandidatesPerCall, 12);
   const llmModel = llmModelOpt ?? config.planner?.model ?? config.auditReview?.llmReview?.model ?? null;
   const llmBudget = llmBudgetFromConfig(config);
 
@@ -557,11 +563,12 @@ export function createAuditReviewScheduler({
       }
 
       // 7. LLM review.
+      const llmCandidates = candidates.candidates.slice(0, maxCandidatesPerLlmReview);
       const llmDay = windowTo.slice(0, 10);
       const estimatedTokens = estimateTokensForReview({
         reviewId,
         window: { from: windowFrom, to: windowTo },
-        candidates: candidates.candidates,
+        candidates: llmCandidates,
       });
       const llmUsage = reviewStore.getLlmUsage?.(llmDay) ?? { day: llmDay, calls: 0, est_tokens: 0 };
       if (usageWouldExceedBudget(llmUsage, llmBudget, estimatedTokens)) {
@@ -577,7 +584,7 @@ export function createAuditReviewScheduler({
           llmResult = await llmReviewer.review({
             reviewId,
             window: { from: windowFrom, to: windowTo },
-            candidates: candidates.candidates,
+            candidates: llmCandidates,
             reviewStore,
           });
           reviewStore.recordLlmUsage?.({ day: llmDay, calls: 1, estTokens: estimatedTokens });
@@ -788,6 +795,10 @@ export function createAuditReviewScheduler({
     return enqueueReview('ingest', { rescheduleAfterReview: true });
   }
 
+  function runManual() {
+    return enqueueReview('manual');
+  }
+
   function stop() {
     started = false;
     clearRefreshTimer();
@@ -798,6 +809,7 @@ export function createAuditReviewScheduler({
     start,
     stop,
     runOnce,
+    runManual,
     runAfterIngest,
     recoverStaleRuns,
   };

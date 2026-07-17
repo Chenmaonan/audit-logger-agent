@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
+import { openDb, insertEvents, queryEvents } from '../../scripts/lib/db.js';
 import {
   DEFAULT_TOOL_TAXONOMY,
   createToolSemanticMapper,
@@ -82,4 +86,70 @@ test('tool semantic mapper falls back to unknown when LLM returns an unsupported
   assert.equal(result.mapped_tool_type, 'unknown');
   assert.equal(result.mapping_status, 'unknown');
   assert.equal(result.mapping_source, 'fallback');
+});
+
+test('tool semantic mapper queues concurrent pending-event mapping runs', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tool-mapping-queue-'));
+  const db = openDb(path.join(tmpDir, 'audit.db'));
+  let releaseFirst;
+  let firstStarted;
+  let calls = 0;
+  let active = 0;
+  let maxActive = 0;
+  const firstStartedPromise = new Promise((resolve) => {
+    firstStarted = resolve;
+  });
+
+  insertEvents(db, [
+    event({
+      id: undefined,
+      ts: '2026-07-08T09:59:00.000Z',
+      tool_name: 'custom.agentAction.one',
+      raw_json: JSON.stringify({ tool_name: 'custom.agentAction.one' }),
+    }),
+    event({
+      id: undefined,
+      ts: '2026-07-08T10:00:00.000Z',
+      span_id: 'span-2',
+      tool_name: 'custom.agentAction.two',
+      raw_json: JSON.stringify({ tool_name: 'custom.agentAction.two' }),
+    }),
+  ]);
+
+  const mapper = createToolSemanticMapper({
+    db,
+    llmClient: {
+      async createStructuredResponse() {
+        calls += 1;
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        if (calls === 1) {
+          firstStarted();
+          await new Promise((resolve) => releaseFirst = resolve);
+        }
+        active -= 1;
+        return { tool_type: 'read', reason: 'queued semantic mapping' };
+      },
+    },
+    model: 'test-model',
+  });
+
+  try {
+    const first = mapper.mapPendingEvents({ limit: 1 });
+    await firstStartedPromise;
+    const second = mapper.mapPendingEvents({ limit: 1 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(calls, 1, 'second mapping run must wait for the first run to finish');
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    assert.equal(maxActive, 1);
+    assert.equal(calls, 2);
+    const mapped = queryEvents(db, { mapping_status: 'mapped', limit: 10 });
+    assert.equal(mapped.length, 2);
+  } finally {
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

@@ -3,13 +3,17 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
-const DEFAULT_TIMEOUT_MS = 30000;
+const DEFAULT_TIMEOUT_MS = 900000;
 const DEFAULT_MAX_CONCURRENCY = 2;
+const DEFAULT_MAX_OUTPUT_TOKENS = 1200;
+const DEFAULT_REASONING_EFFORT = 'low';
 
 const ENV_API_KEY = 'AUDIT_AGENT_LLM_API_KEY';
 const ENV_BASE_URL = 'AUDIT_AGENT_LLM_BASE_URL';
 const ENV_MODEL = 'AUDIT_AGENT_LLM_MODEL';
 const ENV_TIMEOUT_MS = 'AUDIT_AGENT_LLM_TIMEOUT_MS';
+const ENV_MAX_OUTPUT_TOKENS = 'AUDIT_AGENT_LLM_MAX_OUTPUT_TOKENS';
+const ENV_REASONING_EFFORT = 'AUDIT_AGENT_LLM_REASONING_EFFORT';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -55,6 +59,20 @@ function parseMaxConcurrency(value) {
   return Math.floor(parsed);
 }
 
+function parseMaxOutputTokens(value) {
+  if (value == null || value === '') return DEFAULT_MAX_OUTPUT_TOKENS;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`AUDIT_AGENT_LLM_MAX_OUTPUT_TOKENS must be a positive number, got ${value}`);
+  }
+  return Math.floor(parsed);
+}
+
+function parseReasoningEffort(value) {
+  if (value == null || value === '') return DEFAULT_REASONING_EFFORT;
+  return String(value).trim();
+}
+
 export function loadOpenAIConfig({ env = process.env, appConfig = {}, projectRoot } = {}) {
   const rootDir = projectRoot ?? defaultProjectRoot();
   const projectConfig = readProjectConfig(rootDir);
@@ -66,6 +84,8 @@ export function loadOpenAIConfig({ env = process.env, appConfig = {}, projectRoo
   const baseURL = pick(ENV_BASE_URL, [env, projectConfig, plannerConfig]) ?? plannerConfig.baseURL ?? DEFAULT_BASE_URL;
   const timeoutRaw = pick(ENV_TIMEOUT_MS, [env, projectConfig, plannerConfig]) ?? plannerConfig.timeoutMs;
   const maxConcurrencyRaw = llmBudgetConfig.maxConcurrency;
+  const maxOutputTokensRaw = pick(ENV_MAX_OUTPUT_TOKENS, [env, projectConfig, plannerConfig]) ?? plannerConfig.maxOutputTokens;
+  const reasoningEffortRaw = pick(ENV_REASONING_EFFORT, [env, projectConfig, plannerConfig]) ?? plannerConfig.reasoningEffort;
 
   if (!apiKey) throw new Error(`${ENV_API_KEY} is required (set it in .config or the process environment)`);
   if (!model) throw new Error(`${ENV_MODEL} is required (set it in .config or the process environment)`);
@@ -76,5 +96,7 @@ export function loadOpenAIConfig({ env = process.env, appConfig = {}, projectRoo
     model,
     timeoutMs: parseTimeout(timeoutRaw),
     maxConcurrency: parseMaxConcurrency(maxConcurrencyRaw),
+    maxOutputTokens: parseMaxOutputTokens(maxOutputTokensRaw),
+    reasoningEffort: parseReasoningEffort(reasoningEffortRaw),
   };
 }

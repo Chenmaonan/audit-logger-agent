@@ -129,6 +129,8 @@ const llmClient = createOpenAIResponsesClient({
   baseURL: openAIConfig.baseURL,
   timeoutMs: openAIConfig.timeoutMs,
   maxConcurrency: openAIConfig.maxConcurrency,
+  maxOutputTokens: openAIConfig.maxOutputTokens,
+  reasoningEffort: openAIConfig.reasoningEffort,
 });
 
 const planner = createPlanner({

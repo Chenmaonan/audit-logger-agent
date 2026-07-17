@@ -22,7 +22,9 @@
 | `AUDIT_AGENT_LLM_API_KEY` | 是 | OpenAI-compatible LLM 的 API Key |
 | `AUDIT_AGENT_LLM_MODEL` | 是 | 审查与语义映射使用的模型名 |
 | `AUDIT_AGENT_LLM_BASE_URL` | 是 | OpenAI-compatible LLM API 地址，例如 `https://api.openai.com/v1` 或实际模型服务地址 |
-| `AUDIT_AGENT_LLM_TIMEOUT_MS` | 否 | LLM 请求超时毫秒数；未设置时为 `30000` |
+| `AUDIT_AGENT_LLM_TIMEOUT_MS` | 否 | LLM 请求超时毫秒数；未设置时为 `900000`（15 分钟） |
+| `AUDIT_AGENT_LLM_MAX_OUTPUT_TOKENS` | 否 | 单次 Responses API 最大输出 token；未设置时为 `1200` |
+| `AUDIT_AGENT_LLM_REASONING_EFFORT` | 否 | Responses API reasoning effort；未设置时为 `low` |
 | `AUDIT_AGENT_DASHBOARD_TOKEN` | 否 | `/v1/audit-*` Bearer 鉴权密钥；Dashboard 页面不使用它 |
 
 如需调用 `/v1/audit-*` API，`AUDIT_AGENT_DASHBOARD_TOKEN` 应是独立的高强度随机值。未配置时 Dashboard 仍可访问，但审查 API 的 Bearer 鉴权不会放行请求。

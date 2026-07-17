@@ -456,6 +456,78 @@ test('scheduler.runAfterIngest runs an immediate review and resets the scheduled
   db.close();
 });
 
+test('scheduler.runManual queues behind an in-flight review instead of skipping', async () => {
+  const db = makeDb();
+  insertEvent(db, 1, {
+    ts: '2026-07-03T10:29:00.000Z',
+    tool_name: 'some.query',
+    status: 'INTERNAL',
+    event: 'tool.end',
+  });
+
+  let releaseLlm;
+  let llmCalls = 0;
+  let firstLlmStarted;
+  const firstLlmStartedPromise = new Promise((resolve) => {
+    firstLlmStarted = resolve;
+  });
+  const deps = buildRealDeps(db, {
+    llmClient: {
+      async createStructuredResponse({ input }) {
+        llmCalls += 1;
+        if (llmCalls === 1) {
+          firstLlmStarted();
+          await new Promise((resolve) => releaseLlm = resolve);
+        }
+        const payload = JSON.parse(input.find((message) => message.role === 'user').content);
+        return {
+          type: 'audit_review',
+          review_id: payload.review_id,
+          window: payload.window,
+          summary: {
+            title: '审查发现 1 个风险',
+            overview: '过去 30 分钟共审查 1 条事件，发现 1 个失败调用。',
+            severity_counts: { critical: 0, high: 0, medium: 1, low: 0 },
+          },
+          findings: [
+            {
+              category: 'failed_call',
+              severity: 'medium',
+              agent_id: 'mt-agent',
+              tool_name: 'some.query',
+              trace_id: 'trace-1',
+              entity: null,
+              title: '工具调用失败',
+              summary: 'some.query 状态为 INTERNAL',
+              recommendation: '检查工具调用',
+              evidence_event_ids: [1],
+              requires_action: false,
+            },
+          ],
+        };
+      },
+    },
+  });
+  const scheduler = createAuditReviewScheduler({ db, ...deps, now: () => new Date('2026-07-03T10:30:00.000Z') });
+  assert.equal(typeof scheduler.runManual, 'function');
+
+  const first = scheduler.runAfterIngest();
+  await firstLlmStartedPromise;
+  const second = scheduler.runManual();
+  releaseLlm();
+
+  const firstResult = await first;
+  const secondResult = await second;
+
+  assert.equal(firstResult.status, 'completed');
+  assert.equal(secondResult.status, 'completed');
+  const runs = deps.reviewStore.listRuns({ limit: 10 });
+  assert.deepEqual(runs.slice(0, 2).map((run) => run.trigger_type).sort(), ['ingest', 'manual']);
+  assert.equal(runs.some((run) => run.status === 'skipped'), false);
+
+  db.close();
+});
+
 test('scheduler.runOnce with LLM failing: status completed_degraded, still inserts rule-based findings, lock released', async () => {
   const db = makeDb();
   insertEvent(db, 1, {
@@ -533,6 +605,75 @@ test('scheduler skips LLM and runs degraded when daily call budget is exhausted'
     WHERE agent_id = 'audit-logger-agent' AND event = 'review.llm.budget_exceeded'
   `).all();
   assert.equal(auditRows.length, 1);
+
+  db.close();
+});
+
+test('scheduler caps candidates sent to one LLM review call and keeps rule fallback for the full candidate set', async () => {
+  const db = makeDb();
+  let llmCandidateCount = null;
+  const deps = buildRealDeps(db, {
+    configOverrides: {
+      llmReview: {
+        promptVersion: 'audit-review-prompt-v1',
+        reviewerVersion: 'audit-reviewer-v1',
+        maxCandidatesPerCall: 2,
+      },
+    },
+    llmClient: {
+      async createStructuredResponse({ input }) {
+        const payload = JSON.parse(input.find((message) => message.role === 'user').content);
+        llmCandidateCount = payload.candidates.length;
+        return {
+          type: 'audit_review',
+          review_id: payload.review_id,
+          window: payload.window,
+          summary: {
+            title: '未发现额外风险',
+            overview: '模型仅审查配置上限内的候选，其余候选由规则层兜底。',
+            severity_counts: { critical: 0, high: 0, medium: 0, low: 0 },
+          },
+          findings: [],
+        };
+      },
+    },
+  });
+  deps.detector = {
+    detect() {
+      return {
+        totalEvents: 5,
+        trimmed: false,
+        candidates: Array.from({ length: 5 }, (_, index) => ({
+          event_id: index + 1,
+          ts: '2026-07-03T10:00:01.000Z',
+          agent_id: 'mt-agent',
+          trace_id: `trace-cap-${index + 1}`,
+          span_id: `span-cap-${index + 1}`,
+          event: 'tool.error',
+          tool_name: 'publicTraffic.runReport',
+          status: 'INTERNAL',
+          duration_ms: 30000,
+          result_summary: 'upstream timeout after 30000ms',
+          error_message: 'upstream service did not respond in 30s',
+          entity_type: 'product',
+          entity_id: `mt-prod-${index + 1}`,
+          category: 'failed_call',
+          reason: '工具调用失败',
+          min_severity: 'medium',
+        })),
+      };
+    },
+  };
+  const scheduler = createAuditReviewScheduler({ db, ...deps, now: () => new Date('2026-07-03T10:30:00.000Z') });
+
+  const result = await scheduler.runOnce({ triggerType: 'scheduled' });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(llmCandidateCount, 2);
+  const run = deps.reviewStore.getRun(result.reviewId);
+  assert.equal(run.candidate_event_count, 5);
+  const findings = deps.reviewStore.listFindings({ limit: 100 });
+  assert.equal(findings.length, 5);
 
   db.close();
 });
