@@ -388,6 +388,36 @@ test('reviewDetailPage shows degraded callout and linked finding rows', () => {
   assert.equal(page.sections.find((section) => section.id === 'run_metadata').collapsible, true);
 });
 
+test('reviewDetailPage reads occurrence snapshots and marks repeat, escalation, and recurrence', () => {
+  const page = createViz({
+    store: {
+      listReviewOccurrences({ reviewId }) {
+        assert.equal(reviewId, 'r-degraded');
+        return [{
+          occurrence_id: 'occ-1',
+          finding_id: 'f-critical',
+          review_id: reviewId,
+          severity: 'high',
+          title: 'Occurrence snapshot title',
+          observed_at: '2026-07-04T10:00:00.000Z',
+          is_new: 0,
+          severity_escalated: 1,
+          reopened: 1,
+          evidence_json: JSON.stringify([{ event_id: 9, raw_json: '{"snapshot":true}' }]),
+        }];
+      },
+    },
+  }).reviewDetailPage('r-degraded');
+
+  const section = page.sections.find((item) => item.id === 'review_findings');
+  assert.deepEqual(section.rows.map((row) => row.title.text), ['Occurrence snapshot title']);
+  assert.equal(section.rows[0].severity_label.text, '高风险');
+  assert.equal(section.rows[0].occurrence_flags.text, '重复出现 · 严重级别上升 · 已解决后复发');
+  assert.equal(section.rows[0].evidence_count.text, '1');
+  assert.equal(page.summary_metrics.find((metric) => metric.label === '高风险').value, 1);
+  assert.equal(page.summary_metrics.find((metric) => metric.label === '严重').value, 0);
+});
+
 test('reviewDetailPage filters its queue while summary uses the unfiltered review set', () => {
   const page = createViz({
     findings: [
@@ -449,6 +479,74 @@ test('findingDetailPage includes details, raw logs, links, and ordered trace seq
   assert.ok(orderedIds.indexOf('recommendation') < orderedIds.indexOf('trace_sequence'));
   assert.ok(orderedIds.indexOf('trace_sequence') < orderedIds.indexOf('finding_detail'));
   assert.ok(orderedIds.indexOf('finding_detail') < orderedIds.indexOf('evidence_raw_logs'));
+});
+
+test('findingDetailPage exposes lifecycle forms, occurrence/action history, snapshots, and notices', () => {
+  const page = createViz({
+    finding: {
+      state_version: 7,
+      first_review_id: 'r-first',
+      last_review_id: 'r-latest',
+      max_severity: 'critical',
+      status: 'resolved',
+    },
+    store: {
+      listFindingOccurrences({ findingId }) {
+        assert.equal(findingId, 'f-critical');
+        return [
+          {
+            occurrence_id: 'occ-2',
+            finding_id: findingId,
+            review_id: 'r-latest',
+            severity: 'critical',
+            observed_at: '2026-07-05T10:00:00.000Z',
+            is_new: 0,
+            severity_escalated: 1,
+            reopened: 1,
+            evidence_json: JSON.stringify([{ event_id: 88, raw_json: '{"historical":"evidence"}' }]),
+          },
+          {
+            occurrence_id: 'occ-1',
+            finding_id: findingId,
+            review_id: 'r-first',
+            severity: 'high',
+            observed_at: '2026-07-03T10:00:00.000Z',
+            is_new: 1,
+            severity_escalated: 0,
+            reopened: 0,
+            evidence_json: '[]',
+          },
+        ];
+      },
+      listFindingActions() {
+        return [{
+          action_id: 'act-1',
+          action_type: 'resolve',
+          from_status: 'open',
+          to_status: 'resolved',
+          actor: 'operator-1',
+          note: '已修复',
+          created_at: '2026-07-04T10:00:00.000Z',
+        }];
+      },
+    },
+  }).findingDetailPage('f-critical', { notice: 'finding_version_conflict', action: 'reopen' });
+
+  const actionForms = page.sections.find((section) => section.id === 'finding_actions');
+  assert.deepEqual(actionForms.forms.map((form) => form.action), ['reopen']);
+  assert.equal(actionForms.state_version, 7);
+  assert.equal(actionForms.action_url, '/dashboard/audit-findings/f-critical/actions');
+
+  const detail = page.sections.find((section) => section.id === 'finding_detail');
+  assert.equal(detail.items.find((item) => item.label === '复发次数').value, 1);
+  assert.equal(detail.items.find((item) => item.label === '历史最高严重级别').value, '严重');
+  assert.equal(detail.items.find((item) => item.label === '最近审查批次 ID').value, 'r-latest');
+  assert.ok(page.sections.find((section) => section.id === 'occurrence_history'));
+  assert.ok(page.sections.find((section) => section.id === 'action_history'));
+  const snapshots = page.sections.find((section) => section.id === 'historical_evidence_snapshots');
+  assert.equal(snapshots.snippets[0].body, '{"historical":"evidence"}');
+  assert.equal(page.notices[0].title, '操作未完成');
+  assert.match(page.notices[0].body, /其他操作更新/);
 });
 
 test('findingDetailPage limits dashboard trace sequence to first 20 steps and flags over-50 traces', () => {

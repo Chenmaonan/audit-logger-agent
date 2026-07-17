@@ -31,6 +31,14 @@ const CATEGORY_LABELS = {
   trace_integrity: '链路完整性',
   ingest_parse_error: '日志解析错误',
 };
+const ACTION_LABELS = {
+  acknowledge: '确认',
+  snooze: '暂缓',
+  resolve: '解决',
+  reopen: '重新打开',
+  recurrence: '复发重开',
+  snooze_expired: '暂缓到期',
+};
 const TRACE_DISPLAY_STEP_LIMIT = 20;
 const TRACE_ANALYSIS_STEP_LIMIT = 20;
 const TRACE_ABNORMAL_STEP_THRESHOLD = 50;
@@ -49,6 +57,7 @@ const REVIEW_FINDINGS_COLUMNS = [
   { key: 'agent_tool', label: 'Agent / Tool', priority: 'primary' },
   { key: 'severity_label', label: '严重级别', priority: 'primary' },
   { key: 'status', label: '状态', priority: 'primary' },
+  { key: 'occurrence_flags', label: '本次出现', priority: 'secondary' },
   { key: 'evidence_count', label: '证据', priority: 'metadata' },
   { key: 'details', label: '详情', priority: 'secondary' },
 ];
@@ -395,6 +404,75 @@ function insertSectionBefore(sections, anchorId, section) {
   sections.splice(insertIndex, 0, section);
 }
 
+function parseJsonValue(value, fallback) {
+  if (value === null || value === undefined || value === '') return fallback;
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function evidenceOfOccurrence(occurrence) {
+  if (Array.isArray(occurrence?.evidence)) return occurrence.evidence;
+  const snapshot = parseJsonValue(occurrence?.evidence_json, null);
+  if (Array.isArray(snapshot)) return snapshot;
+  if (Array.isArray(snapshot?.evidence)) return snapshot.evidence;
+  if (Array.isArray(snapshot?.events)) return snapshot.events;
+  if (Array.isArray(snapshot?.details)) return snapshot.details;
+  return snapshot && typeof snapshot === 'object' ? [snapshot] : [];
+}
+
+function occurrenceFlags(occurrence) {
+  const labels = [];
+  if (occurrence?.is_new === true || occurrence?.is_new === 1) labels.push('首次发现');
+  else labels.push('重复出现');
+  if (occurrence?.severity_escalated === true || occurrence?.severity_escalated === 1) labels.push('严重级别上升');
+  if (occurrence?.reopened === true || occurrence?.reopened === 1) labels.push('已解决后复发');
+  return labels.join(' · ');
+}
+
+function rawSnapshotSnippets(occurrences) {
+  const snippets = [];
+  for (const occurrence of occurrences) {
+    const occurrenceId = occurrence?.occurrence_id ?? '历史记录';
+    for (const [index, evidence] of evidenceOfOccurrence(occurrence).entries()) {
+      const body = evidence?.raw_json ?? evidence?.log_detail?.raw_json;
+      if (!isPresent(body)) continue;
+      const eventId = evidence?.event_id ?? evidence?.id;
+      snippets.push({
+        label: `${occurrenceId}${isPresent(eventId) ? ` / 日志 ID ${eventId}` : ` / 证据 ${index + 1}`}`,
+        body: typeof body === 'string' ? body : JSON.stringify(body),
+      });
+    }
+  }
+  return snippets;
+}
+
+function occurrenceMatchesFilters(row, filters = {}) {
+  if (filters.agentId && row.agent_id !== filters.agentId) return false;
+  if (filters.severity && row.severity !== filters.severity) return false;
+  if (filters.category && row.category !== filters.category) return false;
+  if (filters.status && row.status !== filters.status) return false;
+  return true;
+}
+
+function actionNotice(notice, action) {
+  if (!notice) return [];
+  if (notice === 'action_success') {
+    return [{ tone: 'success', title: '操作已完成', body: `${ACTION_LABELS[action] ?? '状态操作'}已保存，Finding 状态和操作历史已更新。` }];
+  }
+  const messages = {
+    finding_version_conflict: 'Finding 已被其他操作更新，请核对当前状态后重试。',
+    finding_state_conflict: '当前状态不允许执行该操作，请核对最新状态。',
+    invalid_finding_action: '提交的动作参数无效，请补全必填信息后重试。',
+    finding_not_found: 'Finding 不存在或已被清理。',
+    finding_lifecycle_unavailable: 'Finding 生命周期服务当前不可用。',
+  };
+  return [{ tone: 'critical', title: '操作未完成', body: messages[notice] ?? '处理操作时发生内部错误，请稍后重试。' }];
+}
+
 export function createVisualization({ reviewStore, config, llmClient, model } = {}) {
   const vizConfig = defaultVisualizationConfig(config);
   const baseUrl = vizConfig.baseUrl ?? 'http://127.0.0.1:9320';
@@ -560,6 +638,36 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       return reviewStore.getFinding?.(findingId) ?? null;
     } catch {
       return null;
+    }
+  }
+
+  function listFindingOccurrences(findingId, limit = 1000) {
+    if (typeof reviewStore.listFindingOccurrences !== 'function') return null;
+    try {
+      const rows = reviewStore.listFindingOccurrences({ findingId, limit });
+      return Array.isArray(rows) ? rows : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function listFindingActions(findingId, limit = 1000) {
+    if (typeof reviewStore.listFindingActions !== 'function') return null;
+    try {
+      const rows = reviewStore.listFindingActions({ findingId, limit });
+      return Array.isArray(rows) ? rows : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function listReviewOccurrences(reviewId, limit = 1000) {
+    if (typeof reviewStore.listReviewOccurrences !== 'function') return null;
+    try {
+      const rows = reviewStore.listReviewOccurrences({ reviewId, limit });
+      return Array.isArray(rows) ? rows : [];
+    } catch {
+      return [];
     }
   }
 
@@ -938,14 +1046,19 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     const run = getRun(reviewId);
     const updatedAt = nowIso();
     const explicitFilters = { agentId, severity, category, status };
-    const allReviewFindings = listFindings(1000, { reviewId }).slice().sort(compareFindings);
-    const reviewFindings = listFindings(1000, {
-      reviewId,
-      agentId,
-      severity,
-      category,
-      status,
-    }).slice().sort(compareFindings);
+    const storedOccurrences = listReviewOccurrences(reviewId, 1000);
+    const occurrenceBackedFindings = storedOccurrences === null ? null : storedOccurrences.map((occurrence) => ({
+      ...(getFinding(occurrence.finding_id) ?? {}),
+      ...occurrence,
+      evidence: evidenceOfOccurrence(occurrence),
+      occurrence,
+    }));
+    const allReviewFindings = (occurrenceBackedFindings ?? listFindings(1000, { reviewId })).slice().sort(compareFindings);
+    const reviewFindings = (occurrenceBackedFindings === null
+      ? listFindings(1000, { reviewId, agentId, severity, category, status })
+      : occurrenceBackedFindings.filter((row) => occurrenceMatchesFilters(row, explicitFilters)))
+      .slice()
+      .sort(compareFindings);
     const severityCounts = { critical: 0, high: 0, medium: 0, low: 0 };
     for (const finding of allReviewFindings) {
       if (severityCounts[finding.severity] != null) severityCounts[finding.severity] += 1;
@@ -1031,6 +1144,10 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
             text: labelOf(STATUS_LABELS, finding.status),
             tone: statusTone(finding.status),
           },
+          occurrence_flags: {
+            text: finding.occurrence ? occurrenceFlags(finding.occurrence) : '历史关联',
+            secondary: finding.occurrence?.observed_at ? formatTime(finding.occurrence.observed_at) : undefined,
+          },
           evidence_count: {
             text: String(Array.isArray(finding.evidence) ? finding.evidence.length : 0),
             mono: true,
@@ -1098,7 +1215,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     };
   }
 
-  function findingDetailPage(findingId) {
+  function findingDetailPage(findingId, { notice, action } = {}) {
     const finding = getFinding(findingId);
     const updatedAt = nowIso();
     if (!finding) {
@@ -1119,7 +1236,16 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       };
     }
 
-    const reviewId = finding.review_id;
+    const reviewId = finding.last_review_id ?? finding.review_id;
+    const occurrences = listFindingOccurrences(findingId, 1000) ?? [];
+    const actions = listFindingActions(findingId, 1000) ?? [];
+    const recurrenceCount = occurrences.filter((row) => row?.reopened === true || row?.reopened === 1).length
+      || actions.filter((row) => row?.action_type === 'recurrence').length;
+    const maxSeverity = finding.max_severity ?? occurrences
+      .map((row) => row?.severity)
+      .filter(Boolean)
+      .sort((left, right) => severityRank(right) - severityRank(left))[0]
+      ?? finding.severity;
     const breadcrumbs = [{ label: '总览', href: dashboardPath }];
     if (reviewId) breadcrumbs.push({ label: '审查批次', href: reviewUrl(reviewId) });
     breadcrumbs.push({ label: '风险发现', href: findingUrl(findingId) });
@@ -1139,19 +1265,24 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
 
     const definitionItems = [
       { label: '风险发现 ID', value: finding.finding_id ?? '' },
-      { label: '审查批次 ID', value: finding.review_id ?? '' },
+      { label: '首次审查批次 ID', value: finding.first_review_id ?? finding.review_id ?? '' },
+      { label: '最近审查批次 ID', value: finding.last_review_id ?? finding.review_id ?? '' },
       { label: 'Agent 名称', value: finding.agent_name ?? '' },
       { label: 'Agent ID', value: finding.agent_id ?? '' },
       { label: '工具', value: finding.tool_name ?? '' },
       { label: 'Trace ID', value: finding.trace_id ?? '' },
       { label: '实体', value: [finding.entity?.type, finding.entity?.id].filter(Boolean).join('/') },
       { label: '最后出现', value: formatTime(lastSeenAtOf(finding)) },
+      { label: '历史最高严重级别', value: labelOf(SEVERITY_LABELS, maxSeverity) },
+      { label: '复发次数', value: recurrenceCount },
+      { label: '状态版本', value: finding.state_version },
     ].filter((item) => isPresent(item.value));
 
     const traceEvents = orderedTraceEvents(listTraceEvents(finding.trace_id, 200));
     const traceSteps = traceSequenceSteps(traceEvents);
     const rawEvidenceEvents = listRawEventsByIds(evidenceEventIdsOf(finding), 200);
     const rawEvidenceSnippets = rawLogSnippets(rawEvidenceEvents);
+    const historicalEvidenceSnippets = rawSnapshotSnippets(occurrences);
 
     const linkItems = [];
     if (reviewId) {
@@ -1160,6 +1291,27 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     linkItems.push({ href: dashboardPath, label: '返回总览' });
 
     const sections = [];
+    const allowedActions = {
+      open: ['acknowledge', 'snooze', 'resolve'],
+      acknowledged: ['snooze', 'resolve', 'reopen'],
+      snoozed: ['acknowledge', 'resolve'],
+      resolved: ['reopen'],
+    }[finding.status] ?? [];
+    if (allowedActions.length > 0 && isPresent(finding.state_version)) {
+      sections.push({
+        id: 'finding_actions',
+        title: '处置 Finding',
+        type: 'action_forms',
+        action_url: `${findingUrl(findingId)}/actions`,
+        state_version: finding.state_version,
+        forms: allowedActions.map((actionType) => ({
+          action: actionType,
+          label: ACTION_LABELS[actionType],
+          requires_note: actionType === 'resolve' || actionType === 'reopen',
+          requires_snoozed_until: actionType === 'snooze',
+        })),
+      });
+    }
     if (isPresent(finding.summary)) {
       sections.push({
         id: 'finding_summary',
@@ -1203,6 +1355,68 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
         items: definitionItems,
       });
     }
+    if (occurrences.length > 0) {
+      sections.push({
+        id: 'occurrence_history',
+        title: `出现历史（${occurrences.length} 次）`,
+        type: 'table',
+        columns: [
+          { key: 'observed_at', label: '观察时间', priority: 'primary' },
+          { key: 'review_id', label: '审查批次', priority: 'secondary' },
+          { key: 'severity', label: '严重级别', priority: 'primary' },
+          { key: 'flags', label: '出现类型', priority: 'primary' },
+          { key: 'evidence_count', label: '证据', priority: 'metadata' },
+        ],
+        rows: occurrences.map((occurrence) => ({
+          observed_at: { text: formatTime(occurrence.observed_at ?? occurrence.created_at), mono: true },
+          review_id: {
+            text: occurrence.review_id ?? '',
+            href: occurrence.review_id ? reviewUrl(occurrence.review_id) : undefined,
+            mono: true,
+          },
+          severity: { text: labelOf(SEVERITY_LABELS, occurrence.severity), tone: severityTone(occurrence.severity) },
+          flags: occurrenceFlags(occurrence),
+          evidence_count: String(evidenceOfOccurrence(occurrence).length),
+        })),
+      });
+    }
+    if (actions.length > 0) {
+      sections.push({
+        id: 'action_history',
+        title: `操作历史（${actions.length} 条）`,
+        type: 'table',
+        columns: [
+          { key: 'created_at', label: '操作时间', priority: 'primary' },
+          { key: 'action', label: '动作', priority: 'primary' },
+          { key: 'transition', label: '状态变化', priority: 'secondary' },
+          { key: 'actor', label: '操作者', priority: 'secondary' },
+          { key: 'note', label: '说明', priority: 'metadata' },
+        ],
+        rows: actions.map((row) => ({
+          created_at: { text: formatTime(row.created_at), mono: true },
+          action: ACTION_LABELS[row.action_type] ?? row.action_type ?? '',
+          transition: `${labelOf(STATUS_LABELS, row.from_status)} → ${labelOf(STATUS_LABELS, row.to_status)}`,
+          actor: row.actor ?? '',
+          note: row.note ?? (row.snoozed_until ? `暂缓至 ${row.snoozed_until}` : ''),
+        })),
+      });
+    }
+    if (historicalEvidenceSnippets.length > 0) {
+      sections.push({
+        id: 'historical_evidence_snapshots',
+        title: `历史证据快照（${historicalEvidenceSnippets.length} 条）`,
+        type: 'raw_log_list',
+        collapsible: true,
+        snippets: historicalEvidenceSnippets,
+      });
+    } else if (occurrences.length > 0) {
+      sections.push({
+        id: 'historical_evidence_unavailable',
+        title: '历史证据快照',
+        type: 'callout',
+        body: '历史原始证据已清理或快照中没有 raw_json；Occurrence 元数据仍保留。',
+      });
+    }
     if (rawEvidenceSnippets.length > 0) {
       sections.push({
         id: 'evidence_raw_logs',
@@ -1232,12 +1446,13 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       },
       summary_metrics: [],
       filters: [],
+      notices: actionNotice(notice, action),
       sections,
     };
   }
 
-  async function findingDetailPageWithAnalysis(findingId) {
-    const page = findingDetailPage(findingId);
+  async function findingDetailPageWithAnalysis(findingId, options) {
+    const page = findingDetailPage(findingId, options);
     const finding = getFinding(findingId);
     if (!finding || !llmClient || !traceAnalysisModel || !Array.isArray(page.sections)) return page;
 

@@ -35,6 +35,7 @@ import { createVisualization } from '../src/auditReview/visualization.js';
 import { createDashboardAuth } from '../src/auditReview/dashboardAuth.js';
 import { createAuditReviewScheduler } from '../src/auditReview/scheduler.js';
 import { createRetentionScheduler, createRetentionService } from '../src/auditReview/retention.js';
+import { createFindingLifecycleService } from '../src/auditReview/findingLifecycleService.js';
 import { createGracefulShutdown, listenHttpServer, resolveServerBindHost } from '../src/adapters/http/serverListen.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -187,6 +188,7 @@ const llmReviewer = createLlmReviewer({
 });
 const reviewNotifier = createReviewNotifier({ outboxStore, config: runtimeConfig });
 const reviewVisualization = createVisualization({ reviewStore, config: runtimeConfig, llmClient, model: openAIConfig.model });
+const findingLifecycleService = createFindingLifecycleService({ reviewStore, now: () => new Date() });
 const dashboardAuth = createDashboardAuth({ config: runtimeConfig, env: process.env });
 const scheduler = createAuditReviewScheduler({
   db,
@@ -247,6 +249,7 @@ const app = createHttpApp({
   reviewStore,
   visualization: reviewVisualization,
   dashboardAuth,
+  findingLifecycleService,
   toolSemanticMapper,
   retentionService,
 });

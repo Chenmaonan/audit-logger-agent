@@ -353,32 +353,47 @@ $env:AUDIT_INGEST_URL = "$auditBaseUrl/v1/ingest"
 
 如果目标 Agent 使用不同配置名，也必须映射到同一个 URL 语义：完整的 HTTP ingest 地址，而不是服务基地址或查询地址。
 
-### 10.2 发送最小事件
+### 10.2 发送最小完整调用
 
-以下 PowerShell 示例可验证服务端契约。请将 `catalog-agent` 替换为新 Agent 的稳定 ID：
+以下 PowerShell 示例用同一 `trace_id` 和 `span_id` 发送成对的 `tool.start`、`tool.end`，同时验证结束事件的 `duration_ms`。请将 `catalog-agent` 替换为新 Agent 的稳定 ID：
 
 ```powershell
 $auditBaseUrl = 'http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me'
 $env:AUDIT_INGEST_URL = "$auditBaseUrl/v1/ingest"
 $traceId = "integration-$([guid]::NewGuid().ToString('N'))"
-$event = @{
-  ts = (Get-Date).ToUniversalTime().ToString('o')
-  agent_id = 'catalog-agent'
-  trace_id = $traceId
-  span_id = [guid]::NewGuid().ToString('N')
-  event = 'tool.end'
-  tool_name = 'catalog.getProduct'
-  status = 'OK'
-  result_summary = '接入验证：商品读取完成'
-  entity = @{ type = 'product'; id = '761' }
-} | ConvertTo-Json -Compress
+$spanId = [guid]::NewGuid().ToString('N')
+$events = @(
+  @{
+    ts = (Get-Date).ToUniversalTime().ToString('o')
+    agent_id = 'catalog-agent'
+    trace_id = $traceId
+    span_id = $spanId
+    event = 'tool.start'
+    tool_name = 'catalog.getProduct'
+    status = 'OK'
+    result_summary = '接入验证：开始读取商品'
+    entity = @{ type = 'product'; id = '761' }
+  },
+  @{
+    ts = (Get-Date).ToUniversalTime().ToString('o')
+    agent_id = 'catalog-agent'
+    trace_id = $traceId
+    span_id = $spanId
+    event = 'tool.end'
+    tool_name = 'catalog.getProduct'
+    status = 'OK'
+    result_summary = '接入验证：商品读取完成'
+    duration_ms = 1
+    entity = @{ type = 'product'; id = '761' }
+  }
+) | ConvertTo-Json -Compress
 
 $response = Invoke-RestMethod -Method Post `
   -Uri $env:AUDIT_INGEST_URL `
   -ContentType 'application/json' `
-  -Body $event
+  -Body $events
 
-if ($response.accepted -ne 1 -or $response.rejected -ne 0) {
+if ($response.accepted -ne 2 -or $response.rejected -ne 0) {
   throw "ingest 未完整确认：$($response | ConvertTo-Json -Compress)"
 }
 ```
@@ -391,7 +406,12 @@ if ($response.accepted -ne 1 -or $response.rejected -ne 0) {
 Invoke-RestMethod -Uri "$auditBaseUrl/query?trace_id=$traceId&limit=100"
 ```
 
-返回应包含刚发送的事件。随后用真实 Agent 执行一次完整工具调用，确认相同 `trace_id` 下同时出现 `tool.start` 与 `tool.end` 或 `tool.error`。
+返回应包含刚发送的两个事件。随后用真实 Agent 执行一次完整工具调用，并逐项确认：
+
+- 相同 `trace_id` 下同时出现 `tool.start` 与 `tool.end` 或 `tool.error`。
+- 开始和结束事件复用同一 `span_id`，没有只开始、不结束的孤立调用。
+- `tool.end` 或 `tool.error` 包含非负 `duration_ms`。
+- 重试后的事件仍保留原始 `trace_id`、`span_id`、事件名和时间戳。
 
 验收时还必须检查查询结果中的工具语义映射字段：
 

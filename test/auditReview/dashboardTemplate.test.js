@@ -375,6 +375,35 @@ test('renderDashboard includes focus ring and row hover CSS rules', () => {
   assert.ok(html.includes('.data-table tbody tr:hover { background: var(--surface-muted); }'));
 });
 
+test('renderDashboard renders lifecycle notices and SSR action forms without browser scripts', () => {
+  const html = renderDashboard({
+    page: { title: '风险发现' },
+    notices: [{ tone: 'critical', title: '操作未完成', body: 'Finding 已更新，请重试。' }],
+    sections: [{
+      id: 'finding_actions',
+      type: 'action_forms',
+      title: '处置 Finding',
+      action_url: '/dashboard/audit-findings/f%3C1/actions',
+      state_version: 7,
+      forms: [
+        { action: 'resolve', label: '解决', requires_note: true },
+        { action: 'snooze', label: '暂缓', requires_snoozed_until: true },
+      ],
+    }],
+  });
+
+  assert.ok(html.includes('class="notice" data-tone="critical" role="status"'));
+  assert.ok(html.includes('操作未完成'));
+  assert.ok(html.includes('<form method="post" action="/dashboard/audit-findings/f%3C1/actions" class="finding-action-form">'));
+  assert.ok(html.includes('<input type="hidden" name="expected_state_version" value="7">'));
+  assert.ok(html.includes('<input type="hidden" name="action" value="resolve">'));
+  assert.ok(html.includes('<textarea name="note" required rows="3"></textarea>'));
+  assert.ok(html.includes('<input type="datetime-local" name="snoozed_until" required>'));
+  assert.ok(html.includes('name="actor" required'));
+  assert.equal(html.includes('fetch('), false);
+  assert.equal(html.includes('<script'), false);
+});
+
 test('renderDashboard default UI text is readable Chinese without mojibake', () => {
   const html = renderDashboard({
     sections: [{

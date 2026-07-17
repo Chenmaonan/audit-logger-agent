@@ -275,7 +275,75 @@ function mapRuntimeError(error) {
   return { status: 500, body: { error_code: 'internal_error', error: 'Internal server error' } };
 }
 
-export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth, toolSemanticMapper, retentionService, now = () => new Date() } = {}) {
+function mapFindingActionError(error) {
+  const code = error?.code;
+  if (error instanceof SyntaxError) return { status: 400, body: { error_code: 'invalid_finding_action', error: 'Request body must be valid JSON' } };
+  if (code === 'invalid_finding_action') return { status: 400, body: { error_code: code, error: error.message } };
+  if (code === 'finding_not_found') return { status: 404, body: { error_code: code, error: error.message } };
+  if (code === 'finding_state_conflict' || code === 'finding_version_conflict') {
+    return { status: 409, body: { error_code: code, error: error.message } };
+  }
+  if (code === 'finding_lifecycle_unavailable') return { status: 503, body: { error_code: code, error: error.message } };
+  return { status: 500, body: { error_code: 'internal_error', error: 'Internal server error' } };
+}
+
+async function readForm(req, limitBytes = DEFAULT_MAX_BODY_BYTES) {
+  const declared = Number(req.headers['content-length']);
+  if (Number.isFinite(declared) && declared > limitBytes) {
+    const error = new Error('Request body exceeds maxBodyBytes');
+    error.code = 'body_too_large';
+    throw error;
+  }
+
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > limitBytes) {
+      const error = new Error('Request body exceeds maxBodyBytes');
+      error.code = 'body_too_large';
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  return Object.fromEntries(new URLSearchParams(Buffer.concat(chunks).toString('utf-8')));
+}
+
+function findingActionInput(body = {}) {
+  const rawVersion = body.expected_state_version ?? body.expectedStateVersion;
+  const expectedStateVersion = typeof rawVersion === 'string' && /^\d+$/.test(rawVersion)
+    ? Number(rawVersion)
+    : rawVersion;
+  return {
+    action: body.action,
+    actor: body.actor,
+    note: body.note,
+    snoozedUntil: body.snoozed_until ?? body.snoozedUntil,
+    expectedStateVersion,
+  };
+}
+
+async function performFindingAction(findingLifecycleService, findingId, input) {
+  const handler = findingLifecycleService?.performAction
+    ?? findingLifecycleService?.applyAction
+    ?? findingLifecycleService?.executeAction
+    ?? findingLifecycleService?.transitionFinding;
+  if (typeof handler !== 'function') {
+    const error = new Error('Finding lifecycle service is unavailable');
+    error.code = 'finding_lifecycle_unavailable';
+    throw error;
+  }
+  return handler.call(findingLifecycleService, { findingId, ...input });
+}
+
+function listHistory(store, methodName, idName, id, pagination) {
+  const method = store?.[methodName];
+  if (typeof method !== 'function') return null;
+  const rows = method.call(store, { [idName]: id, ...pagination });
+  return Array.isArray(rows) ? rows : [];
+}
+
+export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth, findingLifecycleService, toolSemanticMapper, retentionService, now = () => new Date() } = {}) {
   // Helpers for audit-review routes. These are optional — if not provided
   // (e.g. in the existing runs-api test), the new routes return 503.
   const hasReviewDeps = !!(scheduler && reviewStore && visualization && dashboardAuth);
@@ -321,6 +389,25 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         return;
       }
 
+      const reviewOccurrencesMatch = url.pathname.match(/^\/v1\/audit-reviews\/([^/]+)\/occurrences$/);
+      if (hasReviewDeps && req.method === 'GET' && reviewOccurrencesMatch) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeApi(req);
+        const fail = mapAuthFailure(auth);
+        if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
+        const reviewId = decodeURIComponent(reviewOccurrencesMatch[1]);
+        const run = reviewStore.getRun(reviewId);
+        if (!run) { auditJson(res, 404, { error_code: 'review_not_found', error: 'Review not found' }, cors); return; }
+        const pagination = paginationFromUrl(url, { defaultLimit: 100, config });
+        const occurrences = listHistory(reviewStore, 'listReviewOccurrences', 'reviewId', reviewId, pagination);
+        if (occurrences === null) {
+          auditJson(res, 503, { error_code: 'occurrence_store_unavailable', error: 'Review occurrence history is unavailable' }, cors);
+          return;
+        }
+        auditJson(res, 200, { count: occurrences.length, results: occurrences }, cors);
+        return;
+      }
+
       if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/v1/audit-reviews/') && url.pathname !== '/v1/audit-reviews/run') {
         const cors = reviewCors(req);
         const auth = dashboardAuth.authorizeApi(req);
@@ -347,6 +434,53 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         const reviewId = url.searchParams.get('review_id') ?? undefined;
         const findings = reviewStore.listFindings({ limit, offset, severity, category, agentId, toolName, status: statusFilter, reviewId });
         auditJson(res, 200, { count: findings.length, results: findings }, cors);
+        return;
+      }
+
+      const findingHistoryMatch = url.pathname.match(/^\/v1\/audit-findings\/([^/]+)\/(actions|occurrences)$/);
+      if (hasReviewDeps && req.method === 'GET' && findingHistoryMatch) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeApi(req);
+        const fail = mapAuthFailure(auth);
+        if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
+        const findingId = decodeURIComponent(findingHistoryMatch[1]);
+        const finding = reviewStore.getFinding(findingId);
+        if (!finding) { auditJson(res, 404, { error_code: 'finding_not_found', error: 'Finding not found' }, cors); return; }
+        const pagination = paginationFromUrl(url, { defaultLimit: 100, config });
+        const isActions = findingHistoryMatch[2] === 'actions';
+        const rows = listHistory(
+          reviewStore,
+          isActions ? 'listFindingActions' : 'listFindingOccurrences',
+          'findingId',
+          findingId,
+          pagination,
+        );
+        if (rows === null) {
+          auditJson(res, 503, {
+            error_code: isActions ? 'action_store_unavailable' : 'occurrence_store_unavailable',
+            error: isActions ? 'Finding action history is unavailable' : 'Finding occurrence history is unavailable',
+          }, cors);
+          return;
+        }
+        auditJson(res, 200, { count: rows.length, results: rows }, cors);
+        return;
+      }
+
+      const findingActionMatch = url.pathname.match(/^\/v1\/audit-findings\/([^/]+)\/actions$/);
+      if (hasReviewDeps && req.method === 'POST' && findingActionMatch) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeApi(req);
+        const fail = mapAuthFailure(auth);
+        if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
+        const findingId = decodeURIComponent(findingActionMatch[1]);
+        try {
+          const body = await readJson(req, maxBodyBytes(config));
+          const result = await performFindingAction(findingLifecycleService, findingId, findingActionInput(body));
+          auditJson(res, 200, result, cors);
+        } catch (error) {
+          const mapped = error?.code === 'body_too_large' ? mapRuntimeError(error) : mapFindingActionError(error);
+          auditJson(res, mapped.status, mapped.body, cors);
+        }
         return;
       }
 
@@ -404,6 +538,28 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         return;
       }
 
+      const dashboardFindingActionMatch = url.pathname.match(/^\/dashboard\/audit-findings\/([^/]+)\/actions$/);
+      if (hasReviewDeps && req.method === 'POST' && dashboardFindingActionMatch) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeDashboard(req);
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
+        const findingId = decodeURIComponent(dashboardFindingActionMatch[1]);
+        let notice = 'action_success';
+        let action = '';
+        try {
+          const body = await readForm(req, maxBodyBytes(config));
+          action = body.action ?? '';
+          await performFindingAction(findingLifecycleService, findingId, findingActionInput(body));
+        } catch (error) {
+          notice = error?.code ?? 'internal_error';
+        }
+        const params = new URLSearchParams({ notice });
+        if (action) params.set('action', action);
+        redirect(res, `/dashboard/audit-findings/${encodeURIComponent(findingId)}?${params}`);
+        return;
+      }
+
       if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/dashboard/audit-reviews/')) {
         const cors = reviewCors(req);
         const auth = dashboardAuth.authorizeDashboard(req);
@@ -426,9 +582,13 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         const findingId = decodeURIComponent(url.pathname.split('/').pop());
         const finding = reviewStore.getFinding(findingId);
         if (!finding) { html(res, 404, '<h1>Finding not found</h1>', cors); return; }
+        const pageOptions = {
+          notice: optionalSearchParam(url, 'notice'),
+          action: optionalSearchParam(url, 'action'),
+        };
         const page = typeof visualization.findingDetailPageWithAnalysis === 'function'
-          ? await visualization.findingDetailPageWithAnalysis(findingId)
-          : visualization.findingDetailPage(findingId);
+          ? await visualization.findingDetailPageWithAnalysis(findingId, pageOptions)
+          : visualization.findingDetailPage(findingId, pageOptions);
         html(res, 200, renderDashboard(page), cors);
         return;
       }

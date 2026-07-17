@@ -42,6 +42,7 @@ function visibleSections(sections = []) {
         || (Array.isArray(section.risk_points) && section.risk_points.length > 0)
         || (Array.isArray(section.next_actions) && section.next_actions.length > 0);
     }
+    if (section.type === 'action_forms') return Array.isArray(section.forms) && section.forms.length > 0;
     return false;
   });
 }
@@ -211,6 +212,14 @@ function renderPageActions(actions) {
   }).join('')}</div>`;
 }
 
+function renderNotices(notices) {
+  if (!Array.isArray(notices) || notices.length === 0) return '';
+  return `<div class="notice-list" aria-live="polite">${notices.map((notice) => {
+    const tone = escapeHtml(notice.tone ?? 'neutral');
+    return `<section class="notice" data-tone="${tone}" role="status"><div class="notice-title">${escapeHtml(notice.title ?? '')}</div>${hasValue(notice.body) ? `<div class="notice-body">${escapeHtml(notice.body)}</div>` : ''}</section>`;
+  }).join('')}</div>`;
+}
+
 function renderTableSection(section) {
   const id = section.id ?? '';
   const escapedId = escapeHtml(id);
@@ -377,6 +386,26 @@ function renderTraceAnalysisSection(section) {
   });
 }
 
+function renderActionFormsSection(section) {
+  const forms = Array.isArray(section.forms) ? section.forms : [];
+  if (forms.length === 0 || !hasValue(section.action_url)) return '';
+  const body = forms.map((form) => `<form method="post" action="${escapeHtml(section.action_url)}" class="finding-action-form">
+      <input type="hidden" name="action" value="${escapeHtml(form.action ?? '')}">
+      <input type="hidden" name="expected_state_version" value="${escapeHtml(section.state_version ?? '')}">
+      <div class="form-heading">${escapeHtml(form.label ?? form.action ?? '')}</div>
+      <label class="form-field"><span>操作者</span><input type="text" name="actor" required autocomplete="username"></label>
+      ${form.requires_note ? '<label class="form-field"><span>说明</span><textarea name="note" required rows="3"></textarea></label>' : ''}
+      ${form.requires_snoozed_until ? '<label class="form-field"><span>暂缓至</span><input type="datetime-local" name="snoozed_until" required></label>' : ''}
+      <button type="submit" class="form-submit">${escapeHtml(form.label ?? '提交')}</button>
+    </form>`).join('');
+  return renderDataSection({
+    id: section.id,
+    title: escapeHtml(section.title ?? ''),
+    className: 'finding-actions-section',
+    body: `<div class="finding-action-grid">${body}</div>`,
+  });
+}
+
 function renderSection(section) {
   if (!section) return '';
   switch (section.type) {
@@ -387,6 +416,7 @@ function renderSection(section) {
     case 'raw_log_list': return renderRawLogListSection(section);
     case 'trace_sequence': return renderTraceSequenceSection(section);
     case 'trace_analysis': return renderTraceAnalysisSection(section);
+    case 'action_forms': return renderActionFormsSection(section);
     default: return '';
   }
 }
@@ -418,6 +448,7 @@ export function renderDashboard(templateInput) {
   const breadcrumbs = renderBreadcrumbs(page.breadcrumbs);
   const contextBadges = renderContextBadges(page.context_badges);
   const pageActions = renderPageActions(page.page_actions);
+  const notices = renderNotices(templateInput?.notices);
   const sections = renderSections(templateInput?.sections);
 
   return `<!DOCTYPE html>
@@ -555,6 +586,61 @@ a:hover {
 .page-action.secondary {
   background: var(--surface);
 }
+.notice-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.notice {
+  padding: 12px 14px;
+  border: 1px solid var(--tone-color);
+  border-left-width: 4px;
+  border-radius: var(--component-radius);
+  background: var(--tone-bg);
+  color: var(--text-primary);
+}
+.notice-title { color: var(--tone-color); font-weight: 700; }
+.notice-body { margin-top: 3px; font-size: 13px; }
+.finding-action-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+.finding-action-form {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--component-radius);
+  background: var(--surface-subtle);
+}
+.form-heading { font-weight: 700; }
+.form-field { display: grid; gap: 4px; color: var(--text-secondary); font-size: 12px; }
+.form-field input,
+.form-field textarea {
+  width: 100%;
+  min-height: 40px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  font: inherit;
+}
+.form-field textarea { resize: vertical; }
+.form-submit {
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 1px solid var(--action-primary);
+  border-radius: 4px;
+  background: var(--action-primary);
+  color: var(--text-inverse);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+}
+.form-submit:hover { background: var(--action-primary-hover); }
 .summary-metrics {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -1126,6 +1212,7 @@ footer { text-align: center; color: var(--text-muted); font-size: 12px; padding:
     ${pageActions}
   </header>
   ${metrics}
+  ${notices}
   ${filters}
   ${sections}
 </main>

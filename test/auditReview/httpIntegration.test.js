@@ -24,6 +24,7 @@ import { createReviewNotifier } from '../../src/auditReview/notification.js';
 import { createVisualization } from '../../src/auditReview/visualization.js';
 import { createDashboardAuth } from '../../src/auditReview/dashboardAuth.js';
 import { createAuditReviewScheduler } from '../../src/auditReview/scheduler.js';
+import { createFindingLifecycleService } from '../../src/auditReview/findingLifecycleService.js';
 import { createToolSemanticMapper } from '../../src/auditReview/toolSemanticMapper.js';
 import { createHttpApp } from '../../src/adapters/http/app.js';
 
@@ -116,6 +117,151 @@ test('dashboard routes pass normalized finding filters to visualization', async 
         status: 'open',
       },
     });
+  } finally {
+    await new Promise((resolve) => app.close(resolve));
+  }
+});
+
+test('finding lifecycle HTTP routes expose history, map conflicts, and use dashboard POST + 303', async () => {
+  const calls = [];
+  const finding = { finding_id: 'finding/1', status: 'open', state_version: 3 };
+  const reviewStore = {
+    getFinding(findingId) {
+      return findingId === 'finding/1' ? finding : null;
+    },
+    getRun(reviewId) {
+      return reviewId === 'review-1' ? { review_id: reviewId } : null;
+    },
+    listFindingActions({ findingId, limit, offset }) {
+      assert.equal(findingId, 'finding/1');
+      return [{ action_id: 'act-1', limit, offset }];
+    },
+    listFindingOccurrences({ findingId, limit, offset }) {
+      assert.equal(findingId, 'finding/1');
+      return [{ occurrence_id: 'occ-1', limit, offset }];
+    },
+    listReviewOccurrences({ reviewId, limit, offset }) {
+      assert.equal(reviewId, 'review-1');
+      return [{ occurrence_id: 'occ-review-1', limit, offset }];
+    },
+  };
+  const findingLifecycleService = {
+    performAction(input) {
+      calls.push(input);
+      if (input.action === 'conflict') {
+        const error = new Error('version changed');
+        error.code = 'finding_version_conflict';
+        throw error;
+      }
+      if (input.action === 'invalid') {
+        const error = new Error('invalid action');
+        error.code = 'invalid_finding_action';
+        throw error;
+      }
+      return { finding: { ...finding, status: 'resolved', state_version: 4 }, action: { action_type: input.action } };
+    },
+  };
+  const visualization = {
+    overviewPage() { return { page: { title: '总览' }, sections: [] }; },
+    reviewDetailPage() { return { page: { title: '审查' }, sections: [] }; },
+    findingDetailPage(findingId, options) {
+      return {
+        page: { title: findingId },
+        notices: options?.notice ? [{ tone: options.notice === 'action_success' ? 'success' : 'critical', title: options.notice }] : [],
+        sections: [],
+      };
+    },
+  };
+  const dashboardAuth = createDashboardAuth({
+    config: { auditReview: { http: { allowedOrigins: [] } } },
+    env: { AUDIT_AGENT_DASHBOARD_TOKEN: 'lifecycle-test-token' },
+  });
+  const app = createHttpApp({
+    db: {},
+    config: { limits: { maxQueryLimit: 50 } },
+    scheduler: {},
+    reviewStore,
+    visualization,
+    dashboardAuth,
+    findingLifecycleService,
+  });
+  await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
+  const baseUrl = `http://127.0.0.1:${app.address().port}`;
+  const apiHeaders = { Authorization: 'Bearer lifecycle-test-token' };
+
+  try {
+    for (const [route, expectedId] of [
+      ['/v1/audit-findings/finding%2F1/actions?limit=500&offset=2', 'act-1'],
+      ['/v1/audit-findings/finding%2F1/occurrences?limit=20&offset=3', 'occ-1'],
+      ['/v1/audit-reviews/review-1/occurrences?limit=10&offset=4', 'occ-review-1'],
+    ]) {
+      const response = await fetch(`${baseUrl}${route}`, { headers: apiHeaders });
+      assert.equal(response.status, 200);
+      const body = await response.json();
+      assert.equal(body.count, 1);
+      assert.equal(body.results[0].action_id ?? body.results[0].occurrence_id, expectedId);
+    }
+
+    const success = await fetch(`${baseUrl}/v1/audit-findings/finding%2F1/actions`, {
+      method: 'POST',
+      headers: { ...apiHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        action: 'resolve',
+        actor: 'operator-1',
+        note: '已修复',
+        expected_state_version: 3,
+      }),
+    });
+    assert.equal(success.status, 200);
+    assert.deepEqual(calls.at(-1), {
+      findingId: 'finding/1',
+      action: 'resolve',
+      actor: 'operator-1',
+      note: '已修复',
+      snoozedUntil: undefined,
+      expectedStateVersion: 3,
+    });
+
+    const conflict = await fetch(`${baseUrl}/v1/audit-findings/finding%2F1/actions`, {
+      method: 'POST',
+      headers: { ...apiHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'conflict', actor: 'operator-1', expected_state_version: 3 }),
+    });
+    assert.equal(conflict.status, 409);
+    assert.equal((await conflict.json()).error_code, 'finding_version_conflict');
+
+    const invalid = await fetch(`${baseUrl}/v1/audit-findings/finding%2F1/actions`, {
+      method: 'POST',
+      headers: { ...apiHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'invalid' }),
+    });
+    assert.equal(invalid.status, 400);
+    assert.equal((await invalid.json()).error_code, 'invalid_finding_action');
+
+    const malformed = await fetch(`${baseUrl}/v1/audit-findings/finding%2F1/actions`, {
+      method: 'POST',
+      headers: { ...apiHeaders, 'content-type': 'application/json' },
+      body: '{not-json',
+    });
+    assert.equal(malformed.status, 400);
+    assert.equal((await malformed.json()).error_code, 'invalid_finding_action');
+
+    const dashboardAction = await fetch(`${baseUrl}/dashboard/audit-findings/finding%2F1/actions`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ action: 'resolve', actor: 'operator-2', note: '完成', expected_state_version: '3' }),
+    });
+    assert.equal(dashboardAction.status, 303);
+    assert.equal(
+      dashboardAction.headers.get('location'),
+      '/dashboard/audit-findings/finding%2F1?notice=action_success&action=resolve',
+    );
+    assert.equal(calls.at(-1).expectedStateVersion, 3);
+
+    const noticePage = await fetch(`${baseUrl}${dashboardAction.headers.get('location')}`);
+    assert.equal(noticePage.status, 200);
+    assert.ok((await noticePage.text()).includes('action_success'));
   } finally {
     await new Promise((resolve) => app.close(resolve));
   }
@@ -248,6 +394,7 @@ test('audit review HTTP integration smoke test', async () => {
   };
 
   const reviewStore = createReviewStore(db);
+  const findingLifecycleService = createFindingLifecycleService({ reviewStore });
   const lockStore = createLockStore(db);
   const cursorStore = createIngestCursorStore(db);
   const ingestService = createAuditIngestService({ db, config, cursorStore });
@@ -359,6 +506,7 @@ test('audit review HTTP integration smoke test', async () => {
     reviewStore,
     visualization,
     dashboardAuth,
+    findingLifecycleService,
   });
 
   await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
@@ -673,6 +821,69 @@ test('audit review HTTP integration smoke test', async () => {
       assert.equal(html.includes('Raw log snippet'), false, 'finding detail should not contain English raw evidence label');
       assert.doesNotMatch(html, MOJIBAKE_PATTERN);
       assert.equal(html.includes('置信度'), false, 'finding detail should not contain 置信度');
+    }
+
+    // ------------------------------------------------------------------
+    // Case: real occurrence/action history and lifecycle Dashboard flow
+    // ------------------------------------------------------------------
+    {
+      const findingOccurrences = await fetch(
+        `${baseUrl}/v1/audit-findings/${findingId}/occurrences`,
+        { headers: bearerHeaders },
+      );
+      assert.equal(findingOccurrences.status, 200);
+      const occurrenceBody = await findingOccurrences.json();
+      assert.ok(occurrenceBody.count >= 1, 'finding should retain at least one occurrence snapshot');
+      assert.ok(Array.isArray(occurrenceBody.results[0].evidence));
+
+      const reviewOccurrences = await fetch(
+        `${baseUrl}/v1/audit-reviews/${findingRecord.review_id}/occurrences`,
+        { headers: bearerHeaders },
+      );
+      assert.equal(reviewOccurrences.status, 200);
+      assert.ok((await reviewOccurrences.json()).count >= 1);
+
+      const acknowledge = await fetch(`${baseUrl}/v1/audit-findings/${findingId}/actions`, {
+        method: 'POST',
+        headers: { ...bearerHeaders, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          action: 'acknowledge',
+          actor: 'integration-operator',
+          expected_state_version: findingRecord.state_version,
+        }),
+      });
+      assert.equal(acknowledge.status, 200);
+      const acknowledgeBody = await acknowledge.json();
+      assert.equal(acknowledgeBody.finding.status, 'acknowledged');
+
+      const resolve = await fetch(`${baseUrl}/dashboard/audit-findings/${findingId}/actions`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          action: 'resolve',
+          actor: 'integration-operator',
+          note: '集成测试已验证',
+          expected_state_version: String(acknowledgeBody.finding.state_version),
+        }),
+      });
+      assert.equal(resolve.status, 303);
+      assert.match(resolve.headers.get('location'), /notice=action_success/);
+
+      const resolvedPage = await fetch(`${baseUrl}${resolve.headers.get('location')}`);
+      assert.equal(resolvedPage.status, 200);
+      const resolvedHtml = await resolvedPage.text();
+      assert.ok(resolvedHtml.includes('操作已完成'));
+      assert.ok(resolvedHtml.includes('出现历史'));
+      assert.ok(resolvedHtml.includes('操作历史'));
+      assert.ok(resolvedHtml.includes('历史证据快照'));
+
+      const actionHistory = await fetch(
+        `${baseUrl}/v1/audit-findings/${findingId}/actions`,
+        { headers: bearerHeaders },
+      );
+      assert.equal(actionHistory.status, 200);
+      assert.equal((await actionHistory.json()).count, 2);
     }
 
     // ------------------------------------------------------------------
