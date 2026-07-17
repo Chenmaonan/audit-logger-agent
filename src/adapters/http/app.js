@@ -229,6 +229,9 @@ function validateCreateRunInput(input) {
   if (input.deliveryMode === 'callback' && !isNonEmptyString(input.deliveryTargetUrl)) {
     errors.push({ field: 'delivery.target_url', message: 'delivery.target_url is required when delivery.mode is callback' });
   }
+  if (input.deliveryMode !== 'callback' && input.deliveryTargetUrl != null) {
+    errors.push({ field: 'delivery.target_url', message: 'delivery.target_url is only allowed when delivery.mode is callback' });
+  }
   return errors;
 }
 

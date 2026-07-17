@@ -224,12 +224,12 @@ test('POST /v1/ingest accepts JSON event batches and stores them immediately', a
 test('POST /v1/ingest prunes audit events immediately after accepted batches', async () => {
   await withIngestServer(async ({ baseUrl, db }) => {
     insertAuditEvent(db, makeEvent({
-      ts: '2026-07-06T01:00:00.000Z',
+      ts: '2026-07-05T01:00:00.000Z',
       trace_id: 'prune-oldest',
       span_id: 'span-prune-oldest',
     }));
     insertAuditEvent(db, makeEvent({
-      ts: '2026-07-06T01:01:00.000Z',
+      ts: '2026-07-05T01:01:00.000Z',
       trace_id: 'prune-middle',
       span_id: 'span-prune-middle',
     }));
@@ -238,7 +238,7 @@ test('POST /v1/ingest prunes audit events immediately after accepted batches', a
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(makeEvent({
-        ts: '2026-07-06T01:02:00.000Z',
+        ts: '2026-07-05T01:02:00.000Z',
         trace_id: 'prune-newest',
         span_id: 'span-prune-newest',
       })),

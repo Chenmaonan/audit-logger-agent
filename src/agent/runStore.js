@@ -81,7 +81,9 @@ export function createRunStore(db) {
       const channel = input.sourceType ?? input.channel;
       const conversationId = input.sessionId ?? input.conversationId;
       const userOpenId = input.requesterId ?? input.userOpenId;
-      const callbackUrl = input.deliveryTargetUrl ?? input.callbackUrl;
+      const callbackUrl = input.deliveryMode === 'callback'
+        ? (input.deliveryTargetUrl ?? input.callbackUrl)
+        : null;
 
       // P2-05: idempotency. Prefer an explicit idempotency key, then fall back
       // to (channel, message_id). A duplicate request returns the existing run

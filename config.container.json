@@ -45,9 +45,21 @@
     "lookbackOverlapMinutes": 5,
     "maxEventsPerReview": 500,
     "notification": {
-      "enabled": false,
-      "minSeverity": "medium",
-      "sendEmptyReview": false
+      "enabled": true,
+      "mode": "feishu_bot",
+      "feishuMode": "disabled",
+      "minSeverity": "high",
+      "sendEmptyReview": false,
+      "maxAttempts": 8,
+      "card": {
+        "maxPayloadBytes": 19456,
+        "foldThresholdChars": 800
+      },
+      "dailyReport": {
+        "enabled": true,
+        "hours": [10, 17],
+        "timezoneOffsetMinutes": 480
+      }
     },
     "http": {
       "bindHost": "0.0.0.0",

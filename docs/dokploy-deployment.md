@@ -24,8 +24,14 @@
 | `AUDIT_AGENT_LLM_BASE_URL` | 是 | OpenAI-compatible LLM API 地址，例如 `https://api.openai.com/v1` 或实际模型服务地址 |
 | `AUDIT_AGENT_LLM_TIMEOUT_MS` | 否 | LLM 请求超时毫秒数；未设置时为 `30000` |
 | `AUDIT_AGENT_DASHBOARD_TOKEN` | 否 | `/v1/audit-*` Bearer 鉴权密钥；Dashboard 页面不使用它 |
+| `AUDIT_AGENT_FEISHU_MODE` | 否 | `disabled`、`dry-run` 或 `live`，默认 `disabled` |
+| `AUDIT_AGENT_FEISHU_WEBHOOK_URL` | live 时是 | 飞书自定义机器人 Webhook；只通过 Dokploy Secret 注入 |
+| `AUDIT_AGENT_FEISHU_WEBHOOK_FILE` | 否 | Webhook secret 文件路径；配置后优先于 URL 环境变量 |
+| `AUDIT_AGENT_FEISHU_LIVE_CONFIRM` | live 时是 | 必须为 `CONFIRM_FEISHU_LIVE`，用于防止误开启真实发送 |
 
 如需调用 `/v1/audit-*` API，`AUDIT_AGENT_DASHBOARD_TOKEN` 应是独立的高强度随机值。未配置时 Dashboard 仍可访问，但审查 API 的 Bearer 鉴权不会放行请求。
+
+飞书通知默认关闭。建议先使用 `dry-run` 验证卡片构建，再切换 `live`。Webhook 不应写入配置文件、Git、日志或命令历史；生产启用前应在飞书侧配置 IP 白名单或关键词安全策略。当前发送器未生成飞书签名字段，如需启用签名校验，应先扩展并验证签名支持。日报固定按 `Asia/Shanghai` 每天 10:00、17:00 运行。
 
 ## 3. 持久化与健康检查
 
@@ -62,11 +68,13 @@ https://<域名>/dashboard
 
 Dashboard 页面不要求登录，能访问该域名和路径的用户可以直接查看审计数据。生产环境应在 Dokploy Proxy、上游网关、VPN 或 IP allowlist 中限制访问范围。审查 API `/v1/audit-*` 不接受 Dashboard 页面访问权限，只接受 `AUDIT_AGENT_DASHBOARD_TOKEN` 对应的 Bearer 请求。
 
-## 6. 通知与外部回调
+## 6. 飞书通知
 
-容器配置中 `auditReview.notification.enabled` 默认是 `false`，因此新部署不会主动发送回调。
+容器配置使用 `auditReview.notification.enabled=true` 和 `mode=feishu_bot`，但 `AUDIT_AGENT_FEISHU_MODE` 默认是 `disabled`，因此新部署不会真实发送。不要通过 `callbackUrl` 配置飞书 Webhook；发送器只在进程内从 Secret 环境变量或 secret 文件读取它，避免写入 outbox 数据库。
 
-如需通知，在 `config.container.json` 的派生部署配置中显式启用 `auditReview.notification.enabled`，并设置 `auditReview.notification.callbackUrl` 为真实、可从该服务器访问的公开 HTTPS URL；不要使用本机回环地址、容器名或示例地址。可按需设置 `auditReview.notification.mode`、`minSeverity` 和 `maxAttempts`。
+上线顺序应为 `disabled -> dry-run -> live`。进入 `live` 前必须配置 Webhook 和 `AUDIT_AGENT_FEISHU_LIVE_CONFIRM=CONFIRM_FEISHU_LIVE`。即时消息只发送 high/critical，并按 `agent_id + trace_id` 隔离；日报按北京时间 10:00、17:00 发送。发送器将持续速率限制在低于 100 次/分钟，同时满足 5 次/秒限制。
+
+从 `live` 切换到 `dry-run` 或 `disabled` 时，已有 pending 飞书消息会保留原状态，不发送、不增加尝试次数；恢复 `live` 后继续投递。
 
 外部通知中的 Dashboard 链接由 `auditReview.visualization.baseUrl` 与 `auditReview.visualization.dashboardPath` 生成。将 `auditReview.visualization.baseUrl` 设置为实际的 `https://<域名>`，否则回调会包含错误的容器内或本地地址。
 

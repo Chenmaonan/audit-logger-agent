@@ -15,7 +15,19 @@ function computeBackoff(attempts) {
 }
 
 export function createOutboxStore(db, { maxAttempts = DEFAULT_MAX_ATTEMPTS } = {}) {
-  const insertStmt = db.prepare(`
+  const supportsDedupeKey = db.prepare('PRAGMA table_info(agent_outbox_events)').all()
+    .some((column) => column.name === 'dedupe_key');
+  const insertStmt = db.prepare(supportsDedupeKey ? `
+    INSERT INTO agent_outbox_events (
+      event_id, run_id, type, payload_json, delivery_mode,
+      delivery_status, delivery_attempts, max_attempts, next_attempt_at,
+      callback_url, dedupe_key, last_error, created_at, delivered_at
+    ) VALUES (
+      @event_id, @run_id, @type, @payload_json, @delivery_mode,
+      @delivery_status, @delivery_attempts, @max_attempts, @next_attempt_at,
+      @callback_url, @dedupe_key, @last_error, @created_at, @delivered_at
+    )
+  ` : `
     INSERT INTO agent_outbox_events (
       event_id, run_id, type, payload_json, delivery_mode,
       delivery_status, delivery_attempts, max_attempts, next_attempt_at,
@@ -57,8 +69,22 @@ export function createOutboxStore(db, { maxAttempts = DEFAULT_MAX_ATTEMPTS } = {
 
   return {
     enqueue(event) {
-      insertStmt.run({
-        event_id: `evt_${crypto.randomUUID()}`,
+      const dedupeKey = event.dedupeKey ?? event.dedupe_key ?? null;
+      if (dedupeKey != null && typeof dedupeKey !== 'string') {
+        throw new Error('outbox dedupeKey must be a string');
+      }
+      if (dedupeKey != null && dedupeKey.length === 0) {
+        throw new Error('outbox dedupeKey must not be empty');
+      }
+
+      if (supportsDedupeKey && dedupeKey != null) {
+        const existing = db.prepare('SELECT event_id FROM agent_outbox_events WHERE dedupe_key = ?').get(dedupeKey);
+        if (existing) return { eventId: existing.event_id, enqueued: false };
+      }
+
+      const eventId = `evt_${crypto.randomUUID()}`;
+      const params = {
+        event_id: eventId,
         run_id: event.runId,
         type: event.type,
         payload_json: JSON.stringify(event.payload),
@@ -68,10 +94,22 @@ export function createOutboxStore(db, { maxAttempts = DEFAULT_MAX_ATTEMPTS } = {
         max_attempts: event.maxAttempts ?? maxAttempts,
         next_attempt_at: null,
         callback_url: event.callbackUrl,
+        ...(supportsDedupeKey ? { dedupe_key: dedupeKey } : {}),
         last_error: null,
         created_at: nowIso(),
         delivered_at: null,
-      });
+      };
+
+      try {
+        insertStmt.run(params);
+        return { eventId, enqueued: true };
+      } catch (error) {
+        if (supportsDedupeKey && dedupeKey != null && error?.code?.startsWith('SQLITE_CONSTRAINT')) {
+          const existing = db.prepare('SELECT event_id FROM agent_outbox_events WHERE dedupe_key = ?').get(dedupeKey);
+          if (existing) return { eventId: existing.event_id, enqueued: false };
+        }
+        throw error;
+      }
     },
 
     listPending(limit = 20, now = nowIso()) {

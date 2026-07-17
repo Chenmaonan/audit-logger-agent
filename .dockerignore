@@ -23,7 +23,9 @@ config.json
 # Local agent/editor artifacts and test/documentation sources are not needed
 # by the explicit COPY instructions in Dockerfile.
 .agents/
+.aionrs/
 .claude/
+.codex/
 .superpowers/
 test/
 docs/

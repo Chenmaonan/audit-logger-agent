@@ -11,6 +11,7 @@
 - 生成日报、错误报表和工具使用统计。
 - 周期审查异常、慢调用、高风险工具和不完整链路，生成 Finding。
 - 通过 Dashboard 查看审查批次、Finding 与关联证据。
+- 将 high/critical 风险按 Agent 与 Trace 隔离聚合为飞书卡片，并在北京时间 10:00、17:00 生成累计日报。
 
 ## 本地启动
 
@@ -68,6 +69,7 @@ http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me
 ## 文档
 
 - [Dokploy 部署说明](docs/dokploy-deployment.md)：生产部署、变量、域名、网络边界、Dashboard 和备份恢复。
+- [飞书 Bot 审计通知方案](docs/feishu-bot-notification-design.md)：分组、卡片折叠、发送安全门、日报调度与验证流程。
 - [其他 Agent 接入日志审计服务指南](docs/agent-audit-log-integration-guide.md)：可直接交给编码 Agent 执行，覆盖仓库审计、日志字段契约、自动改造流程、真实发送和 Dashboard 验收。
 - [功能优化路线图与 P0 实施规格](docs/functionality-optimization-plan.md)：先完成 Finding 数据一致性、证据快照和处置闭环，再按真实规模进入审查队列、分页、评测和运营阶段。
 

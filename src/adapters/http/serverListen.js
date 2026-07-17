@@ -63,6 +63,7 @@ function waitForShutdownStep(action, { name, timeoutMs, setTimeoutFn, clearTimeo
 export function createGracefulShutdown({
   scheduler,
   retentionScheduler,
+  notificationDigestScheduler,
   flushInterval,
   clearIntervalFn = clearInterval,
   setTimeoutFn = setTimeout,
@@ -98,6 +99,7 @@ export function createGracefulShutdown({
     shutdownPromise = (async () => {
       await attempt('scheduler stop', () => scheduler?.stop?.());
       await attempt('retention scheduler stop', () => retentionScheduler?.stop?.());
+      await attempt('notification digest scheduler stop', () => notificationDigestScheduler?.stop?.());
       await attempt('flush interval clear', () => clearIntervalFn(flushInterval));
       await attempt('event publisher flush', () => waitForShutdownStep(
         () => eventPublisher?.flushPending?.(20),

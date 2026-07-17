@@ -289,7 +289,7 @@ function makeFakeRealEvidenceAlteredFieldsLlmClient() {
 // Inline real outbox store to keep tests self-contained.
 import { createOutboxStore } from '../../src/agent/outboxStore.js';
 
-function buildRealDeps(db, { llmClient, configOverrides } = {}) {
+function buildRealDeps(db, { llmClient, configOverrides, feishuMode = 'disabled' } = {}) {
   const config = makeConfig(configOverrides);
   const reviewStore = createReviewStore(db);
   const lockStore = createLockStore(db);
@@ -305,10 +305,10 @@ function buildRealDeps(db, { llmClient, configOverrides } = {}) {
     llmClient: llmClient ?? makeFakeLlmClient(),
     model: 'test-model',
   });
-  const notifier = createReviewNotifier({ outboxStore, config });
+  const notifier = createReviewNotifier({ outboxStore, config, feishuMode });
   const visualization = createVisualization({ reviewStore, config });
   const auditLogger = createRuntimeAuditLogger(db, { agentId: 'audit-logger-agent' });
-  return { config, reviewStore, lockStore, cursorStore, ingestService, detector, llmReviewer, notifier, visualization, auditLogger };
+  return { config, reviewStore, lockStore, cursorStore, outboxStore, ingestService, detector, llmReviewer, notifier, visualization, auditLogger };
 }
 
 // ===================== Tests =====================
@@ -363,6 +363,90 @@ test('scheduler.runOnce happy path: creates completed run, persists findings, re
   assert.ok(events.includes('review.start'), 'should log review.start');
   assert.ok(events.includes('review.completed'), 'should log review.completed');
   assert.ok(events.includes('review.ingest.completed'), 'should log review.ingest.completed');
+
+  db.close();
+});
+
+test('scheduler sends every high-risk finding from a batch larger than 1000 without query truncation', async () => {
+  const db = makeDb();
+  const findingTotal = 1001;
+  db.transaction(() => {
+    for (let index = 0; index < findingTotal; index += 1) {
+      insertEvent(db, index + 1, {
+        ts: `2026-07-03T10:${String(Math.floor(index / 60) % 30).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}.000Z`,
+        tool_name: `tool-${index}`,
+        trace_id: 'trace-large-batch',
+        status: 'INTERNAL',
+      });
+    }
+  })();
+
+  const llmClient = {
+    async createStructuredResponse({ input }) {
+      const { candidates } = JSON.parse(input.find((message) => message.role === 'user').content);
+      const findings = candidates.slice(0, findingTotal).map((candidate, index) => ({
+        category: 'failed_call',
+        severity: 'high',
+        agent_id: 'mt-agent',
+        tool_name: candidate.tool_name,
+        trace_id: 'trace-large-batch',
+        entity: { type: 'test_finding', id: String(index) },
+        title: `批次风险-${index}`,
+        summary: `第 ${index} 条高风险摘要`,
+        recommendation: '检查失败原因',
+        evidence_event_ids: [candidate.event_id],
+        requires_action: true,
+      }));
+      return {
+        type: 'audit_review',
+        review_id: 'fake-large',
+        window: { from: '2026-07-03T10:00:00.000Z', to: '2026-07-03T10:30:00.000Z' },
+        summary: {
+          title: '大批次高风险审查',
+          overview: `发现 ${findings.length} 条高风险。`,
+          severity_counts: { critical: 0, high: findings.length, medium: 0, low: 0 },
+        },
+        findings,
+      };
+    },
+  };
+  const deps = buildRealDeps(db, {
+    llmClient,
+    feishuMode: 'live',
+    configOverrides: {
+      maxEventsPerReview: 1100,
+      notification: {
+        enabled: true,
+        mode: 'feishu_bot',
+        minSeverity: 'high',
+        maxAttempts: 8,
+        card: { maxPayloadBytes: 19 * 1024, foldThresholdChars: 1 },
+      },
+    },
+  });
+  const scheduler = createAuditReviewScheduler({
+    db,
+    ...deps,
+    now: () => new Date('2026-07-03T10:30:00.000Z'),
+  });
+
+  const result = await scheduler.runOnce({ triggerType: 'scheduled' });
+
+  const llmAudit = db.prepare(`
+    SELECT result_summary FROM audit_events
+    WHERE agent_id = 'audit-logger-agent' AND event = 'review.llm.completed'
+    ORDER BY id DESC LIMIT 1
+  `).get();
+  assert.equal(result.status, 'completed', llmAudit?.result_summary);
+  const payloads = deps.outboxStore.listAll(5000)
+    .filter((event) => event.type === 'audit_review_high_risk_group')
+    .map((event) => event.payload_json);
+  assert.ok(payloads.length > 1, 'large same-group batch should be split into multiple cards');
+  const serialized = JSON.stringify(payloads);
+  for (let index = 0; index < findingTotal; index += 1) {
+    assert.match(serialized, new RegExp(`批次风险-${index}(?!\\d)`));
+    assert.match(serialized, new RegExp(`第 ${index} 条高风险摘要(?!\\d)`));
+  }
 
   db.close();
 });

@@ -4,6 +4,9 @@
 // delivery payloads: they are platform-agnostic and rely on the outbox flush
 // mechanism to deliver them to whatever callback receiver is configured.
 
+import crypto from 'crypto';
+import { buildHighRiskAlertPayloads, groupHighRiskFindings } from './feishuCards.js';
+
 const SEVERITY_ORDER = ['low', 'medium', 'high', 'critical'];
 
 function severityRank(severity) {
@@ -90,7 +93,12 @@ export function buildFindingPayload({ finding, reviewId, run, dashboardUrl }) {
   };
 }
 
-export function createReviewNotifier({ outboxStore, config }) {
+function dedupeIdentity(prefix, values) {
+  const digest = crypto.createHash('sha256').update(JSON.stringify(values)).digest('hex').slice(0, 24);
+  return `${prefix}:${digest}`;
+}
+
+export function createReviewNotifier({ outboxStore, config, feishuMode = 'disabled' }) {
   const notifyConfig = defaultNotificationConfig(config);
   const notificationsEnabled = notifyConfig.enabled !== false;
   const minSeverity = notifyConfig.minSeverity ?? 'medium';
@@ -98,6 +106,7 @@ export function createReviewNotifier({ outboxStore, config }) {
   const callbackUrl = notifyConfig.callbackUrl;
   const deliveryMode = notifyConfig.mode ?? 'callback';
   const maxAttempts = notifyConfig.maxAttempts;
+  const cardConfig = notifyConfig.card ?? {};
 
   function enqueue({ reviewId, run, review, dashboardUrl }) {
     if (!notificationsEnabled) {
@@ -106,6 +115,9 @@ export function createReviewNotifier({ outboxStore, config }) {
     const findings = review?.findings ?? [];
     if (findings.length === 0 && !sendEmptyReview) {
       return { enqueued: false, reason: 'empty' };
+    }
+    if (deliveryMode === 'feishu_bot') {
+      return { enqueued: false, reason: 'feishu_high_risk_group_only' };
     }
 
     const payload = buildSummaryPayload({ reviewId, run, review, dashboardUrl });
@@ -128,6 +140,9 @@ export function createReviewNotifier({ outboxStore, config }) {
     if (!meetsMinSeverity(sev, 'high')) {
       return { enqueued: false, reason: 'below_high' };
     }
+    if (deliveryMode === 'feishu_bot') {
+      return enqueueHighRiskGroups({ findings: [finding], reviewId, run, dashboardUrl });
+    }
     const payload = buildFindingPayload({ finding, reviewId, run, dashboardUrl });
     outboxStore.enqueue({
       runId: reviewId,
@@ -140,9 +155,70 @@ export function createReviewNotifier({ outboxStore, config }) {
     return { enqueued: true, payload };
   }
 
+  function enqueueHighRiskGroups({ findings, reviewId, run, dashboardUrl }) {
+    if (!notificationsEnabled) {
+      return { enqueued: false, reason: 'disabled', groups: [] };
+    }
+    const groups = groupHighRiskFindings(findings);
+    if (groups.length === 0) {
+      return { enqueued: false, reason: 'below_high', groups: [] };
+    }
+    if (deliveryMode !== 'feishu_bot') {
+      const results = groups.flatMap((group) => group.findings.map((finding) =>
+        enqueueFinding({ finding, reviewId, run, dashboardUrl })));
+      return {
+        enqueued: results.some((result) => result.enqueued),
+        groups,
+        results,
+      };
+    }
+    if (feishuMode === 'disabled') {
+      return { enqueued: false, reason: 'disabled', groups: [] };
+    }
+
+    const rendered = groups.map((group) => ({
+      ...group,
+      payloads: buildHighRiskAlertPayloads({
+        reviewId,
+        window: { from: run?.window_from, to: run?.window_to },
+        agentId: group.agentId,
+        traceId: group.traceId,
+        findings: group.findings,
+        dashboardUrl,
+        maxPayloadBytes: cardConfig.maxPayloadBytes,
+        foldThresholdChars: cardConfig.foldThresholdChars,
+      }),
+    }));
+    if (feishuMode === 'dry-run') {
+      return { enqueued: false, reason: 'dry_run', groups: rendered };
+    }
+
+    let enqueuedCount = 0;
+    for (const group of rendered) {
+      group.payloads.forEach((payload, index) => {
+        const result = outboxStore.enqueue({
+          runId: reviewId,
+          type: 'audit_review_high_risk_group',
+          payload,
+          deliveryMode: 'feishu_bot',
+          callbackUrl: null,
+          maxAttempts,
+          dedupeKey: dedupeIdentity('feishu_alert', [reviewId, group.agentId, group.traceId, index]),
+        });
+        if (result?.enqueued !== false) enqueuedCount += 1;
+      });
+    }
+    return {
+      enqueued: enqueuedCount > 0,
+      enqueuedCount,
+      groups: rendered,
+    };
+  }
+
   return {
     enqueue,
     enqueueFinding,
+    enqueueHighRiskGroups,
     buildSummaryPayload,
     buildFindingPayload,
     meetsMinSeverity,

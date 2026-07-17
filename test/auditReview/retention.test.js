@@ -617,6 +617,33 @@ test('retention keeps only the latest 200 audit events for each agent', () => {
   fs.rmSync(rootDir, { recursive: true, force: true });
 });
 
+test('retention preserves all events from the current Beijing report day before the 10:00/17:00 digests', () => {
+  const rootDir = tmpDir();
+  const db = makeDb();
+  const service = createRetentionService({
+    db,
+    config: makeConfig(rootDir, { report: { timezoneOffsetMinutes: 480 } }),
+    cursorStore: createIngestCursorStore(db),
+    now: () => new Date('2026-07-06T08:00:00.000Z'),
+  });
+
+  const currentDayStart = Date.parse('2026-07-05T16:00:00.000Z');
+  for (let i = 1; i <= 205; i++) {
+    insertEvent(db, i, new Date(currentDayStart + i * 60 * 1000).toISOString(), 'agent-current');
+  }
+
+  const result = service.run({ batchSize: 10 });
+
+  assert.equal(result.deleted.auditEvents, 0);
+  assert.equal(
+    db.prepare(`SELECT COUNT(*) AS count FROM audit_events WHERE agent_id = 'agent-current'`).get().count,
+    205,
+  );
+
+  db.close();
+  fs.rmSync(rootDir, { recursive: true, force: true });
+});
+
 test('retention removes safe expired spool files and orphan cursors', () => {
   const rootDir = tmpDir();
   const spoolAgentDir = path.join(rootDir, 'data', 'spool', 'incoming', 'agent-a');

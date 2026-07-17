@@ -64,6 +64,17 @@ function safePositiveInteger(value, fallback) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function reportDayStartIso(nowDate, timezoneOffsetMinutes = 480) {
+  const parsed = Number(timezoneOffsetMinutes);
+  const offset = Number.isFinite(parsed) && parsed >= -1440 && parsed <= 1440 ? Math.trunc(parsed) : 480;
+  const shifted = new Date(nowDate.getTime() + offset * 60 * 1000);
+  return new Date(Date.UTC(
+    shifted.getUTCFullYear(),
+    shifted.getUTCMonth(),
+    shifted.getUTCDate(),
+  ) - offset * 60 * 1000).toISOString();
+}
+
 function countRows(db, sql, params) {
   return db.prepare(sql).get(params).count;
 }
@@ -316,6 +327,7 @@ export function createRetentionService({ db, config, cursorStore = null, now = (
       ?? (cfg.eventsDays ? cfg.eventsDays * 24 : DEFAULT_AUDIT_EVENT_MAX_AGE_HOURS);
     return {
       cutoff: cutoffIsoHours(nowDate, safePositiveNumber(eventMaxAgeHours, DEFAULT_AUDIT_EVENT_MAX_AGE_HOURS)),
+      preserveFrom: reportDayStartIso(nowDate, config?.report?.timezoneOffsetMinutes),
       maxPerAgent: safePositiveInteger(
         cfg.maxEventsPerAgent ?? cfg.auditEventsMaxPerAgent,
         DEFAULT_AUDIT_EVENT_MAX_PER_AGENT,
@@ -340,7 +352,7 @@ export function createRetentionService({ db, config, cursorStore = null, now = (
                    ORDER BY ts DESC, rowid DESC
                  ) AS retained_rank
                FROM audit_events
-               WHERE ts >= @cutoff
+               WHERE ts >= @cutoff AND ts < @preserveFrom
              )
              WHERE retained_rank > @maxPerAgent
            )
@@ -361,7 +373,7 @@ export function createRetentionService({ db, config, cursorStore = null, now = (
                      ORDER BY ts DESC, rowid DESC
                    ) AS retained_rank
                  FROM audit_events
-                 WHERE ts >= @cutoff
+                 WHERE ts >= @cutoff AND ts < @preserveFrom
                )
                WHERE retained_rank > @maxPerAgent
              )
@@ -371,6 +383,7 @@ export function createRetentionService({ db, config, cursorStore = null, now = (
       `,
       params: {
         cutoff: params.cutoff,
+        preserveFrom: params.preserveFrom,
         maxPerAgent: params.maxPerAgent,
       },
       batchSize,

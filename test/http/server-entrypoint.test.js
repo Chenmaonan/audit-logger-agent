@@ -61,6 +61,7 @@ test('graceful shutdown releases resources once and exits despite cleanup errors
   const shutdown = serverEntrypoint.createGracefulShutdown({
     scheduler: { stop: () => calls.push('scheduler.stop') },
     retentionScheduler: { stop: () => { calls.push('retention.stop'); throw new Error('retention failed'); } },
+    notificationDigestScheduler: { stop: () => calls.push('notification.stop') },
     flushInterval: 'timer',
     clearIntervalFn: (timer) => calls.push(`clear:${timer}`),
     eventPublisher: { flushPending: async (limit) => calls.push(`flush:${limit}`) },
@@ -75,6 +76,7 @@ test('graceful shutdown releases resources once and exits despite cleanup errors
   assert.deepEqual(calls, [
     'scheduler.stop',
     'retention.stop',
+    'notification.stop',
     'clear:timer',
     'flush:20',
     'server.close',

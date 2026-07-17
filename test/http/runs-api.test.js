@@ -117,3 +117,56 @@ test('POST /v1/runs returns 413 when JSON body exceeds maxBodyBytes', async () =
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('non-callback delivery rejects target_url and the store never persists it', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-http-delivery-secret-'));
+  const db = openDb(path.join(tmpDir, 'runtime.db'));
+  ensureRuntimeSchema(db);
+  const runStore = createRunStore(db);
+  const server = createHttpApp({
+    db,
+    config: { dbPath: path.join(tmpDir, 'runtime.db'), agents: {} },
+    runStore,
+    runtime: {
+      async startRun(input) { return runStore.createRun(input); },
+      async getRun(runId) { return runStore.getRun(runId); },
+    },
+  });
+
+  try {
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+    const response = await fetch(`http://127.0.0.1:${port}/v1/runs`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        source: { type: 'manual', session_id: 'session_secret', requester_id: 'user_secret' },
+        request: { text: '安全边界测试' },
+        delivery: { mode: 'feishu_bot', target_url: 'https://secret.invalid/webhook' },
+      }),
+    });
+
+    assert.equal(response.status, 400);
+    const body = await response.json();
+    assert.ok(body.details.some((detail) => detail.field === 'delivery.target_url'));
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM agent_runs').get().count, 0);
+
+    const direct = runStore.createRun({
+      sourceType: 'manual',
+      sessionId: 'direct_session',
+      requesterId: 'direct_user',
+      requestText: '存储层防御测试',
+      deliveryMode: 'feishu_bot',
+      deliveryTargetUrl: 'https://secret.invalid/webhook',
+    });
+    assert.equal(direct.delivery_callback_url, null);
+    assert.equal(
+      db.prepare('SELECT delivery_callback_url FROM agent_runs WHERE run_id = ?').get(direct.run_id).delivery_callback_url,
+      null,
+    );
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

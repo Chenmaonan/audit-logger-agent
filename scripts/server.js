@@ -14,6 +14,7 @@ import { createToolRegistry } from '../src/tools/registry.js';
 import { buildAuditQueryTool } from '../src/tools/auditQueryTool.js';
 import { buildReportTool } from '../src/tools/reportTool.js';
 import { createCallbackClient } from '../src/adapters/delivery/callbackClient.js';
+import { createFeishuBotClient } from '../src/adapters/delivery/feishuBotClient.js';
 import { createEventPublisher } from '../src/agent/eventPublisher.js';
 import { createRuntimeAuditLogger } from '../src/observability/runtimeAudit.js';
 import { createHttpApp } from '../src/adapters/http/app.js';
@@ -34,6 +35,8 @@ import { createReviewNotifier } from '../src/auditReview/notification.js';
 import { createVisualization } from '../src/auditReview/visualization.js';
 import { createDashboardAuth } from '../src/auditReview/dashboardAuth.js';
 import { createAuditReviewScheduler } from '../src/auditReview/scheduler.js';
+import { loadFeishuRuntimeConfig } from '../src/auditReview/feishuConfig.js';
+import { createNotificationDigestScheduler } from '../src/auditReview/notificationDigestScheduler.js';
 import { createRetentionScheduler, createRetentionService } from '../src/auditReview/retention.js';
 import { createFindingLifecycleService } from '../src/auditReview/findingLifecycleService.js';
 import { createGracefulShutdown, listenHttpServer, resolveServerBindHost } from '../src/adapters/http/serverListen.js';
@@ -140,10 +143,13 @@ const planner = createPlanner({
 
 const auditLogger = createRuntimeAuditLogger(db);
 const reviewAuditLogger = createRuntimeAuditLogger(db, { agentId: 'audit-logger-agent' });
+const feishuRuntimeConfig = loadFeishuRuntimeConfig({ env: process.env, appConfig: runtimeConfig });
+const feishuBotClient = createFeishuBotClient(feishuRuntimeConfig);
 
 const eventPublisher = createEventPublisher({
   outboxStore,
   callbackClient: createCallbackClient({ fetchImpl: fetch }),
+  feishuBotClient,
 });
 
 const runtime = createRuntime({
@@ -186,7 +192,11 @@ const llmReviewer = createLlmReviewer({
   promptVersion: runtimeConfig.auditReview?.llmReview?.promptVersion,
   reviewerVersion: runtimeConfig.auditReview?.llmReview?.reviewerVersion,
 });
-const reviewNotifier = createReviewNotifier({ outboxStore, config: runtimeConfig });
+const reviewNotifier = createReviewNotifier({
+  outboxStore,
+  config: runtimeConfig,
+  feishuMode: feishuRuntimeConfig.mode,
+});
 const reviewVisualization = createVisualization({ reviewStore, config: runtimeConfig, llmClient, model: openAIConfig.model });
 const findingLifecycleService = createFindingLifecycleService({ reviewStore, now: () => new Date() });
 const dashboardAuth = createDashboardAuth({ config: runtimeConfig, env: process.env });
@@ -217,6 +227,13 @@ const retentionScheduler = createRetentionScheduler({
     console.error(`Retention cleanup failed: ${error.message}`);
   },
 });
+const notificationDigestScheduler = createNotificationDigestScheduler({
+  db,
+  outboxStore,
+  config: runtimeConfig,
+  feishuMode: feishuRuntimeConfig.mode,
+  now: () => new Date(),
+});
 
 // v1.4: validate dashboard auth boot config (throws if non-loopback without token).
 const bindHost = resolveServerBindHost(runtimeConfig);
@@ -238,6 +255,11 @@ if (runtimeConfig.auditReview?.enabled !== false) {
 if (runtimeConfig.retention?.enabled !== false) {
   retentionScheduler.start();
   console.log(`Retention scheduler started for hour ${runtimeConfig.retention?.runAtHour ?? 4}.`);
+}
+
+notificationDigestScheduler.start();
+if (feishuRuntimeConfig.mode !== 'disabled' && runtimeConfig.auditReview?.notification?.mode === 'feishu_bot') {
+  console.log(`Feishu notification digest scheduler started in ${feishuRuntimeConfig.mode} mode.`);
 }
 
 const app = createHttpApp({
@@ -276,6 +298,7 @@ const server = listenHttpServer(app, {
 const shutdown = createGracefulShutdown({
   scheduler,
   retentionScheduler,
+  notificationDigestScheduler,
   flushInterval,
   eventPublisher,
   server,

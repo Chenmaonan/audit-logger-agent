@@ -44,6 +44,7 @@ docs/
 docs/*
 !docs/agent-audit-log-integration-guide.md
 !docs/dokploy-deployment.md
+!docs/feishu-bot-notification-design.md
 v1.5/
 
 # OS/editor noise
