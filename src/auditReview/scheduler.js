@@ -736,6 +736,7 @@ export function createAuditReviewScheduler({
               summary: occurrence.summary,
               recommendation: occurrence.recommendation,
               evidence: occurrence.evidence,
+              observed_at: occurrence.observed_at,
             };
           })
           .filter((finding) => finding?.severity === 'high' || finding?.severity === 'critical');

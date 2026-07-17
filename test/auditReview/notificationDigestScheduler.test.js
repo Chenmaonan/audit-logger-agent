@@ -44,17 +44,30 @@ function insertSamples(db) {
   insertEvent.run({ id: 3, ts: '2026-07-17T01:20:00.000Z', agent_id: 'a1', trace_id: 't2', tool_name: 'read', status: 'OK' });
   insertEvent.run({ id: 4, ts: '2026-07-17T01:30:00.000Z', agent_id: 'a2', trace_id: 't1', tool_name: 'deploy', status: 'OK' });
   db.prepare('INSERT INTO audit_review_findings (finding_id, agent_id, trace_id) VALUES (?, ?, ?)').run('f1', 'a1', 't1');
+  db.prepare('INSERT INTO audit_review_findings (finding_id, agent_id, trace_id) VALUES (?, ?, ?)').run('f2', 'a2', 't1');
   db.prepare(`
     INSERT INTO audit_review_finding_occurrences
       (occurrence_id, finding_id, severity, title, summary, observed_at)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run('o1', 'f1', 'high', '高风险写入', '写入摘要', '2026-07-17T01:15:00.000Z');
+  db.prepare(`
+    INSERT INTO audit_review_finding_occurrences
+      (occurrence_id, finding_id, severity, title, summary, observed_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run('o2', 'f2', 'critical', '严重部署风险', '部署风险摘要', '2026-07-17T01:25:00.000Z');
 }
 
 function config() {
   return {
+    agents: {
+      a1: { displayName: '审计 Agent A1' },
+    },
     report: { timezoneOffsetMinutes: 480 },
     auditReview: {
+      visualization: {
+        baseUrl: 'https://audit.example.com',
+        dashboardPath: '/dashboard',
+      },
       notification: {
         enabled: true,
         mode: 'feishu_bot',
@@ -98,6 +111,27 @@ test('dry-run renders one isolated daily card group per agent_id and trace_id wi
   assert.equal(calls.length, 0);
   const identities = result.groups.map(({ group }) => `${group.agent_id}/${group.trace_id}`).sort();
   assert.deepEqual(identities, ['a1/t1', 'a1/t2', 'a2/t1']);
+  const primary = result.groups.find(({ group }) => group.agent_id === 'a1' && group.trace_id === 't1').group;
+  assert.equal(primary.agent_name, '审计 Agent A1');
+  assert.equal(primary.high_risk_count, 1);
+  assert.equal(primary.critical_count, 0);
+  assert.equal(primary.highest_severity, 'high');
+  assert.deepEqual(primary.tools.map((tool) => tool.tool_name), ['write', 'read']);
+  const noRisk = result.groups.find(({ group }) => group.agent_id === 'a1' && group.trace_id === 't2').group;
+  assert.equal(noRisk.high_risk_count, 0);
+  assert.equal(noRisk.highest_severity, 'none');
+  assert.equal(noRisk.agent_name, '审计 Agent A1');
+  const critical = result.groups.find(({ group }) => group.agent_id === 'a2' && group.trace_id === 't1').group;
+  assert.equal(critical.high_risk_count, 1);
+  assert.equal(critical.critical_count, 1);
+  assert.equal(critical.highest_severity, 'critical');
+  const primaryPayload = JSON.stringify(
+    result.groups.find(({ group }) => group.agent_id === 'a1' && group.trace_id === 't1').payloads,
+  );
+  assert.match(primaryPayload, /审计 Agent A1/);
+  assert.match(primaryPayload, /统计范围/);
+  assert.match(primaryPayload, /北京时间/);
+  assert.match(primaryPayload, /audit\.example\.com\/dashboard/);
   for (const item of result.groups) {
     const serialized = JSON.stringify(item.payloads);
     assert.match(serialized, new RegExp(item.group.agent_id));
@@ -129,6 +163,23 @@ test('live daily run enqueues feishu_bot payloads with no callback URL and stabl
   assert.ok(calls.every((call) => call.deliveryMode === 'feishu_bot'));
   assert.ok(calls.every((call) => call.callbackUrl === null));
   assert.equal(new Set(calls.map((call) => call.dedupeKey)).size, 3);
+  const firstKeys = calls.map((call) => call.dedupeKey);
+
+  const renamedCalls = [];
+  const renamedConfig = config();
+  renamedConfig.agents.a1.displayName = '重命名后的 Agent A1';
+  createNotificationDigestScheduler({
+    db,
+    outboxStore: {
+      enqueue(event) {
+        renamedCalls.push(event);
+        return { enqueued: true };
+      },
+    },
+    config: renamedConfig,
+    feishuMode: 'live',
+  }).runNow({ scheduledFor: new Date('2026-07-17T09:00:00.000Z') });
+  assert.deepEqual(renamedCalls.map((call) => call.dedupeKey), firstKeys);
   db.close();
 });
 

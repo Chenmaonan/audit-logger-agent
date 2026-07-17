@@ -6,6 +6,7 @@
 
 import crypto from 'crypto';
 import { buildHighRiskAlertPayloads, groupHighRiskFindings } from './feishuCards.js';
+import { agentDisplayName } from './evidence.js';
 
 const SEVERITY_ORDER = ['low', 'medium', 'high', 'critical'];
 
@@ -107,6 +108,9 @@ export function createReviewNotifier({ outboxStore, config, feishuMode = 'disabl
   const deliveryMode = notifyConfig.mode ?? 'callback';
   const maxAttempts = notifyConfig.maxAttempts;
   const cardConfig = notifyConfig.card ?? {};
+  const agentsConfig = config?.agents
+    ? config
+    : (config?.auditReview?.agents ? { agents: config.auditReview.agents } : config);
 
   function enqueue({ reviewId, run, review, dashboardUrl }) {
     if (!notificationsEnabled) {
@@ -176,19 +180,24 @@ export function createReviewNotifier({ outboxStore, config, feishuMode = 'disabl
       return { enqueued: false, reason: 'disabled', groups: [] };
     }
 
-    const rendered = groups.map((group) => ({
-      ...group,
-      payloads: buildHighRiskAlertPayloads({
-        reviewId,
-        window: { from: run?.window_from, to: run?.window_to },
-        agentId: group.agentId,
-        traceId: group.traceId,
-        findings: group.findings,
-        dashboardUrl,
-        maxPayloadBytes: cardConfig.maxPayloadBytes,
-        foldThresholdChars: cardConfig.foldThresholdChars,
-      }),
-    }));
+    const rendered = groups.map((group) => {
+      const agentName = agentDisplayName(group.agentId, agentsConfig);
+      return {
+        ...group,
+        agentName,
+        payloads: buildHighRiskAlertPayloads({
+          reviewId,
+          window: { from: run?.window_from, to: run?.window_to },
+          agentId: group.agentId,
+          agentName,
+          traceId: group.traceId,
+          findings: group.findings,
+          dashboardUrl,
+          maxPayloadBytes: cardConfig.maxPayloadBytes,
+          foldThresholdChars: cardConfig.foldThresholdChars,
+        }),
+      };
+    });
     if (feishuMode === 'dry-run') {
       return { enqueued: false, reason: 'dry_run', groups: rendered };
     }

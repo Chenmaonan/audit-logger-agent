@@ -424,6 +424,15 @@ test('scheduler sends every high-risk finding from a batch larger than 1000 with
       },
     },
   });
+  let highRiskNotification;
+  const enqueueHighRiskGroups = deps.notifier.enqueueHighRiskGroups;
+  deps.notifier = {
+    ...deps.notifier,
+    enqueueHighRiskGroups(args) {
+      highRiskNotification = args;
+      return enqueueHighRiskGroups(args);
+    },
+  };
   const scheduler = createAuditReviewScheduler({
     db,
     ...deps,
@@ -438,6 +447,10 @@ test('scheduler sends every high-risk finding from a batch larger than 1000 with
     ORDER BY id DESC LIMIT 1
   `).get();
   assert.equal(result.status, 'completed', llmAudit?.result_summary);
+  assert.equal(highRiskNotification.findings.length, findingTotal);
+  assert.ok(highRiskNotification.findings.every((finding) => (
+    typeof finding.observed_at === 'string' && Number.isFinite(Date.parse(finding.observed_at))
+  )));
   const payloads = deps.outboxStore.listAll(5000)
     .filter((event) => event.type === 'audit_review_high_risk_group')
     .map((event) => event.payload_json);

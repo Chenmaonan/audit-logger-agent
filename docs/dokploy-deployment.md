@@ -31,7 +31,7 @@
 
 如需调用 `/v1/audit-*` API，`AUDIT_AGENT_DASHBOARD_TOKEN` 应是独立的高强度随机值。未配置时 Dashboard 仍可访问，但审查 API 的 Bearer 鉴权不会放行请求。
 
-飞书通知默认关闭。建议先使用 `dry-run` 验证卡片构建，再切换 `live`。Webhook 不应写入配置文件、Git、日志或命令历史；生产启用前应在飞书侧配置 IP 白名单或关键词安全策略。当前发送器未生成飞书签名字段，如需启用签名校验，应先扩展并验证签名支持。日报固定按 `Asia/Shanghai` 每天 10:00、17:00 运行。
+飞书通知默认关闭。建议先使用 `dry-run` 验证卡片构建，再按“本地测试 → 卡片预览审核 → Docker 测试 → 真实客户端验收 → live”的顺序推进。Webhook 不应写入配置文件、Git、日志或命令历史；生产启用前应在飞书侧配置 IP 白名单或关键词安全策略。当前发送器未生成飞书签名字段，如需启用签名校验，应先扩展并验证签名支持。日报固定按 `Asia/Shanghai` 每天 10:00、17:00 运行。
 
 ## 3. 持久化与健康检查
 
@@ -72,7 +72,20 @@ Dashboard 页面不要求登录，能访问该域名和路径的用户可以直�
 
 容器配置使用 `auditReview.notification.enabled=true` 和 `mode=feishu_bot`，但 `AUDIT_AGENT_FEISHU_MODE` 默认是 `disabled`，因此新部署不会真实发送。不要通过 `callbackUrl` 配置飞书 Webhook；发送器只在进程内从 Secret 环境变量或 secret 文件读取它，避免写入 outbox 数据库。
 
-上线顺序应为 `disabled -> dry-run -> live`。进入 `live` 前必须配置 Webhook 和 `AUDIT_AGENT_FEISHU_LIVE_CONFIRM=CONFIRM_FEISHU_LIVE`。即时消息只发送 high/critical，并按 `agent_id + trace_id` 隔离；日报按北京时间 10:00、17:00 发送。发送器将持续速率限制在低于 100 次/分钟，同时满足 5 次/秒限制。
+卡片面向管理层和业务负责人：即时告警标题栏始终为橙色，日报标题栏始终为蓝色，不使用红色或 `carmine` 标题。首屏先展示结论、关键数字和最多 Top 3 风险；完整风险名称与摘要放入风险折叠区，日报的风险明细与工具统计使用两个独立折叠区。用户可见时间使用北京时间，Agent/Trace 优先展示可读名称，技术 ID 缩短后作为辅助信息；完整 ID 仍用于分组、去重和 Dashboard 查询。
+
+上线顺序应为：
+
+1. 保持 `disabled`，完成定向测试和本地全量非 external 测试。
+2. 使用 `dry-run` 和完全虚构的数据生成卡片预览，覆盖单条 high、high/critical 混合、超长折叠与多分片、有风险日报、无风险日报。
+3. 在执行任何 Docker 构建或测试前，把卡片截图或渲染图提交给用户审核；未获得明确通过时不得继续 Docker 测试。
+4. 审核通过后，使用最新工作树执行断网 Docker 测试、生产入口健康检查，并检查镜像、环境、日志及文件中不存在真实 Webhook；测试结束后清理临时镜像、容器和卷。
+5. 向私有非生产测试 Bot 发送虚构数据，保留飞书桌面端和移动端、折叠和展开状态、多分片顺序及有风险/无风险日报截图或录屏。
+6. 真实客户端视觉验收通过后，才可配置 `AUDIT_AGENT_FEISHU_MODE=live` 和 `AUDIT_AGENT_FEISHU_LIVE_CONFIRM=CONFIRM_FEISHU_LIVE`。
+
+Docker 前提交的本地截图或渲染图只是设计审核门，不是飞书真实客户端验收。不得用 JSON、源码、单元测试、本地 HTML 或模拟渲染结果替代桌面端和移动端的真实截图或录屏。
+
+即时消息只发送 high/critical，并按 `review_id`、`agent_id + trace_id` 隔离；日报按北京时间 10:00、17:00 发送。发送器将持续速率限制在低于 100 次/分钟，同时满足 5 次/秒限制。
 
 从 `live` 切换到 `dry-run` 或 `disabled` 时，已有 pending 飞书消息会保留原状态，不发送、不增加尝试次数；恢复 `live` 后继续投递。
 

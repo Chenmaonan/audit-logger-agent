@@ -2,6 +2,8 @@ const FEISHU_WEBHOOK_MAX_BYTES = 20 * 1024;
 const DEFAULT_MAX_PAYLOAD_BYTES = 19 * 1024;
 const DEFAULT_FOLD_THRESHOLD_CHARS = 800;
 const MAX_DETAIL_SEGMENT_CHARS = 1800;
+const MAX_CARD_TAGGED_COMPONENTS = 190;
+const BEIJING_TIMEZONE = 'Asia/Shanghai';
 
 function utf8Bytes(value) {
   return Buffer.byteLength(typeof value === 'string' ? value : JSON.stringify(value), 'utf8');
@@ -45,17 +47,58 @@ function normalizeSeverity(value) {
   return value === 'critical' ? 'critical' : 'high';
 }
 
+function sanitizeBusinessText(value) {
+  return sanitizeFeishuText(value)
+    .replace(/通过\s*Webhook\s*推送/gi, '通过通知渠道发送')
+    .replace(/自定义服务消息/gi, '通知消息')
+    .replace(/\bWebhook\b/gi, '通知渠道')
+    .replace(/\bJSON\b/gi, '结构化数据')
+    .replace(/\bHTTP\b/gi, '网络请求')
+    .replace(/\boutbox\b/gi, '消息队列')
+    .replace(/\bcanary\b/gi, '连通性检查');
+}
+
+function severityRank(value) {
+  return value === 'critical' ? 2 : value === 'high' ? 1 : 0;
+}
+
+function timestampValue(value) {
+  const parsed = Date.parse(value ?? '');
+  return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+}
+
+function sortedFindings(findings) {
+  return (Array.isArray(findings) ? findings : [])
+    .map((finding, index) => ({ finding, index }))
+    .filter(({ finding }) => finding?.severity === 'high' || finding?.severity === 'critical')
+    .sort((a, b) => (
+      severityRank(b.finding.severity) - severityRank(a.finding.severity) ||
+      timestampValue(b.finding.observed_at ?? b.finding.observedAt) -
+        timestampValue(a.finding.observed_at ?? a.finding.observedAt) ||
+      a.index - b.index
+    ))
+    .map(({ finding }) => finding);
+}
+
+function summaryText(value) {
+  const sanitized = sanitizeBusinessText(value);
+  return sanitized || '暂无影响摘要，请进入 Dashboard 查看详情。';
+}
+
 function findingEntries(findings) {
   const entries = [];
-  for (const finding of findings) {
-    const title = sanitizeFeishuText(finding.title || finding.tool_name || finding.category || '未命名风险');
-    const summaryParts = splitText(finding.summary || '无摘要');
+  for (const [findingIndex, finding] of findings.entries()) {
+    const title = sanitizeBusinessText(finding.title || finding.tool_name || finding.category || '未命名风险');
+    const summaryParts = splitText(summaryText(finding.summary));
     summaryParts.forEach((summary, index) => {
       entries.push({
         kind: 'finding',
+        findingIndex,
         severity: normalizeSeverity(finding.severity),
-        title: summaryParts.length > 1 ? `${title}（${index + 1}/${summaryParts.length}）` : title,
+        title,
         summary,
+        segmentIndex: index,
+        segmentCount: summaryParts.length,
       });
     });
   }
@@ -63,37 +106,61 @@ function findingEntries(findings) {
 }
 
 function toolEntries(tools) {
-  return (Array.isArray(tools) ? tools : []).map((tool) => ({
-    kind: 'tool',
-    title: sanitizeFeishuText(tool.tool_name || 'unknown'),
-    summary: `调用 ${Number(tool.total) || 0} 次，异常 ${Number(tool.error_count) || 0} 次`,
-  }));
+  return (Array.isArray(tools) ? tools : [])
+    .map((tool, index) => ({ tool, index }))
+    .sort((a, b) => (
+      (Number(b.tool.error_count) || 0) - (Number(a.tool.error_count) || 0) ||
+      (Number(b.tool.total) || 0) - (Number(a.tool.total) || 0) ||
+      String(a.tool.tool_name || '').localeCompare(String(b.tool.tool_name || ''), 'zh-CN') ||
+      a.index - b.index
+    ))
+    .map(({ tool }) => ({
+      kind: 'tool',
+      title: sanitizeBusinessText(tool.tool_name || 'unknown'),
+      summary: `调用 ${Number(tool.total) || 0} 次，异常 ${Number(tool.error_count) || 0} 次`,
+    }));
 }
 
 function entryMarkdown(entry, index) {
-  const severity = entry.severity === 'critical' ? '严重' : entry.severity === 'high' ? '高风险' : null;
-  const label = severity ? `［${severity}］` : '';
-  return `**${index + 1}. ${label}${entry.title}**\n${entry.summary}`;
+  const label = entry.severity ? severityLabelMarkdown(entry.severity) : '';
+  const segment = entry.segmentCount > 1 ? `（摘要 ${entry.segmentIndex + 1}/${entry.segmentCount}）` : '';
+  return `**${index + 1}. ${label}${entry.title}${segment}**\n${entry.summary}`;
 }
 
-function identityMarkdown({ agentId, traceId }) {
+function shortenIdentity(value, maxChars = 24) {
+  const text = sanitizeFeishuText(value);
+  if (!text) return '身份信息缺失';
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, 10)}…${text.slice(-8)}`;
+}
+
+function displayAgentName(agentName, agentId) {
+  return sanitizeFeishuText(agentName) || shortenIdentity(agentId) || '身份信息缺失';
+}
+
+function displayTraceName(traceName, traceId) {
+  return sanitizeFeishuText(traceName) || shortenIdentity(traceId) || '身份信息缺失';
+}
+
+function identityMarkdown({ agentId, traceId, agentName, traceName }) {
+  const missing = !sanitizeFeishuText(agentId) || !sanitizeFeishuText(traceId);
   return [
-    `**Agent ID**：${sanitizeFeishuText(agentId || 'unknown')}`,
-    `**Trace ID**：${sanitizeFeishuText(traceId || 'unknown')}`,
+    `Agent：${displayAgentName(agentName, agentId)}（ID：${shortenIdentity(agentId)}）`,
+    `业务链路：${displayTraceName(traceName, traceId)}（Trace：${shortenIdentity(traceId)}）`,
+    ...(missing ? ['身份状态：身份信息缺失'] : []),
   ].join('\n');
 }
 
-function detailElement(entries, { fold, title = '查看明细' } = {}) {
+function detailElement(entries, { title = '查看明细', itemCount = entries.length, compact = false } = {}) {
   const elements = entries.map((entry, index) => ({
     tag: 'markdown',
     content: entryMarkdown(entry, index),
   }));
-  if (!fold) return elements;
   return [{
     tag: 'collapsible_panel',
     expanded: false,
     header: {
-      title: { tag: 'plain_text', content: `${title}（${entries.length} 项）` },
+      title: { tag: 'plain_text', content: `${title}（${itemCount} 项）` },
       vertical_align: 'center',
       icon: {
         tag: 'standard_icon',
@@ -104,10 +171,97 @@ function detailElement(entries, { fold, title = '查看明细' } = {}) {
       icon_expanded_angle: -180,
     },
     border: { color: 'grey', corner_radius: '5px' },
-    vertical_spacing: '8px',
+    vertical_spacing: compact ? '4px' : '8px',
     padding: '8px',
     elements,
   }];
+}
+
+function truncateText(value, maxChars = 44) {
+  const text = summaryText(value);
+  return text.length <= maxChars ? text : `${text.slice(0, maxChars - 1).trimEnd()}…`;
+}
+
+function severityLabelMarkdown(severity) {
+  return severity === 'critical'
+    ? "<font color='orange'>［严重］</font>"
+    : "<font color='yellow'>［高风险］</font>";
+}
+
+function primaryRiskElement(finding) {
+  const title = sanitizeBusinessText(
+    finding?.title || finding?.tool_name || finding?.category || '未命名风险',
+  );
+  return {
+    tag: 'collapsible_panel',
+    expanded: true,
+    header: {
+      title: { tag: 'plain_text', content: '首要风险' },
+      vertical_align: 'center',
+    },
+    border: { color: 'orange', corner_radius: '5px' },
+    vertical_spacing: '4px',
+    padding: '8px',
+    elements: [{
+      tag: 'markdown',
+      content: `**${severityLabelMarkdown(finding.severity)}${title}**\n${truncateText(finding.summary)}`,
+    }],
+  };
+}
+
+function metricElement(items) {
+  return {
+    tag: 'column_set',
+    flex_mode: 'flow',
+    horizontal_spacing: '8px',
+    columns: items.map(({ label, value }) => ({
+      tag: 'column',
+      width: 'weighted',
+      weight: 1,
+      elements: [{
+        tag: 'markdown',
+        content: `**${sanitizeFeishuText(value)}**\n${sanitizeFeishuText(label)}`,
+        text_align: 'left',
+      }],
+    })),
+  };
+}
+
+function beijingParts(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: BEIJING_TIMEZONE,
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const pick = (type) => parts.find((part) => part.type === type)?.value;
+  return { month: pick('month'), day: pick('day'), hour: pick('hour'), minute: pick('minute') };
+}
+
+function formatBeijingRange(from, to, { prefix = '北京时间 ' } = {}) {
+  const start = beijingParts(from);
+  const end = beijingParts(to);
+  if (!start || !end) return `${prefix}时间范围未知`;
+  const startDate = `${Number(start.month)} 月 ${Number(start.day)} 日`;
+  const endDate = `${Number(end.month)} 月 ${Number(end.day)} 日`;
+  const startTime = `${start.hour}:${start.minute}`;
+  const endTime = `${end.hour}:${end.minute}`;
+  return startDate === endDate
+    ? `${prefix}${startDate} ${startTime}–${endTime}`
+    : `${prefix}${startDate} ${startTime}–${endDate} ${endTime}`;
+}
+
+function reviewWindowLabel(from, to) {
+  const durationMs = Date.parse(to ?? '') - Date.parse(from ?? '');
+  if (!Number.isFinite(durationMs) || durationMs < 0) return '—';
+  const minutes = Math.round(durationMs / 60000);
+  if (minutes < 60) return `${minutes}m`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
 function metadataElement(content) {
@@ -161,13 +315,24 @@ function safeHttpUrl(value) {
   }
 }
 
+function taggedComponentCount(value) {
+  if (!value || typeof value !== 'object') return 0;
+  if (Array.isArray(value)) {
+    return value.reduce((sum, item) => sum + taggedComponentCount(item), 0);
+  }
+  return (typeof value.tag === 'string' ? 1 : 0) +
+    Object.values(value).reduce((sum, item) => sum + taggedComponentCount(item), 0);
+}
+
 function packEntries(entries, makePayload, maxPayloadBytes) {
   const chunks = [];
   let current = [];
   for (const entry of entries) {
     const candidate = [...current, entry];
     const payload = makePayload(candidate, 999, 999);
-    if (current.length > 0 && utf8Bytes(payload) > maxPayloadBytes) {
+    const exceedsLimit = utf8Bytes(payload) > maxPayloadBytes ||
+      taggedComponentCount(payload.card) > MAX_CARD_TAGGED_COMPONENTS;
+    if (current.length > 0 && exceedsLimit) {
       chunks.push(current);
       current = [entry];
     } else {
@@ -180,6 +345,9 @@ function packEntries(entries, makePayload, maxPayloadBytes) {
     const payload = makePayload(chunk, index + 1, chunks.length);
     if (utf8Bytes(payload) > maxPayloadBytes) {
       throw new Error('Feishu card exceeds configured payload byte limit');
+    }
+    if (taggedComponentCount(payload.card) > MAX_CARD_TAGGED_COMPONENTS) {
+      throw new Error('Feishu card exceeds safe component count');
     }
     return payload;
   });
@@ -209,50 +377,78 @@ export function buildHighRiskAlertPayloads({
   reviewId,
   window,
   agentId,
+  agentName,
   traceId,
+  traceName,
   findings,
   dashboardUrl,
   maxPayloadBytes = DEFAULT_MAX_PAYLOAD_BYTES,
   foldThresholdChars = DEFAULT_FOLD_THRESHOLD_CHARS,
 } = {}) {
-  const eligible = (Array.isArray(findings) ? findings : [])
-    .filter((finding) => finding?.severity === 'high' || finding?.severity === 'critical');
+  const eligible = sortedFindings(findings);
   if (eligible.length === 0) return [];
   const entries = findingEntries(eligible);
   const criticalCount = eligible.filter((finding) => finding.severity === 'critical').length;
   const detailChars = entries.reduce((sum, entry) => sum + entry.title.length + entry.summary.length, 0);
-  const shouldFold = entries.length > 2 || detailChars > Number(foldThresholdChars || DEFAULT_FOLD_THRESHOLD_CHARS);
+  const compactDetails = detailChars <= Number(foldThresholdChars || DEFAULT_FOLD_THRESHOLD_CHARS);
   const byteLimit = normalizedLimit(maxPayloadBytes, DEFAULT_MAX_PAYLOAD_BYTES);
   const makePayload = (chunk, part, totalParts) => {
     const partLabel = totalParts > 1 ? `（${part}/${totalParts}）` : '';
-    const primaryRisk = sanitizeFeishuText(eligible[0]?.title || '未命名风险');
+    const primaryFinding = eligible[0];
+    const agentLabel = displayAgentName(agentName, agentId);
+    const traceLabel = displayTraceName(traceName, traceId);
+    const conclusion = criticalCount > 0
+      ? `${agentLabel} 的 ${traceLabel} 发现 ${eligible.length} 条高风险，其中 ${criticalCount} 条严重，需要查看影响范围。`
+      : `${agentLabel} 的 ${traceLabel} 发现 ${eligible.length} 条高风险，建议查看具体影响。`;
+    const otherRisks = eligible.slice(1, 3);
     const elements = [
       {
         tag: 'markdown',
-        content: [
-          identityMarkdown({ agentId, traceId }),
-          `**本批次风险**：${eligible.length} 条（严重 ${criticalCount} 条）`,
-          `**首要风险**：${primaryRisk}`,
-        ].join('\n'),
+        content: `**总体结论**\n${conclusion}`,
       },
-      ...detailElement(chunk, { fold: shouldFold, title: '高风险日志名称与摘要' }),
-      metadataElement(`批次 ${sanitizeFeishuText(reviewId || 'unknown')}｜${sanitizeFeishuText(window?.from || '')} 至 ${sanitizeFeishuText(window?.to || '')}`),
+      metricElement([
+        { label: '高风险总数', value: String(eligible.length) },
+        { label: '严重风险数', value: String(criticalCount) },
+        { label: '审查窗口', value: reviewWindowLabel(window?.from, window?.to) },
+      ]),
+      primaryRiskElement(primaryFinding),
+      ...(otherRisks.length > 0 ? [{
+        tag: 'markdown',
+        content: [
+          '**其他重点风险**',
+          ...otherRisks.map((finding) => (
+            `- ${severityLabelMarkdown(finding.severity)}${sanitizeBusinessText(
+              finding.title || finding.tool_name || finding.category || '未命名风险',
+            )}`
+          )),
+        ].join('\n'),
+      }] : []),
+      ...detailElement(chunk, {
+        title: '全部风险名称与摘要',
+        itemCount: eligible.length,
+        compact: compactDetails,
+      }),
+      metadataElement([
+        formatBeijingRange(window?.from, window?.to),
+        `批次：${shortenIdentity(reviewId)}`,
+        identityMarkdown({ agentId, traceId, agentName, traceName }),
+      ].join('\n')),
     ];
     const detailUrl = safeHttpUrl(dashboardUrl);
     if (detailUrl) {
       elements.push({
         tag: 'button',
         text: { tag: 'plain_text', content: '查看审计详情' },
-        type: 'default',
+        type: 'primary',
         width: 'default',
         behaviors: [{ type: 'open_url', default_url: detailUrl }],
       });
     }
     return baseCard({
-      title: `高风险审计告警${partLabel}`,
-      subtitle: `${sanitizeFeishuText(agentId || 'unknown')} / ${sanitizeFeishuText(traceId || 'unknown')}`,
-      template: criticalCount > 0 ? 'carmine' : 'red',
-      preview: `高风险审计告警：${sanitizeFeishuText(agentId || 'unknown')} / ${sanitizeFeishuText(traceId || 'unknown')}`,
+      title: `${criticalCount > 0 ? '严重审计风险' : '高风险审计告警'}${partLabel}`,
+      subtitle: `${agentLabel} · ${traceLabel}`,
+      template: 'orange',
+      preview: `${criticalCount > 0 ? '严重审计风险' : '高风险审计告警'}：${agentLabel} · ${traceLabel}`,
       elements,
     });
   };
@@ -262,39 +458,91 @@ export function buildHighRiskAlertPayloads({
 export function buildDailyReportPayloads({
   date,
   generatedAt,
+  window,
+  timezoneOffsetMinutes = 480,
   group,
+  dashboardUrl,
   maxPayloadBytes = DEFAULT_MAX_PAYLOAD_BYTES,
   foldThresholdChars = DEFAULT_FOLD_THRESHOLD_CHARS,
 } = {}) {
   if (!group) return [];
-  const findings = (Array.isArray(group.findings) ? group.findings : [])
-    .filter((finding) => finding?.severity === 'high' || finding?.severity === 'critical');
-  const entries = [...toolEntries(group.tools), ...findingEntries(findings)];
+  const findings = sortedFindings(group.findings);
+  const findingDetailEntries = findingEntries(findings);
+  const toolDetailEntries = toolEntries(group.tools);
+  const entries = [...findingDetailEntries, ...toolDetailEntries];
   const byteLimit = normalizedLimit(maxPayloadBytes, DEFAULT_MAX_PAYLOAD_BYTES);
   const detailChars = entries.reduce((sum, entry) => sum + entry.title.length + entry.summary.length, 0);
-  const shouldFold = entries.length > 3 || detailChars > Number(foldThresholdChars || DEFAULT_FOLD_THRESHOLD_CHARS);
+  const compactDetails = detailChars <= Number(foldThresholdChars || DEFAULT_FOLD_THRESHOLD_CHARS);
+  const criticalCount = findings.filter((finding) => finding.severity === 'critical').length;
+  const agentLabel = displayAgentName(group.agent_name, group.agent_id);
+  const traceLabel = displayTraceName(group.trace_name, group.trace_id);
+  const conclusion = criticalCount > 0
+    ? '存在严重风险，需要查看影响范围。'
+    : findings.length > 0
+      ? '存在高风险，建议关注相关业务链路。'
+      : '今日未发现高风险，整体运行正常。';
   const makePayload = (chunk, part, totalParts) => {
     const partLabel = totalParts > 1 ? `（${part}/${totalParts}）` : '';
-    const highRiskCount = findings.length;
+    const chunkFindings = chunk.filter((entry) => entry.kind === 'finding');
+    const chunkTools = chunk.filter((entry) => entry.kind === 'tool');
     const elements = [
       {
         tag: 'markdown',
-        content: [
-          identityMarkdown({ agentId: group.agent_id, traceId: group.trace_id }),
-          `**事件数**：${Number(group.event_count) || 0}`,
-          `**异常事件**：${Number(group.error_count) || 0}`,
-          `**涉及工具**：${Number(group.tool_count) || 0}`,
-          `**高风险发现**：${highRiskCount}`,
-        ].join('\n'),
+        content: `**总体判断**\n${conclusion}`,
       },
-      ...detailElement(chunk, { fold: shouldFold, title: '工具统计与风险明细' }),
-      metadataElement(`统计日期 ${sanitizeFeishuText(date)}（Asia/Shanghai）｜更新于 ${sanitizeFeishuText(generatedAt)}`),
+      metricElement([
+        { label: '事件数', value: String(Number(group.event_count) || 0) },
+        { label: '异常事件数', value: String(Number(group.error_count) || 0) },
+        { label: '涉及工具数', value: String(Number(group.tool_count) || 0) },
+        { label: '高风险发现数', value: String(findings.length) },
+      ]),
+      ...(findings.length > 0 ? [{
+        tag: 'markdown',
+        content: [
+          '**Top 风险**',
+          ...findings.slice(0, 3).map((finding) => (
+            `- ${severityLabelMarkdown(finding.severity)}${sanitizeBusinessText(
+              finding.title || finding.tool_name || finding.category || '未命名风险',
+            )}`
+          )),
+        ].join('\n'),
+      }] : []),
+      ...(chunkFindings.length > 0 ? detailElement(chunkFindings, {
+        title: '高风险名称与摘要',
+        itemCount: findings.length,
+        compact: compactDetails,
+      }) : []),
+      ...(chunkTools.length > 0 ? detailElement(chunkTools, {
+        title: '工具调用统计',
+        itemCount: toolDetailEntries.length,
+        compact: compactDetails,
+      }) : []),
+      metadataElement([
+        `统计范围：${formatBeijingRange(window?.from, window?.to ?? generatedAt, { prefix: '' })} · 北京时间`,
+        `统计日期：${sanitizeFeishuText(date || '未知')}`,
+        identityMarkdown({
+          agentId: group.agent_id,
+          traceId: group.trace_id,
+          agentName: group.agent_name,
+          traceName: group.trace_name,
+        }),
+      ].join('\n')),
     ];
+    const detailUrl = safeHttpUrl(dashboardUrl);
+    if (detailUrl) {
+      elements.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: '查看完整日报' },
+        type: 'primary',
+        width: 'default',
+        behaviors: [{ type: 'open_url', default_url: detailUrl }],
+      });
+    }
     return baseCard({
       title: `审计信息日报${partLabel}`,
-      subtitle: `${sanitizeFeishuText(group.agent_id || 'unknown')} / ${sanitizeFeishuText(group.trace_id || 'unknown')}`,
-      template: highRiskCount > 0 ? 'orange' : 'blue',
-      preview: `审计日报：${sanitizeFeishuText(group.agent_id || 'unknown')} / ${sanitizeFeishuText(group.trace_id || 'unknown')}`,
+      subtitle: `${agentLabel} · ${traceLabel}`,
+      template: 'blue',
+      preview: `审计日报：${agentLabel} · ${traceLabel}`,
       elements,
     });
   };

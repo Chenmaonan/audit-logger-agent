@@ -326,17 +326,53 @@ test('feishu dry-run renders grouped cards but never writes to outbox', () => {
   const notifier = createReviewNotifier({
     outboxStore: outbox,
     feishuMode: 'dry-run',
-    config: { auditReview: { notification: { enabled: true, mode: 'feishu_bot' } } },
+    config: {
+      agents: { a: { displayName: '审计 Agent A' } },
+      auditReview: { notification: { enabled: true, mode: 'feishu_bot' } },
+    },
   });
   const result = notifier.enqueueHighRiskGroups({
-    findings: [{ severity: 'high', agent_id: 'a', trace_id: 't', title: '风险', summary: '摘要' }],
+    findings: [{
+      severity: 'high',
+      agent_id: 'a',
+      trace_id: 't',
+      title: '风险',
+      summary: '摘要',
+      observed_at: '2026-07-17T01:15:00.000Z',
+    }],
     reviewId: 'r',
     run: makeRun(),
   });
 
   assert.equal(result.reason, 'dry_run');
   assert.equal(result.groups.length, 1);
+  assert.equal(result.groups[0].agentName, '审计 Agent A');
+  assert.equal(result.groups[0].agentId, 'a');
+  assert.equal(result.groups[0].findings[0].observed_at, '2026-07-17T01:15:00.000Z');
+  assert.match(JSON.stringify(result.groups[0].payloads), /审计 Agent A/);
   assert.equal(outbox.calls.length, 0);
+});
+
+test('Feishu display names do not change raw identity dedupe keys', () => {
+  function renderWithDisplayName(displayName) {
+    const outbox = makeFakeOutboxStore();
+    const notifier = createReviewNotifier({
+      outboxStore: outbox,
+      feishuMode: 'live',
+      config: {
+        agents: { a: { displayName } },
+        auditReview: { notification: { enabled: true, mode: 'feishu_bot' } },
+      },
+    });
+    notifier.enqueueHighRiskGroups({
+      findings: [{ severity: 'high', agent_id: 'a', trace_id: 't', title: '风险', summary: '摘要' }],
+      reviewId: 'review-display-name',
+      run: makeRun(),
+    });
+    return outbox.calls[0].dedupeKey;
+  }
+
+  assert.equal(renderWithDisplayName('显示名称一'), renderWithDisplayName('显示名称二'));
 });
 
 test('feishu notifier keeps review batches separate even for the same agent and trace', () => {

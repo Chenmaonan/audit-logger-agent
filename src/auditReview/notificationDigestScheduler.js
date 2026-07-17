@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { buildDailyReportPayloads } from './feishuCards.js';
+import { agentDisplayName } from './evidence.js';
 
 const DEFAULT_HOURS = [10, 17];
 const DEFAULT_TIMEZONE_OFFSET_MINUTES = 480;
@@ -74,6 +75,16 @@ function groupKey(agentId, traceId) {
   return JSON.stringify([agentId ?? null, traceId ?? null]);
 }
 
+function dailyDashboardUrl(config) {
+  const visualization = config?.auditReview?.visualization ?? {};
+  const baseUrl = typeof visualization.baseUrl === 'string' ? visualization.baseUrl.trim() : '';
+  if (!baseUrl) return null;
+  const dashboardPath = typeof visualization.dashboardPath === 'string' && visualization.dashboardPath.trim()
+    ? visualization.dashboardPath.trim()
+    : '/dashboard';
+  return `${baseUrl.replace(/\/$/, '')}/${dashboardPath.replace(/^\//, '')}`;
+}
+
 function loadDailyGroups(db, { from, to }) {
   const groupRows = db.prepare(`
     SELECT
@@ -111,7 +122,7 @@ function loadDailyGroups(db, { from, to }) {
       AND agent_id IS NOT NULL AND agent_id <> ''
       AND trace_id IS NOT NULL AND trace_id <> ''
     GROUP BY agent_id, trace_id, tool_name
-    ORDER BY agent_id ASC, trace_id ASC, total DESC, tool_name ASC
+    ORDER BY agent_id ASC, trace_id ASC, error_count DESC, total DESC, tool_name ASC
   `).all({ from, to });
   for (const tool of tools) {
     groups.get(groupKey(tool.agent_id, tool.trace_id))?.tools.push(tool);
@@ -163,6 +174,10 @@ export function createNotificationDigestScheduler({
   const timezoneOffsetMinutes = normalizedOffset(daily.timezoneOffsetMinutes ?? config?.report?.timezoneOffsetMinutes);
   const cardConfig = notification.card ?? {};
   const maxAttempts = notification.maxAttempts;
+  const agentsConfig = config?.agents
+    ? config
+    : (config?.auditReview?.agents ? { agents: config.auditReview.agents } : config);
+  const dashboardUrl = dailyDashboardUrl(config);
   let started = false;
   let timer = null;
   let runChain = Promise.resolve();
@@ -190,13 +205,26 @@ export function createNotificationDigestScheduler({
     if (!enabled) return { enqueued: false, reason: 'disabled', groups: [] };
     if (feishuMode === 'disabled') return { enqueued: false, reason: 'disabled', groups: [] };
     const window = dailyReportWindow(scheduledFor, timezoneOffsetMinutes);
-    const groups = loadDailyGroups(db, window);
+    const groups = loadDailyGroups(db, window).map((group) => {
+      const criticalCount = group.findings.filter((finding) => finding.severity === 'critical').length;
+      const highRiskCount = group.findings.length;
+      return {
+        ...group,
+        agent_name: agentDisplayName(group.agent_id, agentsConfig),
+        high_risk_count: highRiskCount,
+        critical_count: criticalCount,
+        highest_severity: criticalCount > 0 ? 'critical' : highRiskCount > 0 ? 'high' : 'none',
+      };
+    });
     const rendered = groups.map((group) => ({
       group,
       payloads: buildDailyReportPayloads({
         date: window.date,
         generatedAt: scheduledFor.toISOString(),
+        window: { from: window.from, to: window.to },
+        timezoneOffsetMinutes,
         group,
+        dashboardUrl,
         maxPayloadBytes: cardConfig.maxPayloadBytes,
         foldThresholdChars: cardConfig.foldThresholdChars,
       }),
