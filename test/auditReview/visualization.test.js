@@ -481,7 +481,7 @@ test('findingDetailPage includes details, raw logs, links, and ordered trace seq
   assert.ok(orderedIds.indexOf('finding_detail') < orderedIds.indexOf('evidence_raw_logs'));
 });
 
-test('findingDetailPage exposes lifecycle forms, occurrence/action history, snapshots, and notices', () => {
+test('findingDetailPage hides lifecycle forms while preserving occurrence/action history, snapshots, and notices', () => {
   const page = createViz({
     finding: {
       state_version: 7,
@@ -532,10 +532,7 @@ test('findingDetailPage exposes lifecycle forms, occurrence/action history, snap
     },
   }).findingDetailPage('f-critical', { notice: 'finding_version_conflict', action: 'reopen' });
 
-  const actionForms = page.sections.find((section) => section.id === 'finding_actions');
-  assert.deepEqual(actionForms.forms.map((form) => form.action), ['reopen']);
-  assert.equal(actionForms.state_version, 7);
-  assert.equal(actionForms.action_url, '/dashboard/audit-findings/f-critical/actions');
+  assert.equal(page.sections.some((section) => section.id === 'finding_actions'), false);
 
   const detail = page.sections.find((section) => section.id === 'finding_detail');
   assert.equal(detail.items.find((item) => item.label === '复发次数').value, 1);

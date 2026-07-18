@@ -1291,27 +1291,6 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     linkItems.push({ href: dashboardPath, label: '返回总览' });
 
     const sections = [];
-    const allowedActions = {
-      open: ['acknowledge', 'snooze', 'resolve'],
-      acknowledged: ['snooze', 'resolve', 'reopen'],
-      snoozed: ['acknowledge', 'resolve'],
-      resolved: ['reopen'],
-    }[finding.status] ?? [];
-    if (allowedActions.length > 0 && isPresent(finding.state_version)) {
-      sections.push({
-        id: 'finding_actions',
-        title: '处置 Finding',
-        type: 'action_forms',
-        action_url: `${findingUrl(findingId)}/actions`,
-        state_version: finding.state_version,
-        forms: allowedActions.map((actionType) => ({
-          action: actionType,
-          label: ACTION_LABELS[actionType],
-          requires_note: actionType === 'resolve' || actionType === 'reopen',
-          requires_snoozed_until: actionType === 'snooze',
-        })),
-      });
-    }
     if (isPresent(finding.summary)) {
       sections.push({
         id: 'finding_summary',
