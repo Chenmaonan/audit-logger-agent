@@ -200,6 +200,172 @@ function parseUrl(req) {
   return new URL(req.url, 'http://127.0.0.1');
 }
 
+function firstDefined(...values) {
+  return values.find((value) => value !== undefined);
+}
+
+function safeIso(value) {
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) return null;
+  return value;
+}
+
+function safeScheduleHours(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map(Number)
+    .filter((hour) => Number.isInteger(hour) && hour >= 0 && hour <= 23);
+}
+
+function safeTimezoneOffset(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < -1440 || parsed > 1440) return null;
+  return Math.trunc(parsed);
+}
+
+function safeDigestSlot(value) {
+  if (!value || typeof value !== 'object') return null;
+  const slotHour = Number(value.slot_hour ?? value.slotHour);
+  const attempts = Number(value.attempts);
+  const enqueuedCount = Number(value.enqueued_count ?? value.enqueuedCount);
+  return {
+    slot_key: typeof (value.slot_key ?? value.slotKey) === 'string' ? (value.slot_key ?? value.slotKey) : null,
+    report_date: typeof (value.report_date ?? value.reportDate) === 'string' ? (value.report_date ?? value.reportDate) : null,
+    slot_hour: Number.isInteger(slotHour) ? slotHour : null,
+    scheduled_for: safeIso(value.scheduled_for ?? value.scheduledFor),
+    timezone_offset_minutes: safeTimezoneOffset(value.timezone_offset_minutes ?? value.timezoneOffsetMinutes),
+    trigger_type: ['scheduled', 'catch_up'].includes(value.trigger_type ?? value.triggerType)
+      ? (value.trigger_type ?? value.triggerType)
+      : null,
+    status: typeof value.status === 'string' ? value.status : null,
+    attempts: Number.isInteger(attempts) && attempts >= 0 ? attempts : null,
+    enqueued_count: Number.isInteger(enqueuedCount) && enqueuedCount >= 0 ? enqueuedCount : null,
+    started_at: safeIso(value.started_at ?? value.startedAt),
+    completed_at: safeIso(value.completed_at ?? value.completedAt),
+  };
+}
+
+function latestDailyDigestDelivery(db, timezoneOffsetMinutes, lastSlot) {
+  const empty = {
+    delivery_slot_key: lastSlot?.slot_key ?? null,
+    last_enqueued_at: null,
+    last_delivered_at: null,
+    delivery_lag_ms: null,
+  };
+  try {
+    let runId = null;
+    let scheduledAt = safeIso(lastSlot?.scheduled_for);
+    if (lastSlot?.slot_key) {
+      if (lastSlot.status !== 'enqueued') return empty;
+      if (lastSlot.report_date && Number.isInteger(lastSlot.slot_hour)) {
+        runId = `daily_${lastSlot.report_date}_${lastSlot.slot_hour}`;
+      }
+    } else {
+      runId = db.prepare(`
+        SELECT run_id
+        FROM agent_outbox_events
+        WHERE type = 'audit_daily_trace_report'
+          AND delivery_mode = 'feishu_bot'
+        GROUP BY run_id
+        ORDER BY MAX(created_at) DESC
+        LIMIT 1
+      `).get()?.run_id ?? null;
+    }
+    if (!runId) return empty;
+
+    const row = db.prepare(`
+      SELECT
+        events.run_id,
+        MAX(events.created_at) AS last_enqueued_at,
+        CASE
+          WHEN SUM(CASE
+            WHEN events.delivery_status = 'delivered' AND events.delivered_at IS NOT NULL THEN 0
+            ELSE 1
+          END) = 0
+          THEN MAX(events.delivered_at)
+          ELSE NULL
+        END AS last_delivered_at
+      FROM agent_outbox_events AS events
+      WHERE events.run_id = @run_id
+        AND events.type = 'audit_daily_trace_report'
+        AND events.delivery_mode = 'feishu_bot'
+      GROUP BY events.run_id
+    `).get({ run_id: runId });
+    if (!row) return empty;
+
+    const lastEnqueuedAt = safeIso(row.last_enqueued_at);
+    const lastDeliveredAt = safeIso(row.last_delivered_at);
+    const runMatch = /^daily_(\d{4})-(\d{2})-(\d{2})_(\d{1,2})$/.exec(runId);
+    let deliveryLagMs = null;
+    if (!scheduledAt && runMatch && timezoneOffsetMinutes !== null) {
+      const [, year, month, day, hour] = runMatch;
+      scheduledAt = new Date(Date.UTC(
+        Number(year),
+        Number(month) - 1,
+        Number(day),
+        Number(hour),
+      ) - timezoneOffsetMinutes * 60 * 1000).toISOString();
+    }
+    if (lastDeliveredAt && scheduledAt) {
+      deliveryLagMs = Date.parse(lastDeliveredAt) - Date.parse(scheduledAt);
+    }
+
+    return {
+      delivery_slot_key: lastSlot?.slot_key ?? runId.replace(/^daily_/, 'daily:').replace(/_(\d{1,2})$/, ':$1'),
+      last_enqueued_at: lastEnqueuedAt,
+      last_delivered_at: lastDeliveredAt,
+      delivery_lag_ms: Number.isFinite(deliveryLagMs) ? deliveryLagMs : null,
+    };
+  } catch (error) {
+    if (isMissingTableError(error)) return empty;
+    return empty;
+  }
+}
+
+function notificationDigestHealth(notificationDigestScheduler, db) {
+  if (typeof notificationDigestScheduler?.getHealthStatus !== 'function') return null;
+
+  let source;
+  let statusError = false;
+  try {
+    source = notificationDigestScheduler.getHealthStatus() ?? {};
+  } catch {
+    source = {};
+    statusError = true;
+  }
+
+  const timezoneOffsetMinutes = safeTimezoneOffset(firstDefined(
+    source.timezone_offset_minutes,
+    source.timezoneOffsetMinutes,
+  ));
+  const lastSlot = safeDigestSlot(firstDefined(source.last_slot, source.lastSlot));
+  const schedulerState = {
+    status_error: statusError,
+    feishu_mode: ['disabled', 'dry-run', 'live'].includes(firstDefined(source.feishu_mode, source.feishuMode, source.mode))
+      ? firstDefined(source.feishu_mode, source.feishuMode, source.mode)
+      : 'disabled',
+    configured_enabled: Boolean(firstDefined(source.configured_enabled, source.configuredEnabled, source.enabled, false)),
+    scheduler_started: Boolean(firstDefined(source.scheduler_started, source.schedulerStarted, source.started, false)),
+    active: Boolean(source.active),
+    timezone: typeof source.timezone === 'string' ? source.timezone : null,
+    timezone_offset_minutes: timezoneOffsetMinutes,
+    schedule_hours: safeScheduleHours(firstDefined(source.schedule_hours, source.scheduleHours, source.hours)),
+    catch_up_window_minutes: Number.isInteger(Number(firstDefined(
+      source.catch_up_window_minutes,
+      source.catchUpWindowMinutes,
+    ))) && Number(firstDefined(source.catch_up_window_minutes, source.catchUpWindowMinutes)) >= 0
+      ? Number(firstDefined(source.catch_up_window_minutes, source.catchUpWindowMinutes))
+      : null,
+    next_run_at_utc: safeIso(firstDefined(source.next_run_at_utc, source.nextRunAtUtc)),
+    next_run_at_local: safeIso(firstDefined(source.next_run_at_local, source.nextRunAtLocal)),
+    last_slot: lastSlot,
+  };
+
+  return {
+    ...schedulerState,
+    ...latestDailyDigestDelivery(db, timezoneOffsetMinutes, lastSlot),
+  };
+}
+
 function optionalSearchParam(url, name) {
   return url.searchParams.get(name) || undefined;
 }
@@ -346,7 +512,7 @@ function listHistory(store, methodName, idName, id, pagination) {
   return Array.isArray(rows) ? rows : [];
 }
 
-export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth, findingLifecycleService, toolSemanticMapper, retentionService, now = () => new Date() } = {}) {
+export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth, findingLifecycleService, toolSemanticMapper, retentionService, notificationDigestScheduler, now = () => new Date() } = {}) {
   // Helpers for audit-review routes. These are optional — if not provided
   // (e.g. in the existing runs-api test), the new routes return 503.
   const hasReviewDeps = !!(scheduler && reviewStore && visualization && dashboardAuth);
@@ -607,6 +773,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
           db: dbProbe,
           latest_review: latestReview(db),
           outbox: outboxCounts(db),
+          notification_digest: notificationDigestHealth(notificationDigestScheduler, db),
           disk: diskUsageEstimate(config.dbPath),
         });
         return;

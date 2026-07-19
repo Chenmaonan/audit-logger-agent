@@ -1,15 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import Database from 'better-sqlite3';
 import {
   createNotificationDigestScheduler,
+  latestDailyReportSlotAt,
   nextDailyReportAt,
 } from '../../src/auditReview/notificationDigestScheduler.js';
 
-function makeDb() {
-  const db = new Database(':memory:');
+function makeDb(databasePath = ':memory:') {
+  const db = new Database(databasePath);
+  db.pragma('journal_mode = WAL');
+  db.pragma('busy_timeout = 5000');
   db.exec(`
-    CREATE TABLE audit_events (
+    CREATE TABLE IF NOT EXISTS audit_events (
       id INTEGER PRIMARY KEY,
       ts TEXT NOT NULL,
       agent_id TEXT NOT NULL,
@@ -17,18 +23,34 @@ function makeDb() {
       tool_name TEXT NOT NULL,
       status TEXT NOT NULL
     );
-    CREATE TABLE audit_review_findings (
+    CREATE TABLE IF NOT EXISTS audit_review_findings (
       finding_id TEXT PRIMARY KEY,
       agent_id TEXT,
       trace_id TEXT
     );
-    CREATE TABLE audit_review_finding_occurrences (
+    CREATE TABLE IF NOT EXISTS audit_review_finding_occurrences (
       occurrence_id TEXT PRIMARY KEY,
       finding_id TEXT NOT NULL,
       severity TEXT NOT NULL,
       title TEXT NOT NULL,
       summary TEXT NOT NULL,
       observed_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS audit_notification_digest_slots (
+      slot_key TEXT PRIMARY KEY,
+      report_date TEXT NOT NULL,
+      slot_hour INTEGER NOT NULL,
+      scheduled_for TEXT NOT NULL,
+      timezone_offset_minutes INTEGER NOT NULL,
+      trigger_type TEXT NOT NULL,
+      status TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      enqueued_count INTEGER NOT NULL DEFAULT 0,
+      owner_id TEXT,
+      lease_expires_at TEXT,
+      started_at TEXT,
+      completed_at TEXT,
+      last_error TEXT
     );
   `);
   return db;
@@ -71,7 +93,12 @@ function config() {
       notification: {
         enabled: true,
         mode: 'feishu_bot',
-        dailyReport: { enabled: true, hours: [10, 17], timezoneOffsetMinutes: 480 },
+        dailyReport: {
+          enabled: true,
+          hours: [10, 17],
+          timezoneOffsetMinutes: 480,
+          catchUpWindowMinutes: 30,
+        },
         card: { foldThresholdChars: 1 },
       },
     },
@@ -91,6 +118,44 @@ test('nextDailyReportAt uses Beijing 10:00 and 17:00 independent of host timezon
     nextDailyReportAt(new Date('2026-07-17T09:00:00.000Z')).toISOString(),
     '2026-07-18T02:00:00.000Z',
   );
+});
+
+test('latestDailyReportSlotAt includes an exact schedule boundary', () => {
+  assert.deepEqual(
+    latestDailyReportSlotAt(new Date('2026-07-17T02:00:00.000Z')),
+    { hour: 10, scheduledFor: new Date('2026-07-17T02:00:00.000Z') },
+  );
+  assert.deepEqual(
+    latestDailyReportSlotAt(new Date('2026-07-17T09:10:00.000Z')),
+    { hour: 17, scheduledFor: new Date('2026-07-17T09:00:00.000Z') },
+  );
+});
+
+test('scheduler rejects invalid runtime schedule configuration', () => {
+  const db = makeDb();
+  const base = {
+    db,
+    outboxStore: { enqueue() {} },
+    config: config(),
+    ownerId: 'owner-validation',
+  };
+  assert.throws(
+    () => createNotificationDigestScheduler({ ...base, feishuMode: 'unexpected' }),
+    /invalid Feishu mode/,
+  );
+  const badOffset = config();
+  badOffset.auditReview.notification.dailyReport.timezoneOffsetMinutes = 480.5;
+  assert.throws(
+    () => createNotificationDigestScheduler({ ...base, config: badOffset, feishuMode: 'live' }),
+    /timezone offset/,
+  );
+  const badCatchUp = config();
+  badCatchUp.auditReview.notification.dailyReport.catchUpWindowMinutes = -1;
+  assert.throws(
+    () => createNotificationDigestScheduler({ ...base, config: badCatchUp, feishuMode: 'live' }),
+    /catch-up window/,
+  );
+  db.close();
 });
 
 test('dry-run renders one isolated daily card group per agent_id and trace_id without outbox writes', () => {
@@ -209,5 +274,408 @@ test('scheduler start installs the next calendar timer and stop clears it', () =
   assert.equal(timers[0].delayMs, 60_000);
   scheduler.stop();
   assert.deepEqual(cleared, [timers[0]]);
+  db.close();
+});
+
+test('scheduler start executes the exact 10:00 live slot and immediately requests a flush', async () => {
+  const db = makeDb();
+  insertSamples(db);
+  const calls = [];
+  const flushes = [];
+  const scheduler = createNotificationDigestScheduler({
+    db,
+    outboxStore: { enqueue(event) { calls.push(event); return { enqueued: true }; } },
+    config: config(),
+    feishuMode: 'live',
+    ownerId: 'owner-exact',
+    now: () => new Date('2026-07-17T02:00:00.000Z'),
+    onEnqueued(result) { flushes.push(result.status); },
+    timerApi: { setTimeout() { return { id: 1 }; }, clearTimeout() {} },
+  });
+
+  scheduler.start();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(calls.length, 3);
+  assert.deepEqual(flushes, ['enqueued']);
+  assert.ok(calls.every((call) => call.runId === 'daily_2026-07-17_10'));
+  assert.ok(calls.every((call) => call.priority === 100));
+  const slot = db.prepare('SELECT * FROM audit_notification_digest_slots').get();
+  assert.equal(slot.slot_key, 'daily:2026-07-17:10');
+  assert.equal(slot.status, 'enqueued');
+  assert.equal(slot.trigger_type, 'scheduled');
+  db.close();
+});
+
+test('scheduler reclaims an expired slot lease and does not rerun a completed empty slot', () => {
+  const staleDb = makeDb();
+  insertSamples(staleDb);
+  staleDb.prepare(`
+    INSERT INTO audit_notification_digest_slots (
+      slot_key, report_date, slot_hour, scheduled_for, timezone_offset_minutes,
+      trigger_type, status, attempts, enqueued_count, owner_id, lease_expires_at, started_at
+    ) VALUES (
+      'daily:2026-07-17:10', '2026-07-17', 10, '2026-07-17T02:00:00.000Z', 480,
+      'catch_up', 'running', 1, 0, 'owner-stale', '2026-07-17T02:00:30.000Z', '2026-07-17T02:00:00.000Z'
+    )
+  `).run();
+  const recoveredCalls = [];
+  createNotificationDigestScheduler({
+    db: staleDb,
+    outboxStore: { enqueue(event) { recoveredCalls.push(event); return { enqueued: true }; } },
+    config: config(),
+    feishuMode: 'live',
+    ownerId: 'owner-recovered',
+    now: () => new Date('2026-07-17T02:01:00.000Z'),
+    timerApi: { setTimeout() { return { id: 1 }; }, clearTimeout() {} },
+  }).start();
+  assert.equal(recoveredCalls.length, 3);
+  const recoveredSlot = staleDb.prepare('SELECT * FROM audit_notification_digest_slots').get();
+  assert.equal(recoveredSlot.status, 'enqueued');
+  assert.equal(recoveredSlot.attempts, 2);
+  staleDb.close();
+
+  const emptyDb = makeDb();
+  const emptyCalls = [];
+  const emptyOptions = {
+    db: emptyDb,
+    outboxStore: { enqueue(event) { emptyCalls.push(event); return { enqueued: true }; } },
+    config: config(),
+    feishuMode: 'live',
+    now: () => new Date('2026-07-17T02:00:00.000Z'),
+    timerApi: { setTimeout() { return { id: 1 }; }, clearTimeout() {} },
+  };
+  createNotificationDigestScheduler({ ...emptyOptions, ownerId: 'owner-empty-1' }).start();
+  createNotificationDigestScheduler({ ...emptyOptions, ownerId: 'owner-empty-2' }).start();
+  assert.equal(emptyCalls.length, 0);
+  const emptySlot = emptyDb.prepare('SELECT * FROM audit_notification_digest_slots').get();
+  assert.equal(emptySlot.status, 'empty');
+  assert.equal(emptySlot.attempts, 1);
+  emptyDb.close();
+});
+
+test('scheduler catches up at 10:01 but records skipped_late after the 30-minute window', () => {
+  const catchUpDb = makeDb();
+  insertSamples(catchUpDb);
+  const catchUpCalls = [];
+  const catchUp = createNotificationDigestScheduler({
+    db: catchUpDb,
+    outboxStore: { enqueue(event) { catchUpCalls.push(event); return { enqueued: true }; } },
+    config: config(),
+    feishuMode: 'live',
+    ownerId: 'owner-catch-up',
+    now: () => new Date('2026-07-17T02:01:00.000Z'),
+    timerApi: { setTimeout() { return { id: 1 }; }, clearTimeout() {} },
+  });
+  catchUp.start();
+  assert.equal(catchUpCalls.length, 3);
+  const catchUpSlot = catchUpDb.prepare('SELECT * FROM audit_notification_digest_slots').get();
+  assert.equal(catchUpSlot.status, 'enqueued');
+  assert.equal(catchUpSlot.trigger_type, 'catch_up');
+  catchUpDb.close();
+
+  const lateDb = makeDb();
+  insertSamples(lateDb);
+  const lateCalls = [];
+  const late = createNotificationDigestScheduler({
+    db: lateDb,
+    outboxStore: { enqueue(event) { lateCalls.push(event); return { enqueued: true }; } },
+    config: config(),
+    feishuMode: 'live',
+    ownerId: 'owner-late',
+    now: () => new Date('2026-07-17T02:31:00.001Z'),
+    timerApi: { setTimeout() { return { id: 1 }; }, clearTimeout() {} },
+  });
+  late.start();
+  assert.equal(lateCalls.length, 0);
+  assert.equal(lateDb.prepare('SELECT status FROM audit_notification_digest_slots').get().status, 'skipped_late');
+  lateDb.close();
+});
+
+test('scheduler retries a failed slot inside the catch-up window without a restart', async () => {
+  const db = makeDb();
+  insertSamples(db);
+  let current = new Date('2026-07-17T02:00:00.000Z');
+  let shouldFail = true;
+  const calls = [];
+  const timers = [];
+  const scheduler = createNotificationDigestScheduler({
+    db,
+    outboxStore: {
+      enqueue(event) {
+        if (shouldFail) {
+          shouldFail = false;
+          throw new Error('transient sqlite failure');
+        }
+        calls.push(event);
+        return { enqueued: true };
+      },
+    },
+    config: config(),
+    feishuMode: 'live',
+    ownerId: 'owner-retry',
+    now: () => current,
+    timerApi: {
+      setTimeout(callback, delayMs) {
+        const timer = { callback, delayMs };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout() {},
+    },
+  });
+
+  scheduler.start();
+  assert.equal(db.prepare('SELECT status FROM audit_notification_digest_slots').get().status, 'failed');
+  assert.equal(timers[0].delayMs, 2_000);
+
+  current = new Date('2026-07-17T02:00:02.000Z');
+  timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const slot = db.prepare('SELECT * FROM audit_notification_digest_slots').get();
+  assert.equal(slot.status, 'enqueued');
+  assert.equal(slot.attempts, 2);
+  assert.equal(calls.length, 3);
+  db.close();
+});
+
+test('scheduler retries when a previous process slot lease expires inside the catch-up window', async () => {
+  const db = makeDb();
+  insertSamples(db);
+  db.prepare(`
+    INSERT INTO audit_notification_digest_slots (
+      slot_key, report_date, slot_hour, scheduled_for, timezone_offset_minutes,
+      trigger_type, status, attempts, enqueued_count, owner_id, lease_expires_at, started_at
+    ) VALUES (
+      'daily:2026-07-17:10', '2026-07-17', 10, '2026-07-17T02:00:00.000Z', 480,
+      'scheduled', 'running', 1, 0, 'owner-crashed', '2026-07-17T02:05:00.000Z', '2026-07-17T02:00:00.000Z'
+    )
+  `).run();
+  let current = new Date('2026-07-17T02:01:00.000Z');
+  const timers = [];
+  const calls = [];
+  const scheduler = createNotificationDigestScheduler({
+    db,
+    outboxStore: { enqueue(event) { calls.push(event); return { enqueued: true }; } },
+    config: config(),
+    feishuMode: 'live',
+    ownerId: 'owner-after-crash',
+    now: () => current,
+    timerApi: {
+      setTimeout(callback, delayMs) {
+        const timer = { callback, delayMs };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout() {},
+    },
+  });
+
+  scheduler.start();
+  assert.equal(calls.length, 0);
+  assert.equal(timers[0].delayMs, 240_001);
+
+  current = new Date('2026-07-17T02:05:00.001Z');
+  timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const slot = db.prepare('SELECT * FROM audit_notification_digest_slots').get();
+  assert.equal(slot.status, 'enqueued');
+  assert.equal(slot.attempts, 2);
+  assert.equal(slot.trigger_type, 'catch_up');
+  assert.equal(calls.length, 3);
+  db.close();
+});
+
+test('two live schedulers sharing a database execute one slot only', () => {
+  const db = makeDb();
+  insertSamples(db);
+  const calls = [];
+  const options = {
+    db,
+    outboxStore: { enqueue(event) { calls.push(event); return { enqueued: true }; } },
+    config: config(),
+    feishuMode: 'live',
+    now: () => new Date('2026-07-17T02:01:00.000Z'),
+    timerApi: { setTimeout() { return { id: 1 }; }, clearTimeout() {} },
+  };
+  const first = createNotificationDigestScheduler({ ...options, ownerId: 'owner-1' });
+  const second = createNotificationDigestScheduler({ ...options, ownerId: 'owner-2' });
+
+  first.start();
+  second.start();
+
+  assert.equal(calls.length, 3);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM audit_notification_digest_slots').get().count, 1);
+  assert.equal(db.prepare('SELECT attempts FROM audit_notification_digest_slots').get().attempts, 1);
+  db.close();
+});
+
+test('two live schedulers on independent SQLite connections execute one slot only', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-digest-claim-'));
+  const dbPath = path.join(tmpDir, 'audit.db');
+  const firstDb = makeDb(dbPath);
+  const secondDb = makeDb(dbPath);
+  insertSamples(firstDb);
+  const calls = [];
+  const options = {
+    outboxStore: { enqueue(event) { calls.push(event); return { enqueued: true }; } },
+    config: config(),
+    feishuMode: 'live',
+    now: () => new Date('2026-07-17T02:01:00.000Z'),
+    timerApi: { setTimeout() { return { id: 1 }; }, clearTimeout() {} },
+  };
+
+  try {
+    createNotificationDigestScheduler({ ...options, db: firstDb, ownerId: 'owner-connection-1' }).start();
+    createNotificationDigestScheduler({ ...options, db: secondDb, ownerId: 'owner-connection-2' }).start();
+
+    assert.equal(calls.length, 3);
+    assert.equal(secondDb.prepare('SELECT COUNT(*) AS count FROM audit_notification_digest_slots').get().count, 1);
+    assert.equal(secondDb.prepare('SELECT attempts FROM audit_notification_digest_slots').get().attempts, 1);
+  } finally {
+    secondDb.close();
+    firstDb.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('scheduler does not report or flush success after losing the slot lease', () => {
+  const db = makeDb();
+  insertSamples(db);
+  const flushes = [];
+  let stolen = false;
+  const scheduler = createNotificationDigestScheduler({
+    db,
+    outboxStore: {
+      enqueue() {
+        if (!stolen) {
+          stolen = true;
+          db.prepare(`
+            UPDATE audit_notification_digest_slots
+            SET owner_id = 'owner-replacement', lease_expires_at = '2026-07-17T02:20:00.000Z'
+            WHERE slot_key = 'daily:2026-07-17:10'
+          `).run();
+        }
+        return { enqueued: true };
+      },
+    },
+    config: config(),
+    feishuMode: 'live',
+    ownerId: 'owner-original',
+    now: () => new Date('2026-07-17T02:01:00.000Z'),
+    onEnqueued(result) { flushes.push(result); },
+  });
+
+  const result = scheduler.reconcileDueSlot();
+
+  assert.equal(result.status, 'lost_lease');
+  assert.equal(result.processed, false);
+  assert.equal(flushes.length, 0);
+  assert.equal(db.prepare('SELECT status FROM audit_notification_digest_slots').get().status, 'running');
+  assert.equal(db.prepare('SELECT owner_id FROM audit_notification_digest_slots').get().owner_id, 'owner-replacement');
+  db.close();
+});
+
+test('scheduler reports lost lease when failure recording no longer owns the slot', () => {
+  const db = makeDb();
+  insertSamples(db);
+  let stolen = false;
+  const scheduler = createNotificationDigestScheduler({
+    db,
+    outboxStore: {
+      enqueue() {
+        if (!stolen) {
+          stolen = true;
+          db.prepare(`
+            UPDATE audit_notification_digest_slots
+            SET owner_id = 'owner-replacement', lease_expires_at = '2026-07-17T02:20:00.000Z'
+            WHERE slot_key = 'daily:2026-07-17:10'
+          `).run();
+        }
+        throw new Error('simulated enqueue failure');
+      },
+    },
+    config: config(),
+    feishuMode: 'live',
+    ownerId: 'owner-original',
+    now: () => new Date('2026-07-17T02:01:00.000Z'),
+  });
+
+  const result = scheduler.reconcileDueSlot();
+
+  assert.equal(result.status, 'lost_lease');
+  assert.equal(result.processed, false);
+  assert.match(result.error.message, /simulated enqueue failure/);
+  assert.equal(db.prepare('SELECT status FROM audit_notification_digest_slots').get().status, 'running');
+  assert.equal(db.prepare('SELECT owner_id FROM audit_notification_digest_slots').get().owner_id, 'owner-replacement');
+  db.close();
+});
+
+test('a delayed timer reconciles the latest 17:00 cumulative slot', async () => {
+  const db = makeDb();
+  insertSamples(db);
+  db.prepare(`
+    INSERT INTO audit_events (id, ts, agent_id, trace_id, tool_name, status)
+    VALUES (5, '2026-07-17T08:30:00.000Z', 'a1', 't1', 'read', 'OK')
+  `).run();
+  let current = new Date('2026-07-17T01:59:00.000Z');
+  const timers = [];
+  const calls = [];
+  const scheduler = createNotificationDigestScheduler({
+    db,
+    outboxStore: { enqueue(event) { calls.push(event); return { enqueued: true }; } },
+    config: config(),
+    feishuMode: 'live',
+    ownerId: 'owner-delayed',
+    now: () => current,
+    timerApi: {
+      setTimeout(callback, delayMs) {
+        const timer = { callback, delayMs };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout() {},
+    },
+  });
+
+  scheduler.start();
+  calls.length = 0;
+  current = new Date('2026-07-17T09:10:00.000Z');
+  timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.ok(calls.length > 0);
+  assert.ok(calls.every((call) => call.runId === 'daily_2026-07-17_17'));
+  assert.equal(
+    db.prepare(`SELECT status FROM audit_notification_digest_slots WHERE slot_key = 'daily:2026-07-17:17'`).get().status,
+    'enqueued',
+  );
+  db.close();
+});
+
+test('health status exposes safe scheduling state and no next run when inactive', () => {
+  const db = makeDb();
+  const scheduler = createNotificationDigestScheduler({
+    db,
+    outboxStore: { enqueue() {} },
+    config: config(),
+    feishuMode: 'live',
+    ownerId: 'owner-health',
+    now: () => new Date('2026-07-17T01:59:00.000Z'),
+    timerApi: { setTimeout() { return { id: 1 }; }, clearTimeout() {} },
+  });
+
+  assert.equal(scheduler.getHealthStatus().active, false);
+  assert.equal(scheduler.getHealthStatus().next_run_at_utc, null);
+  scheduler.start();
+  const health = scheduler.getHealthStatus();
+  assert.equal(health.active, true);
+  assert.equal(health.timezone, 'UTC+08:00');
+  assert.deepEqual(health.schedule_hours, [10, 17]);
+  assert.equal(health.catch_up_window_minutes, 30);
+  assert.equal(health.next_run_at_utc, '2026-07-17T02:00:00.000Z');
+  assert.equal(health.next_run_at_local, '2026-07-17T10:00:00.000+08:00');
   db.close();
 });

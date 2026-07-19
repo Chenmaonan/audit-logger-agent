@@ -53,6 +53,20 @@ test('outbox event is delivered to callback url and marked delivered', async () 
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+test('callback delivery times out instead of blocking the outbox lease indefinitely', async () => {
+  const callbackClient = createCallbackClient({
+    timeoutMs: 10,
+    fetchImpl: async (_url, { signal }) => new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    }),
+  });
+
+  await assert.rejects(
+    () => callbackClient.send('https://callback.invalid/events', { ok: true }),
+    /timed out/,
+  );
+});
+
 test('outbox optional dedupe key is idempotent while legacy enqueue remains compatible', () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-outbox-dedupe-'));
   const db = openDb(path.join(tmpDir, 'runtime.db'));
@@ -106,6 +120,10 @@ test('runtime schema migrates an existing outbox and adds dedupe uniqueness', ()
   ensureRuntimeSchema(db);
   const columns = db.prepare('PRAGMA table_info(agent_outbox_events)').all().map((column) => column.name);
   assert.ok(columns.includes('dedupe_key'));
+  assert.ok(columns.includes('priority'));
+  assert.ok(columns.includes('claim_owner'));
+  assert.ok(columns.includes('claim_token'));
+  assert.ok(columns.includes('claim_expires_at'));
 
   const outboxStore = createOutboxStore(db);
   const event = {
@@ -119,6 +137,230 @@ test('runtime schema migrates an existing outbox and adds dedupe uniqueness', ()
   const inserted = outboxStore.enqueue(event);
   assert.deepEqual(outboxStore.enqueue(event), { eventId: inserted.eventId, enqueued: false });
   assert.equal(outboxStore.listAll(10).length, 1);
+
+  db.close();
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('outbox claims higher-priority daily reports before older ordinary events', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-outbox-priority-'));
+  const db = openDb(path.join(tmpDir, 'runtime.db'));
+  ensureRuntimeSchema(db);
+  const outboxStore = createOutboxStore(db);
+
+  const ordinary = outboxStore.enqueue({
+    runId: 'run_ordinary',
+    type: 'audit_review_finding',
+    payload: { title: 'ordinary' },
+    deliveryMode: 'feishu_bot',
+    callbackUrl: null,
+  });
+  const daily = outboxStore.enqueue({
+    runId: 'run_daily',
+    type: 'audit_daily_trace_report',
+    payload: { title: 'daily' },
+    deliveryMode: 'feishu_bot',
+    callbackUrl: null,
+  });
+
+  const claimed = outboxStore.claimPending(1, {
+    ownerId: 'publisher-priority',
+    leaseMs: 60_000,
+    now: '2026-07-19T10:00:00.000Z',
+  });
+
+  assert.equal(claimed.length, 1);
+  assert.equal(claimed[0].event_id, daily.eventId);
+  assert.equal(claimed[0].priority, 100);
+  assert.equal(claimed[0].claim_owner, 'publisher-priority');
+  assert.notEqual(claimed[0].claim_token, null);
+  assert.deepEqual(
+    outboxStore.listPending(10, '2026-07-19T10:00:30.000Z').map((event) => event.event_id),
+    [ordinary.eventId],
+  );
+
+  db.close();
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('outbox recovers expired claims and rejects stale claim tokens for delivery and failure', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-outbox-lease-'));
+  const db = openDb(path.join(tmpDir, 'runtime.db'));
+  ensureRuntimeSchema(db);
+  const outboxStore = createOutboxStore(db);
+  const deliveredEvent = outboxStore.enqueue({
+    runId: 'run_claim_delivery',
+    type: 'audit_review_finding',
+    payload: { title: 'claim delivery' },
+    deliveryMode: 'feishu_bot',
+    callbackUrl: null,
+  });
+
+  const first = outboxStore.claimPending(1, {
+    ownerId: 'publisher-old',
+    leaseMs: 60_000,
+    now: '2026-07-19T10:00:00.000Z',
+  })[0];
+  assert.equal(outboxStore.markDelivered(deliveredEvent.eventId), false);
+  assert.equal(outboxStore.markFailed(deliveredEvent.eventId, new Error('missing token')), false);
+  assert.deepEqual(outboxStore.claimPending(1, {
+    ownerId: 'publisher-too-early',
+    leaseMs: 60_000,
+    now: '2026-07-19T10:00:59.000Z',
+  }), []);
+
+  const recovered = outboxStore.claimPending(1, {
+    ownerId: 'publisher-new',
+    leaseMs: 60_000,
+    now: '2026-07-19T10:01:01.000Z',
+  })[0];
+  assert.equal(recovered.event_id, deliveredEvent.eventId);
+  assert.notEqual(recovered.claim_token, first.claim_token);
+  assert.equal(outboxStore.markDelivered(deliveredEvent.eventId, first.claim_token), false);
+  assert.equal(outboxStore.markDelivered(deliveredEvent.eventId, recovered.claim_token), true);
+
+  const failedEvent = outboxStore.enqueue({
+    runId: 'run_claim_failure',
+    type: 'audit_review_finding',
+    payload: { title: 'claim failure' },
+    deliveryMode: 'feishu_bot',
+    callbackUrl: null,
+  });
+  const failedClaim = outboxStore.claimPending(1, {
+    ownerId: 'publisher-failure',
+    leaseMs: 60_000,
+    now: '2026-07-19T10:02:00.000Z',
+  })[0];
+  assert.equal(outboxStore.markFailed(failedEvent.eventId, new Error('stale'), 'claim_stale'), false);
+  assert.equal(outboxStore.markFailed(failedEvent.eventId, new Error('retry'), failedClaim.claim_token), true);
+
+  const deliveredRow = db.prepare('SELECT * FROM agent_outbox_events WHERE event_id = ?').get(deliveredEvent.eventId);
+  assert.equal(deliveredRow.delivery_status, 'delivered');
+  assert.equal(deliveredRow.delivery_attempts, 1);
+  assert.equal(deliveredRow.claim_token, null);
+  const failedRow = db.prepare('SELECT * FROM agent_outbox_events WHERE event_id = ?').get(failedEvent.eventId);
+  assert.equal(failedRow.delivery_status, 'pending');
+  assert.equal(failedRow.delivery_attempts, 1);
+  assert.equal(failedRow.claim_token, null);
+  assert.match(failedRow.last_error, /retry/);
+
+  db.close();
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('separate event publishers cannot send the same claimed outbox event concurrently', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-outbox-multi-publisher-'));
+  const dbPath = path.join(tmpDir, 'runtime.db');
+  const firstDb = openDb(dbPath);
+  ensureRuntimeSchema(firstDb);
+  const secondDb = openDb(dbPath);
+  const firstOutboxStore = createOutboxStore(firstDb);
+  const secondOutboxStore = createOutboxStore(secondDb);
+  firstOutboxStore.enqueue({
+    runId: 'run_multi_publisher',
+    type: 'progress_update',
+    payload: { title: 'once' },
+    deliveryMode: 'callback',
+    callbackUrl: 'https://callback.invalid/events',
+  });
+
+  let releaseSend;
+  let sendCalls = 0;
+  const callbackClient = {
+    async send() {
+      sendCalls += 1;
+      await new Promise((resolve) => { releaseSend = resolve; });
+    },
+  };
+  const firstPublisher = createEventPublisher({
+    outboxStore: firstOutboxStore,
+    callbackClient,
+    claimOwnerId: 'publisher-one',
+  });
+  const secondPublisher = createEventPublisher({
+    outboxStore: secondOutboxStore,
+    callbackClient,
+    claimOwnerId: 'publisher-two',
+  });
+
+  const firstFlush = firstPublisher.flushPending();
+  await new Promise((resolve) => setImmediate(resolve));
+  const secondFlush = secondPublisher.flushPending();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sendCalls, 1);
+  releaseSend();
+  await Promise.all([firstFlush, secondFlush]);
+  assert.equal(firstOutboxStore.listPending(10).length, 0);
+
+  firstDb.close();
+  secondDb.close();
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('publisher skips inactive Feishu claims without starving live callback delivery', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-outbox-mode-filter-'));
+  const db = openDb(path.join(tmpDir, 'runtime.db'));
+  ensureRuntimeSchema(db);
+  const outboxStore = createOutboxStore(db);
+  const feishuEvent = outboxStore.enqueue({
+    runId: 'run_feishu_disabled',
+    type: 'audit_daily_trace_report',
+    payload: { title: 'daily pending' },
+    deliveryMode: 'feishu_bot',
+    callbackUrl: null,
+  });
+  const callbackEvent = outboxStore.enqueue({
+    runId: 'run_callback_live',
+    type: 'progress_update',
+    payload: { title: 'callback live' },
+    deliveryMode: 'callback',
+    callbackUrl: 'https://callback.invalid/events',
+  });
+  const sent = [];
+  const publisher = createEventPublisher({
+    outboxStore,
+    callbackClient: { async send(_url, payload) { sent.push(payload); } },
+    feishuBotClient: { mode: 'dry-run', async send() { throw new Error('must not send'); } },
+    claimOwnerId: 'publisher-mode-filter',
+  });
+
+  await publisher.flushPending(20);
+
+  assert.deepEqual(sent, [{ title: 'callback live' }]);
+  const feishuRow = db.prepare('SELECT * FROM agent_outbox_events WHERE event_id = ?').get(feishuEvent.eventId);
+  const callbackRow = db.prepare('SELECT * FROM agent_outbox_events WHERE event_id = ?').get(callbackEvent.eventId);
+  assert.equal(feishuRow.delivery_status, 'pending');
+  assert.equal(feishuRow.claim_token, null);
+  assert.equal(callbackRow.delivery_status, 'delivered');
+
+  db.close();
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('publisher still fails claimed events whose delivery client is missing', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-outbox-missing-client-'));
+  const db = openDb(path.join(tmpDir, 'runtime.db'));
+  ensureRuntimeSchema(db);
+  const outboxStore = createOutboxStore(db);
+  const event = outboxStore.enqueue({
+    runId: 'run_missing_client',
+    type: 'unknown_delivery',
+    payload: { title: 'missing client' },
+    deliveryMode: 'unknown_mode',
+    callbackUrl: null,
+  });
+  const publisher = createEventPublisher({
+    outboxStore,
+    claimOwnerId: 'publisher-missing-client',
+  });
+
+  await publisher.flushPending(20);
+
+  const row = db.prepare('SELECT * FROM agent_outbox_events WHERE event_id = ?').get(event.eventId);
+  assert.equal(row.delivery_status, 'pending');
+  assert.equal(row.delivery_attempts, 1);
+  assert.equal(row.claim_token, null);
+  assert.match(row.last_error, /No delivery client configured/);
 
   db.close();
   fs.rmSync(tmpDir, { recursive: true, force: true });

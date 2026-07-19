@@ -44,6 +44,13 @@ import { createGracefulShutdown, listenHttpServer, resolveServerBindHost } from 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
 
+function isoAtOffset(date, offsetMinutes) {
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const absolute = Math.abs(offsetMinutes);
+  const offset = `${sign}${String(Math.floor(absolute / 60)).padStart(2, '0')}:${String(absolute % 60).padStart(2, '0')}`;
+  return `${new Date(date.getTime() + offsetMinutes * 60 * 1000).toISOString().replace(/Z$/, '')}${offset}`;
+}
+
 function installProcessFileLogging(paths) {
   const writeTargets = {
     log: paths.serverLogPath,
@@ -233,6 +240,7 @@ const notificationDigestScheduler = createNotificationDigestScheduler({
   config: runtimeConfig,
   feishuMode: feishuRuntimeConfig.mode,
   now: () => new Date(),
+  onEnqueued: () => eventPublisher.flushPending(20),
 });
 
 // v1.4: validate dashboard auth boot config (throws if non-loopback without token).
@@ -258,8 +266,21 @@ if (runtimeConfig.retention?.enabled !== false) {
 }
 
 notificationDigestScheduler.start();
-if (feishuRuntimeConfig.mode !== 'disabled' && runtimeConfig.auditReview?.notification?.mode === 'feishu_bot') {
-  console.log(`Feishu notification digest scheduler started in ${feishuRuntimeConfig.mode} mode.`);
+if (runtimeConfig.auditReview?.notification?.mode === 'feishu_bot') {
+  const loggedAt = new Date();
+  const digestHealth = notificationDigestScheduler.getHealthStatus();
+  console.log(`Feishu notification digest scheduler: ${JSON.stringify({
+    current_time_utc: loggedAt.toISOString(),
+    current_time_local: isoAtOffset(loggedAt, digestHealth.timezone_offset_minutes),
+    mode: digestHealth.feishu_mode,
+    active: digestHealth.active,
+    timezone: digestHealth.timezone,
+    schedule_hours: digestHealth.schedule_hours,
+    catch_up_window_minutes: digestHealth.catch_up_window_minutes,
+    next_run_at_utc: digestHealth.next_run_at_utc,
+    next_run_at_local: digestHealth.next_run_at_local,
+    startup_slot_status: digestHealth.last_slot?.status ?? null,
+  })}`);
 }
 
 const app = createHttpApp({
@@ -274,6 +295,7 @@ const app = createHttpApp({
   findingLifecycleService,
   toolSemanticMapper,
   retentionService,
+  notificationDigestScheduler,
 });
 const portIndex = process.argv.indexOf('--port');
 const portArg = portIndex >= 0 ? Number(process.argv[portIndex + 1]) : 9320;

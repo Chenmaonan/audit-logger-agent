@@ -114,6 +114,23 @@ CREATE TABLE IF NOT EXISTS audit_ingest_cursors (
   last_error TEXT,
   PRIMARY KEY (agent_id, file_path)
 );
+
+CREATE TABLE IF NOT EXISTS audit_notification_digest_slots (
+  slot_key TEXT PRIMARY KEY,
+  report_date TEXT NOT NULL,
+  slot_hour INTEGER NOT NULL,
+  scheduled_for TEXT NOT NULL,
+  timezone_offset_minutes INTEGER NOT NULL,
+  trigger_type TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  enqueued_count INTEGER NOT NULL DEFAULT 0,
+  owner_id TEXT,
+  lease_expires_at TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  last_error TEXT
+);
 `;
 
 export const REVIEW_INDEXES = `
@@ -137,6 +154,12 @@ ON audit_review_finding_occurrences(review_id, severity);
 
 CREATE INDEX IF NOT EXISTS idx_audit_finding_actions_finding_created
 ON audit_finding_actions(finding_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_audit_notification_digest_slots_scheduled
+ON audit_notification_digest_slots(scheduled_for DESC);
+
+CREATE INDEX IF NOT EXISTS idx_audit_notification_digest_slots_status_lease
+ON audit_notification_digest_slots(status, lease_expires_at);
 `;
 
 function tableColumns(db, tableName) {

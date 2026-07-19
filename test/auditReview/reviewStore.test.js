@@ -72,6 +72,12 @@ test('ensureReviewSchema migrates legacy finding and LLM usage tables', () => {
   assert.ok(findingColumns.includes('state_version'));
   const usageColumns = db.prepare(`PRAGMA table_info(audit_llm_usage)`).all().map((row) => row.name);
   assert.deepEqual(usageColumns, ['day', 'calls', 'est_tokens', 'updated_at']);
+  const digestSlotColumns = db.prepare(`PRAGMA table_info(audit_notification_digest_slots)`).all().map((row) => row.name);
+  assert.deepEqual(digestSlotColumns, [
+    'slot_key', 'report_date', 'slot_hour', 'scheduled_for', 'timezone_offset_minutes', 'trigger_type',
+    'status', 'attempts', 'enqueued_count', 'owner_id', 'lease_expires_at',
+    'started_at', 'completed_at', 'last_error',
+  ]);
   const occurrence = db.prepare(`SELECT * FROM audit_review_finding_occurrences`).get();
   assert.equal(occurrence.finding_id, 'fnd_legacy');
   assert.equal(occurrence.review_id, 'review_legacy');

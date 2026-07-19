@@ -58,7 +58,8 @@
       "dailyReport": {
         "enabled": true,
         "hours": [10, 17],
-        "timezoneOffsetMinutes": 480
+        "timezoneOffsetMinutes": 480,
+        "catchUpWindowMinutes": 30
       }
     },
     "http": {
