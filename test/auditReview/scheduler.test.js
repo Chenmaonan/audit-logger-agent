@@ -8,6 +8,7 @@ import { createReviewStore } from '../../src/auditReview/reviewStore.js';
 import { createLockStore } from '../../src/auditReview/lockStore.js';
 import { createIngestCursorStore } from '../../src/auditReview/ingestCursorStore.js';
 import { createCandidateDetector } from '../../src/auditReview/candidateDetector.js';
+import { createToolSemanticMapper } from '../../src/auditReview/toolSemanticMapper.js';
 import { createLlmReviewer } from '../../src/auditReview/llmReviewer.js';
 import { createReviewNotifier } from '../../src/auditReview/notification.js';
 import { createVisualization } from '../../src/auditReview/visualization.js';
@@ -363,6 +364,96 @@ test('scheduler.runOnce happy path: creates completed run, persists findings, re
   assert.ok(events.includes('review.start'), 'should log review.start');
   assert.ok(events.includes('review.completed'), 'should log review.completed');
   assert.ok(events.includes('review.ingest.completed'), 'should log review.ingest.completed');
+
+  db.close();
+});
+
+test('scheduler maps semantic tool type before detection and sends mapped high-risk candidate to reviewer', async () => {
+  const db = makeDb();
+  db.exec(`
+    ALTER TABLE audit_events ADD COLUMN mapped_tool_type TEXT;
+    ALTER TABLE audit_events ADD COLUMN mapping_status TEXT;
+    ALTER TABLE audit_events ADD COLUMN mapping_reason TEXT;
+    ALTER TABLE audit_events ADD COLUMN mapping_model TEXT;
+    ALTER TABLE audit_events ADD COLUMN mapping_version TEXT;
+    ALTER TABLE audit_events ADD COLUMN mapped_at TEXT;
+  `);
+  insertEvent(db, 1, {
+    ts: '2026-07-03T10:00:01.000Z',
+    tool_name: 'rental.priceApply',
+    status: 'OK',
+    event: 'tool.end',
+  });
+
+  let mappingCalls = 0;
+  const toolSemanticMapper = createToolSemanticMapper({
+    db,
+    llmClient: {
+      async createStructuredResponse() {
+        mappingCalls += 1;
+        return { tool_type: 'update', reason: 'Applies a new rental price' };
+      },
+    },
+    model: 'test-mapping-model',
+  });
+
+  let reviewerCandidates = null;
+  const reviewerLlmClient = {
+    async createStructuredResponse({ input }) {
+      const payload = JSON.parse(input.find((message) => message.role === 'user').content);
+      reviewerCandidates = payload.candidates;
+      const candidate = payload.candidates[0];
+      return {
+        type: 'audit_review',
+        review_id: payload.review_id,
+        window: payload.window,
+        summary: {
+          title: '审查发现 1 个高风险操作',
+          overview: 'rental.priceApply 被语义映射为 update。',
+          severity_counts: { critical: 0, high: 1, medium: 0, low: 0 },
+        },
+        findings: [{
+          category: candidate.category,
+          severity: 'high',
+          agent_id: candidate.agent_id,
+          tool_name: candidate.tool_name,
+          trace_id: candidate.trace_id,
+          entity: candidate.entity,
+          title: '租金修改操作需要审查',
+          summary: 'rental.priceApply 映射为 update 并命中高风险策略。',
+          recommendation: '核实修改权限和审批记录。',
+          evidence_event_ids: [candidate.event_id],
+          requires_action: true,
+        }],
+      };
+    },
+  };
+
+  const deps = buildRealDeps(db, { llmClient: reviewerLlmClient });
+  deps.detector = createCandidateDetector({
+    db,
+    riskPolicy: {
+      ...RISK_POLICY,
+      highRiskMappedToolTypes: ['update'],
+    },
+  });
+  const scheduler = createAuditReviewScheduler({
+    db,
+    ...deps,
+    toolSemanticMapper,
+    now: () => new Date('2026-07-03T10:30:00.000Z'),
+  });
+
+  const result = await scheduler.runOnce({ triggerType: 'scheduled' });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(mappingCalls, 1);
+  assert.equal(reviewerCandidates.length, 1);
+  assert.equal(reviewerCandidates[0].tool_name, 'rental.priceApply');
+  assert.equal(reviewerCandidates[0].mapped_tool_type, 'update');
+  assert.equal(reviewerCandidates[0].mapping_status, 'mapped');
+  assert.equal(reviewerCandidates[0].category, 'high_risk_permission');
+  assert.match(reviewerCandidates[0].reason, /mapped_tool_type=update/);
 
   db.close();
 });

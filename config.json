@@ -65,7 +65,7 @@
       "allowedOrigins": ["http://127.0.0.1:9320"]
     },
     "riskPolicy": {
-      "version": "risk-policy-v1",
+      "version": "risk-policy-v2",
       "repeatWindowMinutes": 10,
       "repeatThreshold": 5,
       "slowCallDurationMs": 30000,
@@ -79,6 +79,15 @@
         "*credential*",
         "shell.*",
         "browser.runScript"
+      ],
+      "highRiskMappedToolTypes": [
+        "write",
+        "update",
+        "delete",
+        "deploy",
+        "permission",
+        "credential",
+        "shell"
       ],
       "agentToolAllowlists": {
         "rental-price-agent": [],
