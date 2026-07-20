@@ -1,6 +1,5 @@
 import crypto from 'crypto';
 import { buildDailyReportPayloads } from './feishuCards.js';
-import { agentDisplayName } from './evidence.js';
 
 const DEFAULT_HOURS = [10, 17];
 const DEFAULT_TIMEZONE_OFFSET_MINUTES = 480;
@@ -134,10 +133,6 @@ export function dailyReportWindow(now = new Date(), timezoneOffsetMinutes = DEFA
   };
 }
 
-function groupKey(agentId, traceId) {
-  return JSON.stringify([agentId ?? null, traceId ?? null]);
-}
-
 function dailyDashboardUrl(config) {
   const visualization = config?.auditReview?.visualization ?? {};
   const baseUrl = typeof visualization.baseUrl === 'string' ? visualization.baseUrl.trim() : '';
@@ -148,48 +143,43 @@ function dailyDashboardUrl(config) {
   return `${baseUrl.replace(/\/$/, '')}/${dashboardPath.replace(/^\//, '')}`;
 }
 
-function loadDailyGroups(db, { from, to }) {
-  const groupRows = db.prepare(`
+function loadDailySummary(db, { from, to }) {
+  const summary = db.prepare(`
     SELECT
-      agent_id,
-      trace_id,
       COUNT(*) AS event_count,
       SUM(CASE WHEN status <> 'OK' THEN 1 ELSE 0 END) AS error_count,
+      COUNT(DISTINCT CASE WHEN agent_id IS NOT NULL AND agent_id <> '' THEN agent_id END) AS agent_count,
+      COUNT(DISTINCT CASE
+        WHEN agent_id IS NOT NULL AND agent_id <> '' AND trace_id IS NOT NULL AND trace_id <> ''
+        THEN agent_id || char(31) || trace_id
+      END) AS trace_count,
       COUNT(DISTINCT tool_name) AS tool_count,
       MIN(ts) AS first_event_at,
       MAX(ts) AS last_event_at
     FROM audit_events
     WHERE ts >= @from AND ts <= @to
-      AND agent_id IS NOT NULL AND agent_id <> ''
-      AND trace_id IS NOT NULL AND trace_id <> ''
-    GROUP BY agent_id, trace_id
-    ORDER BY agent_id ASC, trace_id ASC
-  `).all({ from, to });
-
-  const groups = new Map(groupRows.map((row) => [groupKey(row.agent_id, row.trace_id), {
-    ...row,
-    tools: [],
-    findings: [],
-  }]));
-  if (groups.size === 0) return [];
+  `).get({ from, to });
 
   const tools = db.prepare(`
     SELECT
-      agent_id,
-      trace_id,
       tool_name,
       COUNT(*) AS total,
       SUM(CASE WHEN status <> 'OK' THEN 1 ELSE 0 END) AS error_count
     FROM audit_events
     WHERE ts >= @from AND ts <= @to
-      AND agent_id IS NOT NULL AND agent_id <> ''
-      AND trace_id IS NOT NULL AND trace_id <> ''
-    GROUP BY agent_id, trace_id, tool_name
-    ORDER BY agent_id ASC, trace_id ASC, error_count DESC, total DESC, tool_name ASC
+    GROUP BY tool_name
+    ORDER BY error_count DESC, total DESC, tool_name ASC
+    LIMIT 5
   `).all({ from, to });
-  for (const tool of tools) {
-    groups.get(groupKey(tool.agent_id, tool.trace_id))?.tools.push(tool);
-  }
+
+  const riskStats = db.prepare(`
+    SELECT
+      COUNT(*) AS high_risk_count,
+      SUM(CASE WHEN occurrences.severity = 'critical' THEN 1 ELSE 0 END) AS critical_count
+    FROM audit_review_finding_occurrences occurrences
+    WHERE occurrences.observed_at >= @from AND occurrences.observed_at <= @to
+      AND occurrences.severity IN ('high', 'critical')
+  `).get({ from, to });
 
   const findings = db.prepare(`
     SELECT
@@ -203,13 +193,26 @@ function loadDailyGroups(db, { from, to }) {
     INNER JOIN audit_review_findings findings ON findings.finding_id = occurrences.finding_id
     WHERE occurrences.observed_at >= @from AND occurrences.observed_at <= @to
       AND occurrences.severity IN ('high', 'critical')
-    ORDER BY occurrences.observed_at DESC
+    ORDER BY
+      CASE occurrences.severity WHEN 'critical' THEN 2 ELSE 1 END DESC,
+      occurrences.observed_at DESC
+    LIMIT 3
   `).all({ from, to });
-  for (const finding of findings) {
-    groups.get(groupKey(finding.agent_id, finding.trace_id))?.findings.push(finding);
-  }
 
-  return [...groups.values()];
+  return {
+    scope: 'global',
+    event_count: Number(summary?.event_count) || 0,
+    error_count: Number(summary?.error_count) || 0,
+    agent_count: Number(summary?.agent_count) || 0,
+    trace_count: Number(summary?.trace_count) || 0,
+    tool_count: Number(summary?.tool_count) || 0,
+    high_risk_count: Number(riskStats?.high_risk_count) || 0,
+    critical_count: Number(riskStats?.critical_count) || 0,
+    first_event_at: summary?.first_event_at ?? null,
+    last_event_at: summary?.last_event_at ?? null,
+    tools,
+    findings,
+  };
 }
 
 function dedupeKey(values) {
@@ -255,9 +258,6 @@ export function createNotificationDigestScheduler({
   const catchUpWindowMinutes = normalizedCatchUpWindow(daily.catchUpWindowMinutes);
   const cardConfig = notification.card ?? {};
   const maxAttempts = notification.maxAttempts;
-  const agentsConfig = config?.agents
-    ? config
-    : (config?.auditReview?.agents ? { agents: config.auditReview.agents } : config);
   const dashboardUrl = dailyDashboardUrl(config);
   let started = false;
   let timer = null;
@@ -408,30 +408,28 @@ export function createNotificationDigestScheduler({
     if (!enabled) return { enqueued: false, reason: 'disabled', groups: [] };
     if (feishuMode === 'disabled') return { enqueued: false, reason: 'disabled', groups: [] };
     const window = dailyReportWindow(scheduledFor, timezoneOffsetMinutes);
-    const groups = loadDailyGroups(db, window).map((group) => {
-      const criticalCount = group.findings.filter((finding) => finding.severity === 'critical').length;
-      const highRiskCount = group.findings.length;
-      return {
-        ...group,
-        agent_name: agentDisplayName(group.agent_id, agentsConfig),
-        high_risk_count: highRiskCount,
-        critical_count: criticalCount,
-        highest_severity: criticalCount > 0 ? 'critical' : highRiskCount > 0 ? 'high' : 'none',
-      };
-    });
-    const rendered = groups.map((group) => ({
+    const summary = loadDailySummary(db, window);
+    const group = {
+      ...summary,
+      highest_severity: summary.critical_count > 0 ? 'critical' : summary.high_risk_count > 0 ? 'high' : 'none',
+    };
+    const payloads = buildDailyReportPayloads({
+      date: window.date,
+      generatedAt: scheduledFor.toISOString(),
+      window: { from: window.from, to: window.to },
+      timezoneOffsetMinutes,
       group,
-      payloads: buildDailyReportPayloads({
-        date: window.date,
-        generatedAt: scheduledFor.toISOString(),
-        window: { from: window.from, to: window.to },
-        timezoneOffsetMinutes,
-        group,
-        dashboardUrl,
-        maxPayloadBytes: cardConfig.maxPayloadBytes,
-        foldThresholdChars: cardConfig.foldThresholdChars,
-      }),
-    }));
+      dashboardUrl,
+      maxPayloadBytes: cardConfig.maxPayloadBytes,
+      foldThresholdChars: cardConfig.foldThresholdChars,
+    });
+    if (payloads.length !== 1) {
+      throw new Error(`Daily report must render exactly one payload, received ${payloads.length}`);
+    }
+    const rendered = [{
+      group,
+      payloads,
+    }];
     if (feishuMode === 'dry-run') {
       return {
         enqueued: false,
@@ -446,7 +444,7 @@ export function createNotificationDigestScheduler({
     let enqueuedCount = 0;
     let payloadCount = 0;
     for (const item of rendered) {
-      item.payloads.forEach((payload, index) => {
+      item.payloads.forEach((payload) => {
         payloadCount += 1;
         const result = outboxStore.enqueue({
           runId: `daily_${window.date}_${window.slotHour}`,
@@ -456,13 +454,7 @@ export function createNotificationDigestScheduler({
           priority: DAILY_REPORT_PRIORITY,
           callbackUrl: null,
           maxAttempts,
-          dedupeKey: dedupeKey([
-            window.date,
-            window.slotHour,
-            item.group.agent_id,
-            item.group.trace_id,
-            index,
-          ]),
+          dedupeKey: dedupeKey([window.date, window.slotHour]),
         });
         if (result?.enqueued !== false) enqueuedCount += 1;
       });
@@ -660,5 +652,5 @@ export function createNotificationDigestScheduler({
 export {
   DAILY_REPORT_PRIORITY,
   DEFAULT_CATCH_UP_WINDOW_MINUTES,
-  loadDailyGroups,
+  loadDailySummary,
 };

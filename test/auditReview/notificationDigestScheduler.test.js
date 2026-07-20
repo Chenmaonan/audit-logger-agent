@@ -158,7 +158,7 @@ test('scheduler rejects invalid runtime schedule configuration', () => {
   db.close();
 });
 
-test('dry-run renders one isolated daily card group per agent_id and trace_id without outbox writes', () => {
+test('dry-run renders one global daily card across agents and traces without outbox writes', () => {
   const db = makeDb();
   insertSamples(db);
   const calls = [];
@@ -172,36 +172,26 @@ test('dry-run renders one isolated daily card group per agent_id and trace_id wi
   const result = scheduler.runNow({ scheduledFor: new Date('2026-07-17T02:00:00.000Z') });
 
   assert.equal(result.reason, 'dry_run');
-  assert.equal(result.groups.length, 3);
+  assert.equal(result.groups.length, 1);
+  assert.equal(result.payloadCount, 1);
   assert.equal(calls.length, 0);
-  const identities = result.groups.map(({ group }) => `${group.agent_id}/${group.trace_id}`).sort();
-  assert.deepEqual(identities, ['a1/t1', 'a1/t2', 'a2/t1']);
-  const primary = result.groups.find(({ group }) => group.agent_id === 'a1' && group.trace_id === 't1').group;
-  assert.equal(primary.agent_name, '审计 Agent A1');
-  assert.equal(primary.high_risk_count, 1);
-  assert.equal(primary.critical_count, 0);
-  assert.equal(primary.highest_severity, 'high');
-  assert.deepEqual(primary.tools.map((tool) => tool.tool_name), ['write', 'read']);
-  const noRisk = result.groups.find(({ group }) => group.agent_id === 'a1' && group.trace_id === 't2').group;
-  assert.equal(noRisk.high_risk_count, 0);
-  assert.equal(noRisk.highest_severity, 'none');
-  assert.equal(noRisk.agent_name, '审计 Agent A1');
-  const critical = result.groups.find(({ group }) => group.agent_id === 'a2' && group.trace_id === 't1').group;
-  assert.equal(critical.high_risk_count, 1);
-  assert.equal(critical.critical_count, 1);
-  assert.equal(critical.highest_severity, 'critical');
-  const primaryPayload = JSON.stringify(
-    result.groups.find(({ group }) => group.agent_id === 'a1' && group.trace_id === 't1').payloads,
-  );
-  assert.match(primaryPayload, /审计 Agent A1/);
-  assert.match(primaryPayload, /统计范围/);
-  assert.match(primaryPayload, /北京时间/);
-  assert.match(primaryPayload, /audit\.example\.com\/dashboard/);
-  for (const item of result.groups) {
-    const serialized = JSON.stringify(item.payloads);
-    assert.match(serialized, new RegExp(item.group.agent_id));
-    assert.match(serialized, new RegExp(item.group.trace_id));
-  }
+  const [{ group, payloads }] = result.groups;
+  assert.equal(group.scope, 'global');
+  assert.equal(group.event_count, 4);
+  assert.equal(group.error_count, 1);
+  assert.equal(group.tool_count, 3);
+  assert.equal(group.agent_count, 2);
+  assert.equal(group.trace_count, 3);
+  assert.equal(group.high_risk_count, 2);
+  assert.equal(group.critical_count, 1);
+  assert.equal(group.highest_severity, 'critical');
+  assert.equal(group.findings.length, 2);
+  assert.deepEqual(group.tools.map((tool) => tool.tool_name), ['write', 'read', 'deploy']);
+  assert.equal(payloads.length, 1);
+  const serialized = JSON.stringify(payloads);
+  assert.match(serialized, /统计范围/);
+  assert.match(serialized, /北京时间/);
+  assert.match(serialized, /audit\.example\.com\/dashboard/);
   db.close();
 });
 
@@ -224,11 +214,12 @@ test('live daily run enqueues feishu_bot payloads with no callback URL and stabl
   const result = scheduler.runNow({ scheduledFor: new Date('2026-07-17T09:00:00.000Z') });
 
   assert.equal(result.enqueued, true);
-  assert.equal(calls.length, 3);
+  assert.equal(result.enqueuedCount, 1);
+  assert.equal(result.payloadCount, 1);
+  assert.equal(calls.length, 1);
   assert.ok(calls.every((call) => call.deliveryMode === 'feishu_bot'));
   assert.ok(calls.every((call) => call.callbackUrl === null));
-  assert.equal(new Set(calls.map((call) => call.dedupeKey)).size, 3);
-  const firstKeys = calls.map((call) => call.dedupeKey);
+  const firstKey = calls[0].dedupeKey;
 
   const renamedCalls = [];
   const renamedConfig = config();
@@ -244,7 +235,23 @@ test('live daily run enqueues feishu_bot payloads with no callback URL and stabl
     config: renamedConfig,
     feishuMode: 'live',
   }).runNow({ scheduledFor: new Date('2026-07-17T09:00:00.000Z') });
-  assert.deepEqual(renamedCalls.map((call) => call.dedupeKey), firstKeys);
+  assert.equal(renamedCalls.length, 1);
+  assert.equal(renamedCalls[0].dedupeKey, firstKey);
+
+  const morningCalls = [];
+  createNotificationDigestScheduler({
+    db,
+    outboxStore: {
+      enqueue(event) {
+        morningCalls.push(event);
+        return { enqueued: true };
+      },
+    },
+    config: config(),
+    feishuMode: 'live',
+  }).runNow({ scheduledFor: new Date('2026-07-17T02:00:00.000Z') });
+  assert.equal(morningCalls.length, 1);
+  assert.notEqual(morningCalls[0].dedupeKey, firstKey);
   db.close();
 });
 
@@ -296,7 +303,7 @@ test('scheduler start executes the exact 10:00 live slot and immediately request
   scheduler.start();
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 1);
   assert.deepEqual(flushes, ['enqueued']);
   assert.ok(calls.every((call) => call.runId === 'daily_2026-07-17_10'));
   assert.ok(calls.every((call) => call.priority === 100));
@@ -307,7 +314,7 @@ test('scheduler start executes the exact 10:00 live slot and immediately request
   db.close();
 });
 
-test('scheduler reclaims an expired slot lease and does not rerun a completed empty slot', () => {
+test('scheduler reclaims an expired slot lease and sends one zero-data overview only once', () => {
   const staleDb = makeDb();
   insertSamples(staleDb);
   staleDb.prepare(`
@@ -329,7 +336,7 @@ test('scheduler reclaims an expired slot lease and does not rerun a completed em
     now: () => new Date('2026-07-17T02:01:00.000Z'),
     timerApi: { setTimeout() { return { id: 1 }; }, clearTimeout() {} },
   }).start();
-  assert.equal(recoveredCalls.length, 3);
+  assert.equal(recoveredCalls.length, 1);
   const recoveredSlot = staleDb.prepare('SELECT * FROM audit_notification_digest_slots').get();
   assert.equal(recoveredSlot.status, 'enqueued');
   assert.equal(recoveredSlot.attempts, 2);
@@ -345,11 +352,39 @@ test('scheduler reclaims an expired slot lease and does not rerun a completed em
     now: () => new Date('2026-07-17T02:00:00.000Z'),
     timerApi: { setTimeout() { return { id: 1 }; }, clearTimeout() {} },
   };
-  createNotificationDigestScheduler({ ...emptyOptions, ownerId: 'owner-empty-1' }).start();
+  const emptyResult = createNotificationDigestScheduler({
+    ...emptyOptions,
+    ownerId: 'owner-empty-1',
+  }).reconcileDueSlot();
   createNotificationDigestScheduler({ ...emptyOptions, ownerId: 'owner-empty-2' }).start();
-  assert.equal(emptyCalls.length, 0);
+  assert.equal(emptyResult.status, 'enqueued');
+  assert.equal(emptyResult.result.groups.length, 1);
+  assert.equal(emptyResult.result.enqueuedCount, 1);
+  assert.equal(emptyResult.result.payloadCount, 1);
+  assert.deepEqual(
+    {
+      event_count: emptyResult.result.groups[0].group.event_count,
+      error_count: emptyResult.result.groups[0].group.error_count,
+      agent_count: emptyResult.result.groups[0].group.agent_count,
+      trace_count: emptyResult.result.groups[0].group.trace_count,
+      tool_count: emptyResult.result.groups[0].group.tool_count,
+      high_risk_count: emptyResult.result.groups[0].group.high_risk_count,
+    },
+    {
+      event_count: 0,
+      error_count: 0,
+      agent_count: 0,
+      trace_count: 0,
+      tool_count: 0,
+      high_risk_count: 0,
+    },
+  );
+  assert.equal(emptyCalls.length, 1);
+  assert.equal(emptyCalls[0].runId, 'daily_2026-07-17_10');
+  assert.match(JSON.stringify(emptyCalls[0].payload), /0/);
   const emptySlot = emptyDb.prepare('SELECT * FROM audit_notification_digest_slots').get();
-  assert.equal(emptySlot.status, 'empty');
+  assert.equal(emptySlot.status, 'enqueued');
+  assert.equal(emptySlot.enqueued_count, 1);
   assert.equal(emptySlot.attempts, 1);
   emptyDb.close();
 });
@@ -368,7 +403,7 @@ test('scheduler catches up at 10:01 but records skipped_late after the 30-minute
     timerApi: { setTimeout() { return { id: 1 }; }, clearTimeout() {} },
   });
   catchUp.start();
-  assert.equal(catchUpCalls.length, 3);
+  assert.equal(catchUpCalls.length, 1);
   const catchUpSlot = catchUpDb.prepare('SELECT * FROM audit_notification_digest_slots').get();
   assert.equal(catchUpSlot.status, 'enqueued');
   assert.equal(catchUpSlot.trigger_type, 'catch_up');
@@ -436,7 +471,7 @@ test('scheduler retries a failed slot inside the catch-up window without a resta
   const slot = db.prepare('SELECT * FROM audit_notification_digest_slots').get();
   assert.equal(slot.status, 'enqueued');
   assert.equal(slot.attempts, 2);
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 1);
   db.close();
 });
 
@@ -484,7 +519,7 @@ test('scheduler retries when a previous process slot lease expires inside the ca
   assert.equal(slot.status, 'enqueued');
   assert.equal(slot.attempts, 2);
   assert.equal(slot.trigger_type, 'catch_up');
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 1);
   db.close();
 });
 
@@ -506,7 +541,7 @@ test('two live schedulers sharing a database execute one slot only', () => {
   first.start();
   second.start();
 
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM audit_notification_digest_slots').get().count, 1);
   assert.equal(db.prepare('SELECT attempts FROM audit_notification_digest_slots').get().attempts, 1);
   db.close();
@@ -531,7 +566,7 @@ test('two live schedulers on independent SQLite connections execute one slot onl
     createNotificationDigestScheduler({ ...options, db: firstDb, ownerId: 'owner-connection-1' }).start();
     createNotificationDigestScheduler({ ...options, db: secondDb, ownerId: 'owner-connection-2' }).start();
 
-    assert.equal(calls.length, 3);
+    assert.equal(calls.length, 1);
     assert.equal(secondDb.prepare('SELECT COUNT(*) AS count FROM audit_notification_digest_slots').get().count, 1);
     assert.equal(secondDb.prepare('SELECT attempts FROM audit_notification_digest_slots').get().attempts, 1);
   } finally {
@@ -646,7 +681,7 @@ test('a delayed timer reconciles the latest 17:00 cumulative slot', async () => 
   timers[0].callback();
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.ok(calls.length > 0);
+  assert.equal(calls.length, 1);
   assert.ok(calls.every((call) => call.runId === 'daily_2026-07-17_17'));
   assert.equal(
     db.prepare(`SELECT status FROM audit_notification_digest_slots WHERE slot_key = 'daily:2026-07-17:17'`).get().status,

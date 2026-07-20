@@ -463,90 +463,102 @@ export function buildDailyReportPayloads({
   group,
   dashboardUrl,
   maxPayloadBytes = DEFAULT_MAX_PAYLOAD_BYTES,
-  foldThresholdChars = DEFAULT_FOLD_THRESHOLD_CHARS,
+  foldThresholdChars: _foldThresholdChars = DEFAULT_FOLD_THRESHOLD_CHARS,
 } = {}) {
   if (!group) return [];
   const findings = sortedFindings(group.findings);
-  const findingDetailEntries = findingEntries(findings);
-  const toolDetailEntries = toolEntries(group.tools);
-  const entries = [...findingDetailEntries, ...toolDetailEntries];
   const byteLimit = normalizedLimit(maxPayloadBytes, DEFAULT_MAX_PAYLOAD_BYTES);
-  const detailChars = entries.reduce((sum, entry) => sum + entry.title.length + entry.summary.length, 0);
-  const compactDetails = detailChars <= Number(foldThresholdChars || DEFAULT_FOLD_THRESHOLD_CHARS);
-  const criticalCount = findings.filter((finding) => finding.severity === 'critical').length;
-  const agentLabel = displayAgentName(group.agent_name, group.agent_id);
-  const traceLabel = displayTraceName(group.trace_name, group.trace_id);
+  const highRiskCount = Math.max(Number(group.high_risk_count) || 0, findings.length);
+  const criticalCount = Math.max(
+    Number(group.critical_count) || 0,
+    findings.filter((finding) => finding.severity === 'critical').length,
+  );
+  const eventCount = Number(group.event_count) || 0;
+  const errorCount = Number(group.error_count) || 0;
+  const agentCount = Number(group.agent_count) || 0;
+  const traceCount = Number(group.trace_count) || 0;
+  const toolCount = Number(group.tool_count) || 0;
+  const topFindings = findings.slice(0, 3);
+  const topTools = toolEntries(group.tools).slice(0, 5);
   const conclusion = criticalCount > 0
-    ? '存在严重风险，需要查看影响范围。'
-    : findings.length > 0
-      ? '存在高风险，建议关注相关业务链路。'
-      : '今日未发现高风险，整体运行正常。';
-  const makePayload = (chunk, part, totalParts) => {
-    const partLabel = totalParts > 1 ? `（${part}/${totalParts}）` : '';
-    const chunkFindings = chunk.filter((entry) => entry.kind === 'finding');
-    const chunkTools = chunk.filter((entry) => entry.kind === 'tool');
-    const elements = [
-      {
-        tag: 'markdown',
-        content: `**总体判断**\n${conclusion}`,
-      },
-      metricElement([
-        { label: '事件数', value: String(Number(group.event_count) || 0) },
-        { label: '异常事件数', value: String(Number(group.error_count) || 0) },
-        { label: '涉及工具数', value: String(Number(group.tool_count) || 0) },
-        { label: '高风险发现数', value: String(findings.length) },
-      ]),
-      ...(findings.length > 0 ? [{
-        tag: 'markdown',
-        content: [
-          '**Top 风险**',
-          ...findings.slice(0, 3).map((finding) => (
-            `- ${severityLabelMarkdown(finding.severity)}${sanitizeBusinessText(
-              finding.title || finding.tool_name || finding.category || '未命名风险',
-            )}`
-          )),
-        ].join('\n'),
-      }] : []),
-      ...(chunkFindings.length > 0 ? detailElement(chunkFindings, {
-        title: '高风险名称与摘要',
-        itemCount: findings.length,
-        compact: compactDetails,
-      }) : []),
-      ...(chunkTools.length > 0 ? detailElement(chunkTools, {
-        title: '工具调用统计',
-        itemCount: toolDetailEntries.length,
-        compact: compactDetails,
-      }) : []),
-      metadataElement([
-        `统计范围：${formatBeijingRange(window?.from, window?.to ?? generatedAt, { prefix: '' })} · 北京时间`,
-        `统计日期：${sanitizeFeishuText(date || '未知')}`,
-        identityMarkdown({
-          agentId: group.agent_id,
-          traceId: group.trace_id,
-          agentName: group.agent_name,
-          traceName: group.trace_name,
+    ? `存在 ${highRiskCount} 条高风险，其中 ${criticalCount} 条严重，需要查看影响范围。`
+    : highRiskCount > 0
+      ? `存在 ${highRiskCount} 条高风险，建议关注相关业务链路。`
+      : errorCount > 0
+        ? `存在 ${errorCount} 条异常事件，暂未形成高风险发现，建议查看详情。`
+        : eventCount > 0
+          ? '今日未发现异常或高风险，整体运行正常。'
+          : '统计窗口内暂无审计事件。';
+  const generated = beijingParts(window?.to ?? generatedAt);
+  const slotLabel = generated ? `${generated.hour}:${generated.minute}` : '定时时段';
+  const elements = [
+    {
+      tag: 'markdown',
+      content: `**总体判断**\n${conclusion}`,
+    },
+    metricElement([
+      { label: '事件数', value: String(eventCount) },
+      { label: '异常事件数', value: String(errorCount) },
+      { label: '高风险发现数', value: String(highRiskCount) },
+      { label: '严重风险数', value: String(criticalCount) },
+    ]),
+    {
+      tag: 'markdown',
+      content: `**覆盖范围**\n覆盖 ${agentCount} 个 Agent · ${traceCount} 条 Trace · ${toolCount} 类工具`,
+    },
+    ...(topFindings.length > 0 ? [{
+      tag: 'markdown',
+      content: [
+        `**Top 风险（展示 ${topFindings.length}/${highRiskCount}）**`,
+        ...topFindings.map((finding, index) => {
+          const title = sanitizeBusinessText(
+            finding.title || finding.tool_name || finding.category || '未命名风险',
+          );
+          return [
+            `${index + 1}. ${severityLabelMarkdown(finding.severity)}${truncateText(title, 72)}`,
+            `Agent：${shortenIdentity(finding.agent_id)} · Trace：${shortenIdentity(finding.trace_id)}`,
+            truncateText(finding.summary, 100),
+          ].join('\n');
         }),
-      ].join('\n')),
-    ];
-    const detailUrl = safeHttpUrl(dashboardUrl);
-    if (detailUrl) {
-      elements.push({
-        tag: 'button',
-        text: { tag: 'plain_text', content: '查看完整日报' },
-        type: 'primary',
-        width: 'default',
-        behaviors: [{ type: 'open_url', default_url: detailUrl }],
-      });
-    }
-    return baseCard({
-      title: `审计信息日报${partLabel}`,
-      subtitle: `${agentLabel} · ${traceLabel}`,
-      template: 'blue',
-      preview: `审计日报：${agentLabel} · ${traceLabel}`,
-      elements,
+      ].join('\n\n'),
+    }] : []),
+    ...(topTools.length > 0 ? [{
+      tag: 'markdown',
+      content: [
+        `**Top 工具（展示 ${topTools.length}/${toolCount}）**`,
+        ...topTools.map((tool, index) => `${index + 1}. ${truncateText(tool.title, 72)}：${tool.summary}`),
+      ].join('\n'),
+    }] : []),
+    metadataElement([
+      `统计范围：${formatBeijingRange(window?.from, window?.to ?? generatedAt, { prefix: '' })} · 北京时间`,
+      `统计日期：${sanitizeFeishuText(date || '未知')}`,
+      '报告范围：全部 Agent 与业务链路',
+    ].join('\n')),
+  ];
+  const detailUrl = safeHttpUrl(dashboardUrl);
+  if (detailUrl) {
+    elements.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: '查看完整日报' },
+      type: 'primary',
+      width: 'default',
+      behaviors: [{ type: 'open_url', default_url: detailUrl }],
     });
-  };
-  return packEntries(entries, makePayload, byteLimit);
+  }
+  const payload = baseCard({
+    title: '审计信息日报',
+    subtitle: `全局汇总 · ${slotLabel}`,
+    template: 'blue',
+    preview: '审计日报：全局汇总',
+    elements,
+  });
+  if (utf8Bytes(payload) > byteLimit) {
+    throw new Error('Feishu daily report exceeds configured payload byte limit');
+  }
+  if (taggedComponentCount(payload.card) > MAX_CARD_TAGGED_COMPONENTS) {
+    throw new Error('Feishu daily report exceeds safe component count');
+  }
+  return [payload];
 }
 
 export function feishuPayloadBytes(payload) {

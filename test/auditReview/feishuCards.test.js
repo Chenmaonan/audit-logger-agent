@@ -232,86 +232,138 @@ test('sanitization neutralizes Feishu mention and link markup from untrusted log
   assert.match(sanitized, /＜at id=all＞/);
 });
 
-test('daily report card keeps one group identity and folds detailed tool/risk rows', () => {
+function countTaggedComponents(value) {
+  if (!value || typeof value !== 'object') return 0;
+  const current = typeof value.tag === 'string' ? 1 : 0;
+  if (Array.isArray(value)) {
+    return current + value.reduce((sum, item) => sum + countTaggedComponents(item), 0);
+  }
+  return current + Object.values(value)
+    .reduce((sum, item) => sum + countTaggedComponents(item), 0);
+}
+
+test('daily report produces one global management overview across agents and traces', () => {
   const payloads = buildDailyReportPayloads({
     date: '2026-07-17',
     generatedAt: '2026-07-17T02:00:00.000Z',
+    window: { from: '2026-07-16T16:00:00.000Z', to: '2026-07-17T02:00:00.000Z' },
+    dashboardUrl: 'https://example.com/dashboard',
     group: {
-      agent_id: 'agent-daily',
-      trace_id: 'trace-daily',
-      event_count: 12,
-      error_count: 2,
-      tool_count: 2,
+      scope: 'global',
+      event_count: 42,
+      error_count: 3,
+      tool_count: 7,
+      agent_count: 3,
+      trace_count: 5,
       tools: [
-        { tool_name: 'db.read', total: 8, error_count: 0 },
-        { tool_name: 'db.write', total: 4, error_count: 2 },
+        { tool_name: 'db.read', total: 18, error_count: 0 },
+        { tool_name: 'db.write', total: 8, error_count: 2 },
+        { tool_name: 'shell.exec', total: 7, error_count: 1 },
+        { tool_name: 'file.read', total: 5, error_count: 0 },
+        { tool_name: 'cache.get', total: 3, error_count: 0 },
+        { tool_name: 'ignored.sixth', total: 1, error_count: 0 },
       ],
-      findings: [{ severity: 'high', title: '写入异常', summary: '连续失败' }],
+      findings: [
+        { severity: 'high', title: '写入异常', summary: '连续失败' },
+        { severity: 'critical', title: '权限异常', summary: '越权调用' },
+        { severity: 'high', title: '外发异常', summary: '目标未知' },
+        { severity: 'high', title: 'ignored-fourth', summary: '不进入管理层总览' },
+      ],
     },
-    foldThresholdChars: 1,
+  });
+
+  assert.equal(payloads.length, 1);
+  const payload = payloads[0];
+  const serialized = JSON.stringify(payload);
+  assert.equal(payload.card.header.template, 'blue');
+  assert.match(serialized, /覆盖 3 个 Agent · 5 条 Trace/);
+  assert.match(serialized, /\*\*42\*\*\\n事件数/);
+  assert.match(serialized, /\*\*3\*\*\\n异常事件数/);
+  assert.match(serialized, /\*\*4\*\*\\n高风险发现数/);
+  for (const expected of ['权限异常', '写入异常', '外发异常']) assert.match(serialized, new RegExp(expected));
+  assert.doesNotMatch(serialized, /ignored-fourth/);
+  for (const expected of ['db.write', 'shell.exec', 'db.read', 'file.read', 'cache.get']) {
+    assert.match(serialized, new RegExp(expected.replaceAll('.', '\\.')));
+  }
+  assert.doesNotMatch(serialized, /ignored\.sixth/);
+  assert.doesNotMatch(serialized, /agent_id|trace_id|agent-daily|trace-daily/);
+  assert.doesNotMatch(serialized, /高风险名称与摘要|工具调用统计/);
+  assert.doesNotMatch(serialized, /"tag":"note"/);
+  assert.equal(payload.card.body.elements.filter((element) => element.tag === 'button').length, 1);
+  assert.match(serialized, /查看完整日报/);
+});
+
+test('daily report still sends one blue overview when no risk is found', () => {
+  const payloads = buildDailyReportPayloads({
+    date: '2026-07-17',
+    generatedAt: '2026-07-17T09:00:00.000Z',
+    window: { from: '2026-07-16T16:00:00.000Z', to: '2026-07-17T09:00:00.000Z' },
+    group: {
+      scope: 'global',
+      agent_count: 4,
+      trace_count: 9,
+      event_count: 28,
+      error_count: 0,
+      tool_count: 1,
+      tools: [{ tool_name: 'db.read', total: 28, error_count: 0 }],
+      findings: [],
+    },
+  });
+
+  assert.equal(payloads.length, 1);
+  const payload = payloads[0];
+  const serialized = JSON.stringify(payload);
+  assert.equal(payload.card.header.template, 'blue');
+  assert.match(serialized, /今日未发现异常或高风险，整体运行正常/);
+  assert.match(serialized, /覆盖 4 个 Agent · 9 条 Trace/);
+  assert.doesNotMatch(serialized, /Top 风险|高风险名称与摘要/);
+});
+
+test('daily report explicitly reports an empty audit window and still sends one card', () => {
+  const payloads = buildDailyReportPayloads({
+    date: '2026-07-17',
+    generatedAt: '2026-07-17T09:00:00.000Z',
+    window: { from: '2026-07-16T16:00:00.000Z', to: '2026-07-17T09:00:00.000Z' },
+    group: {
+      scope: 'global',
+      agent_count: 0,
+      trace_count: 0,
+      event_count: 0,
+      error_count: 0,
+      tool_count: 0,
+      tools: [],
+      findings: [],
+    },
   });
 
   assert.equal(payloads.length, 1);
   const serialized = JSON.stringify(payloads[0]);
-  assert.match(serialized, /agent-daily/);
-  assert.match(serialized, /trace-daily/);
-  assert.match(serialized, /db\.read/);
-  assert.match(serialized, /写入异常/);
-  assert.doesNotMatch(serialized, /"tag":"note"/);
-  assert.equal(payloads[0].card.header.template, 'blue');
-  const panels = payloads[0].card.body.elements.filter((element) => element.tag === 'collapsible_panel');
-  assert.equal(panels.length, 2);
-  assert.match(panels[0].header.title.content, /高风险名称与摘要/);
-  assert.match(panels[1].header.title.content, /工具调用统计/);
-  assert.ok(JSON.stringify(panels[1]).indexOf('db.write') < JSON.stringify(panels[1]).indexOf('db.read'));
+  assert.match(serialized, /统计窗口内暂无审计事件/);
+  assert.match(serialized, /覆盖 0 个 Agent · 0 条 Trace/);
+  assert.doesNotMatch(serialized, /Top 风险|Top 工具|高风险名称与摘要|工具调用统计/);
 });
 
-test('daily report uses blue header for critical, high, and no-risk states', () => {
-  const base = {
-    date: '2026-07-17',
-    generatedAt: '2026-07-17T09:00:00.000Z',
-    window: { from: '2026-07-16T16:00:00.000Z', to: '2026-07-17T09:00:00.000Z' },
-  };
-  const makeGroup = (findings) => ({
-    agent_id: 'agent-daily',
-    agent_name: '日报演示 Agent',
-    trace_id: 'trace-daily',
-    event_count: 4,
-    error_count: 1,
-    tool_count: 0,
-    tools: [],
-    findings,
-  });
-  const critical = buildDailyReportPayloads({ ...base, group: makeGroup([{ severity: 'critical', title: '严重', summary: '摘要' }]) })[0];
-  const high = buildDailyReportPayloads({ ...base, group: makeGroup([{ severity: 'high', title: '高风险', summary: '摘要' }]) })[0];
-  const clean = buildDailyReportPayloads({ ...base, group: makeGroup([]) })[0];
-
-  for (const payload of [critical, high, clean]) assert.equal(payload.card.header.template, 'blue');
-  assert.match(JSON.stringify(critical), /存在严重风险，需要查看影响范围/);
-  assert.match(JSON.stringify(high), /存在高风险，建议关注相关业务链路/);
-  assert.match(JSON.stringify(clean), /今日未发现高风险，整体运行正常/);
-  assert.doesNotMatch(JSON.stringify(clean), /Top 风险|高风险名称与摘要/);
-});
-
-test('daily report hides empty sections and keeps Dashboard as its only action', () => {
+test('daily report with non-risk errors recommends detail review', () => {
   const payload = buildDailyReportPayloads({
     date: '2026-07-17',
     generatedAt: '2026-07-17T09:00:00.000Z',
     window: { from: '2026-07-16T16:00:00.000Z', to: '2026-07-17T09:00:00.000Z' },
     dashboardUrl: 'https://example.com/dashboard',
     group: {
-      agent_id: 'agent-clean',
-      trace_id: 'trace-clean',
-      event_count: 1,
-      error_count: 0,
+      scope: 'global',
+      agent_count: 1,
+      trace_count: 1,
+      event_count: 4,
+      error_count: 2,
       tool_count: 0,
       tools: [],
       findings: [],
     },
   })[0];
   const serialized = JSON.stringify(payload);
+  assert.match(serialized, /存在 2 条异常事件，暂未形成高风险发现，建议查看详情/);
   assert.match(serialized, /统计范围：7 月 17 日 00:00–17:00 · 北京时间/);
-  assert.doesNotMatch(serialized, /高风险名称与摘要|工具调用统计/);
+  assert.doesNotMatch(serialized, /Top 风险|Top 工具|高风险名称与摘要|工具调用统计/);
   assert.equal(payload.card.body.elements.filter((element) => element.tag === 'button').length, 1);
   assert.match(serialized, /查看完整日报/);
 });
@@ -335,14 +387,14 @@ test('many tiny findings split before the JSON 2.0 component ceiling', () => {
   findings.forEach((finding) => assert.match(serialized, new RegExp(`\\b${finding.title}\\b`)));
 });
 
-test('large daily reports split safely while keeping independent risk/tool folds and context', () => {
+test('oversized daily input stays one compact card below byte and component limits', () => {
   const findings = Array.from({ length: 14 }, (_, index) => ({
     severity: index % 4 === 0 ? 'critical' : 'high',
     title: `日报风险-${index}`,
-    summary: `日报完整摘要-${index}-` + '影响说明'.repeat(120),
+    summary: `日报完整摘要-${index}-` + '影响说明'.repeat(600),
     observed_at: `2026-07-17T08:${String(index).padStart(2, '0')}:00.000Z`,
   }));
-  const tools = Array.from({ length: 24 }, (_, index) => ({
+  const tools = Array.from({ length: 80 }, (_, index) => ({
     tool_name: `daily.tool.${index}`,
     total: 100 - index,
     error_count: index % 5,
@@ -352,11 +404,11 @@ test('large daily reports split safely while keeping independent risk/tool folds
     generatedAt: '2026-07-17T09:00:00.000Z',
     window: { from: '2026-07-16T16:00:00.000Z', to: '2026-07-17T09:00:00.000Z' },
     dashboardUrl: 'https://example.com/dashboard',
-    maxPayloadBytes: 8 * 1024,
+    maxPayloadBytes: 19 * 1024,
     group: {
-      agent_id: 'agent-daily-large',
-      agent_name: '大型日报 Agent',
-      trace_id: 'trace-daily-large',
+      scope: 'global',
+      agent_count: 120,
+      trace_count: 600,
       event_count: 999,
       error_count: 20,
       tool_count: tools.length,
@@ -364,19 +416,17 @@ test('large daily reports split safely while keeping independent risk/tool folds
       findings,
     },
   });
-  assert.ok(payloads.length > 1);
-  for (const [index, payload] of payloads.entries()) {
-    const serialized = JSON.stringify(payload);
-    assert.equal(payload.card.header.template, 'blue');
-    assert.match(payload.card.header.title.content, new RegExp(`（${index + 1}/${payloads.length}）`));
-    assert.match(serialized, /大型日报 Agent|trace-daily-large|统计范围|事件数|高风险发现数/);
-    assert.ok(feishuPayloadBytes(payload) <= 8 * 1024);
-    const panelTitles = payload.card.body.elements
-      .filter((element) => element.tag === 'collapsible_panel')
-      .map((element) => element.header.title.content);
-    assert.ok(panelTitles.every((title) => /高风险名称与摘要|工具调用统计/.test(title)));
+  assert.equal(payloads.length, 1);
+  const payload = payloads[0];
+  const serialized = JSON.stringify(payload);
+  assert.equal(payload.card.header.template, 'blue');
+  assert.doesNotMatch(payload.card.header.title.content, /（\d+\/\d+）/);
+  assert.match(serialized, /覆盖 120 个 Agent · 600 条 Trace/);
+  assert.ok(feishuPayloadBytes(payload) <= 19 * 1024);
+  assert.ok(feishuPayloadBytes(payload) < FEISHU_WEBHOOK_MAX_BYTES);
+  assert.ok(countTaggedComponents(payload.card) <= 190);
+  for (const title of ['日报风险-12', '日报风险-8', '日报风险-4']) {
+    assert.match(serialized, new RegExp(title));
   }
-  const all = JSON.stringify(payloads);
-  findings.forEach((finding) => assert.match(all, new RegExp(finding.title)));
-  tools.forEach((tool) => assert.match(all, new RegExp(tool.tool_name.replaceAll('.', '\\.'))));
+  assert.doesNotMatch(serialized, /日报风险-13|日报风险-0|daily\.tool\.79/);
 });
