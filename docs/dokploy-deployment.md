@@ -24,6 +24,7 @@
 | `AUDIT_AGENT_LLM_BASE_URL` | 是 | OpenAI-compatible LLM API 地址，例如 `https://api.openai.com/v1` 或实际模型服务地址 |
 | `AUDIT_AGENT_LLM_TIMEOUT_MS` | 否 | LLM 请求超时毫秒数；未设置时为 `30000` |
 | `AUDIT_AGENT_DASHBOARD_TOKEN` | 否 | `/v1/audit-*` Bearer 鉴权密钥；Dashboard 页面不使用它 |
+| `AUDIT_AGENT_DASHBOARD_BASE_URL` | 飞书通知时是 | 外部可访问的 Dashboard 基地址，例如 `https://<域名>`；覆盖 `auditReview.visualization.baseUrl` |
 | `AUDIT_AGENT_FEISHU_MODE` | 否 | `disabled`、`dry-run` 或 `live`，默认 `disabled` |
 | `AUDIT_AGENT_FEISHU_WEBHOOK_URL` | live 时是 | 飞书自定义机器人 Webhook；只通过 Dokploy Secret 注入 |
 | `AUDIT_AGENT_FEISHU_WEBHOOK_FILE` | 否 | Webhook secret 文件路径；配置后优先于 URL 环境变量 |
@@ -105,7 +106,7 @@ Dashboard 顶部的“飞书通知正常”状态标识同时作为即时日报�
 
 从 `live` 切换到 `dry-run` 或 `disabled` 时，已有 pending 飞书消息会保留原状态，不发送、不增加尝试次数；恢复 `live` 后继续投递。
 
-外部通知中的 Dashboard 链接由 `auditReview.visualization.baseUrl` 与 `auditReview.visualization.dashboardPath` 生成。将 `auditReview.visualization.baseUrl` 设置为实际的 `https://<域名>`，否则回调会包含错误的容器内或本地地址。
+外部通知中的 Dashboard 链接由 `AUDIT_AGENT_DASHBOARD_BASE_URL`（优先）或 `auditReview.visualization.baseUrl` 与 `auditReview.visualization.dashboardPath` 生成。Dokploy 应将 `AUDIT_AGENT_DASHBOARD_BASE_URL` 设置为实际的 `https://<域名>`；变量为空时才回退到配置文件，否则飞书卡片会隐藏 Dashboard 操作。
 
 ## 8. 升级、备份与恢复
 
