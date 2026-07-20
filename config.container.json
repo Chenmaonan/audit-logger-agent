@@ -110,7 +110,8 @@
     },
     "llmReview": {
       "promptVersion": "audit-review-prompt-v1",
-      "reviewerVersion": "audit-reviewer-v1"
+      "reviewerVersion": "audit-reviewer-v1",
+      "maxCandidatesPerCall": 12
     },
     "llmBudget": {
       "maxCallsPerDay": 500,

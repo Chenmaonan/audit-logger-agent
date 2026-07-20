@@ -152,6 +152,7 @@ export function createToolSemanticMapper({
   now = () => new Date(),
 } = {}) {
   const allowed = new Set(taxonomy);
+  let pendingMappingQueue = Promise.resolve();
 
   async function mapEvent(event) {
     const local = localMap(event);
@@ -202,7 +203,7 @@ export function createToolSemanticMapper({
     });
   }
 
-  async function mapPendingEvents({ limit = 500, from, to } = {}) {
+  async function mapPendingEventsNow({ limit = 500, from, to } = {}) {
     if (!db) return { mapped: 0, unknown: 0, total: 0 };
     const rows = listEventsNeedingToolMapping(db, { limit, from, to });
     let mapped = 0;
@@ -214,6 +215,14 @@ export function createToolSemanticMapper({
       if (result.mapping_status === 'unknown') unknown += 1;
     }
     return { mapped, unknown, total: rows.length };
+  }
+
+  function mapPendingEvents(options = {}) {
+    const run = pendingMappingQueue
+      .catch(() => {})
+      .then(() => mapPendingEventsNow(options));
+    pendingMappingQueue = run.catch(() => {});
+    return run;
   }
 
   return { mapEvent, mapPendingEvents, taxonomy, mappingVersion };

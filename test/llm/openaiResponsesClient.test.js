@@ -41,3 +41,32 @@ test('OpenAI responses client limits concurrent structured requests', async () =
   assert.ok(results.every((result) => result.ok === true));
   assert.equal(maxActive, 2);
 });
+
+test('OpenAI responses client sends output cap and reasoning effort', async () => {
+  let requestBody = null;
+  const fakeResponsesClient = {
+    responses: {
+      async create(body) {
+        requestBody = body;
+        return { output_text: '{"ok":true}' };
+      },
+    },
+  };
+
+  const client = createOpenAIResponsesClient({
+    apiKey: 'sk-test',
+    model: 'test-model',
+    maxOutputTokens: 800,
+    reasoningEffort: 'minimal',
+    openaiClient: fakeResponsesClient,
+  });
+
+  await client.createStructuredResponse({
+    model: 'test-model',
+    input: [],
+    schema: { type: 'json_schema', name: 'test', strict: true, schema: { type: 'object' } },
+  });
+
+  assert.equal(requestBody.max_output_tokens, 800);
+  assert.deepEqual(requestBody.reasoning, { effort: 'minimal' });
+});

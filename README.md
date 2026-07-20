@@ -24,7 +24,10 @@
 ```json
 {
   "AUDIT_AGENT_LLM_API_KEY": "<api-key>",
-  "AUDIT_AGENT_LLM_MODEL": "<model-name>"
+  "AUDIT_AGENT_LLM_MODEL": "<model-name>",
+  "AUDIT_AGENT_LLM_TIMEOUT_MS": "900000",
+  "AUDIT_AGENT_LLM_MAX_OUTPUT_TOKENS": "1200",
+  "AUDIT_AGENT_LLM_REASONING_EFFORT": "low"
 }
 ```
 

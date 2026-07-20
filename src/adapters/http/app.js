@@ -774,7 +774,9 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         const fail = mapAuthFailure(auth);
         if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
         try {
-          const result = await scheduler.runOnce({ triggerType: 'manual' });
+          const result = typeof scheduler.runManual === 'function'
+            ? await scheduler.runManual()
+            : await scheduler.runOnce({ triggerType: 'manual' });
           if (result.status === 'skipped') {
             auditJson(res, 409, { error_code: 'review_already_running', error: 'A review is already running', review_id: result.reviewId }, cors);
           } else {
