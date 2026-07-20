@@ -370,6 +370,109 @@ function optionalSearchParam(url, name) {
   return url.searchParams.get(name) || undefined;
 }
 
+const MANUAL_DAILY_REPORT_PATH = '/dashboard/daily-report/send';
+
+const DAILY_REPORT_NOTICES = {
+  daily_report_sent: { tone: 'success', title: '日报已发送' },
+  daily_report_queued: { tone: 'neutral', title: '日报已进入发送队列' },
+  daily_report_duplicate: { tone: 'neutral', title: '本分钟日报已提交，请勿重复操作' },
+  daily_report_protected: { tone: 'neutral', title: '临近定时报送时段，请等待自动日报' },
+  daily_report_unavailable: { tone: 'critical', title: '飞书通知当前不可用' },
+  daily_report_failed: { tone: 'critical', title: '日报发送失败，请稍后重试' },
+};
+
+function dailyReportNotice(value) {
+  const notice = DAILY_REPORT_NOTICES[value];
+  return notice ? [{ ...notice }] : [];
+}
+
+function manualSendStatus(notificationDigestScheduler, at) {
+  if (typeof notificationDigestScheduler?.getManualSendStatus !== 'function') {
+    return { allowed: false, reason: 'unavailable' };
+  }
+  try {
+    return notificationDigestScheduler.getManualSendStatus({ at }) ?? { allowed: false, reason: 'unavailable' };
+  } catch {
+    return { allowed: false, reason: 'unavailable' };
+  }
+}
+
+function notificationStatusModel(status = {}) {
+  const reason = status.reason;
+  if (status.allowed === true || reason === 'allowed' || reason === 'protected_window') {
+    return {
+      ...status,
+      label: '飞书通知正常',
+      tone: 'success',
+      href: MANUAL_DAILY_REPORT_PATH,
+      active: true,
+      ...(reason === 'protected_window'
+        ? { message: '临近定时报送时段，请等待自动日报。' }
+        : {}),
+    };
+  }
+  if (reason === 'dry_run') {
+    return {
+      ...status,
+      label: '飞书通知演练模式',
+      tone: 'neutral',
+      href: MANUAL_DAILY_REPORT_PATH,
+      active: false,
+      message: '当前为飞书演练模式，不能发送真实日报。',
+    };
+  }
+  if (reason === 'disabled') {
+    return {
+      ...status,
+      label: '飞书通知未启用',
+      tone: 'neutral',
+      href: MANUAL_DAILY_REPORT_PATH,
+      active: false,
+      message: '飞书通知未启用，当前不能发送日报。',
+    };
+  }
+  return {
+    ...status,
+    label: '飞书通知状态异常',
+    tone: 'critical',
+    href: MANUAL_DAILY_REPORT_PATH,
+    active: false,
+    message: '飞书通知状态异常，当前不能发送日报。',
+  };
+}
+
+function manualDeliveryStatus(db, eventId) {
+  if (!eventId) return null;
+  try {
+    return db.prepare('SELECT delivery_status FROM agent_outbox_events WHERE event_id = ?').get(eventId)?.delivery_status ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function noticeForManualResult(result, deliveryStatus) {
+  if (result?.reason === 'duplicate') return 'daily_report_duplicate';
+  if (result?.reason === 'protected_window') return 'daily_report_protected';
+  if (result?.reason === 'disabled' || result?.reason === 'dry_run') return 'daily_report_unavailable';
+  if (result?.reason !== 'enqueued' || !result.eventId) return 'daily_report_failed';
+  if (deliveryStatus === 'delivered') return 'daily_report_sent';
+  if (deliveryStatus === 'pending' || deliveryStatus == null) return 'daily_report_queued';
+  return 'daily_report_failed';
+}
+
+function decorateOverviewPage(page, { status, notice } = {}) {
+  if (!page || typeof page !== 'object') return page;
+  const notices = dailyReportNotice(notice);
+  return {
+    ...page,
+    page: {
+      ...(page.page && typeof page.page === 'object' ? page.page : {}),
+      notification_status: notificationStatusModel(status),
+    },
+    ...(notices.length > 0 ? { notices } : {}),
+  };
+}
+
 function dashboardFindingFilters(url, { includeReviewId = false } = {}) {
   const filters = {
     agentId: optionalSearchParam(url, 'agent_id'),
@@ -512,7 +615,7 @@ function listHistory(store, methodName, idName, id, pagination) {
   return Array.isArray(rows) ? rows : [];
 }
 
-export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth, findingLifecycleService, toolSemanticMapper, retentionService, notificationDigestScheduler, now = () => new Date() } = {}) {
+export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth, findingLifecycleService, toolSemanticMapper, retentionService, notificationDigestScheduler, flushNotifications, now = () => new Date() } = {}) {
   // Helpers for audit-review routes. These are optional — if not provided
   // (e.g. in the existing runs-api test), the new routes return 503.
   const hasReviewDeps = !!(scheduler && reviewStore && visualization && dashboardAuth);
@@ -696,13 +799,61 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         return;
       }
 
+      if (hasReviewDeps && req.method === 'GET' && url.pathname === MANUAL_DAILY_REPORT_PATH) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeDashboard(req);
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
+        if (typeof visualization.manualDailyReportPage !== 'function') {
+          html(res, 503, '<h1>Daily report page unavailable</h1>', cors);
+          return;
+        }
+        const at = now();
+        const status = notificationStatusModel(manualSendStatus(notificationDigestScheduler, at));
+        const page = visualization.manualDailyReportPage({ status });
+        html(res, 200, renderDashboard(page), cors);
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'POST' && url.pathname === MANUAL_DAILY_REPORT_PATH) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeDashboard(req);
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
+
+        let notice = 'daily_report_failed';
+        try {
+          await readForm(req, maxBodyBytes(config));
+          if (typeof notificationDigestScheduler?.runManual !== 'function') {
+            notice = 'daily_report_unavailable';
+          } else {
+            const result = await notificationDigestScheduler.runManual({ generatedAt: now() });
+            if (result?.reason === 'enqueued' && result.eventId) {
+              try {
+                if (typeof flushNotifications === 'function') await flushNotifications();
+              } catch {
+                // The Outbox keeps the event pending for the normal retry loop.
+              }
+            }
+            notice = noticeForManualResult(result, manualDeliveryStatus(db, result?.eventId));
+          }
+        } catch {
+          notice = 'daily_report_failed';
+        }
+        redirect(res, `/dashboard?notice=${encodeURIComponent(notice)}`);
+        return;
+      }
+
       if (hasReviewDeps && req.method === 'GET' && (url.pathname === '/dashboard' || url.pathname === '/dashboard/')) {
         const cors = reviewCors(req);
         const auth = dashboardAuth.authorizeDashboard(req);
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
         const filters = dashboardFindingFilters(url, { includeReviewId: true });
-        const page = visualization.overviewPage(filters);
+        const page = decorateOverviewPage(visualization.overviewPage(filters), {
+          status: manualSendStatus(notificationDigestScheduler, now()),
+          notice: optionalSearchParam(url, 'notice'),
+        });
         html(res, 200, renderDashboard(page), cors);
         return;
       }

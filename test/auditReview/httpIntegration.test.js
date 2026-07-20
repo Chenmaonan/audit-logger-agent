@@ -122,6 +122,197 @@ test('dashboard routes pass normalized finding filters to visualization', async 
   }
 });
 
+test('dashboard manual daily report confirmation and POST map delivery outcomes without GET side effects', async () => {
+  const db = openDb(':memory:');
+  ensureRuntimeSchema(db);
+  let scenario = 'enqueued';
+  let flushMode = 'delivered';
+  let eventSequence = 0;
+  let flushCalls = 0;
+  let runCalls = 0;
+  const manualStatuses = [];
+  const insertOutbox = db.prepare(`
+    INSERT INTO agent_outbox_events (
+      event_id, run_id, type, payload_json, delivery_mode, delivery_status,
+      delivery_attempts, max_attempts, callback_url, created_at
+    ) VALUES (?, ?, 'audit_daily_trace_report', '{}', 'feishu_bot', 'pending', 0, 8, NULL, ?)
+  `);
+  const notificationDigestScheduler = {
+    getManualSendStatus() {
+      return {
+        allowed: scenario !== 'disabled' && scenario !== 'dry_run',
+        reason: scenario === 'disabled' || scenario === 'dry_run' ? scenario : 'allowed',
+        date: '2026-07-20',
+        window: { from: '2026-07-19T16:00:00.000Z', to: '2026-07-20T06:35:00.000Z' },
+        localTime: '2026-07-20T14:35:00+08:00',
+        timezone: 'UTC+08:00',
+        timezoneOffsetMinutes: 480,
+      };
+    },
+    runManual() {
+      runCalls += 1;
+      if (scenario === 'duplicate') {
+        return { reason: 'duplicate', eventId: 'evt-existing', enqueuedCount: 0, payloadCount: 1 };
+      }
+      if (scenario === 'protected_window') {
+        return { reason: 'protected_window', eventId: null, enqueuedCount: 0, payloadCount: 0 };
+      }
+      if (scenario === 'disabled' || scenario === 'dry_run') {
+        return { reason: scenario, eventId: null, enqueuedCount: 0, payloadCount: 0 };
+      }
+      if (scenario === 'failed') throw new Error('internal manual report failure');
+      const eventId = `evt-manual-${++eventSequence}`;
+      insertOutbox.run(eventId, `manual-${eventSequence}`, new Date().toISOString());
+      return { reason: 'enqueued', eventId, enqueuedCount: 1, payloadCount: 1 };
+    },
+  };
+  const visualization = {
+    overviewPage() {
+      return { page: { title: '日报入口测试' }, summary_metrics: [], filters: [], sections: [] };
+    },
+    manualDailyReportPage({ status }) {
+      manualStatuses.push(status);
+      return {
+        page: { title: '确认发送当前日报', notification_status: status },
+        summary_metrics: [],
+        filters: [],
+        sections: [{
+          id: 'manual_daily_report_confirmation',
+          type: 'confirmation',
+          title: '发送当前日报',
+          description: status.message,
+          allowed: status.allowed,
+          items: [{ label: '统计日期', value: status.date }],
+          form: status.allowed ? {
+            method: 'post',
+            action: '/dashboard/daily-report/send',
+            submit_label: '确认发送',
+            cancel_label: '返回',
+            cancel_href: '/dashboard',
+          } : {
+            cancel_label: '返回',
+            cancel_href: '/dashboard',
+          },
+        }],
+      };
+    },
+  };
+  const dashboardAuth = {
+    authorizeDashboard(req) {
+      return req.headers['x-deny'] === '1'
+        ? { ok: false, status: 403, code: 'forbidden' }
+        : { ok: true };
+    },
+    corsHeaders() { return {}; },
+    clearSessionCookie() { return ''; },
+  };
+  const app = createHttpApp({
+    db,
+    config: {},
+    scheduler: {},
+    reviewStore: {},
+    visualization,
+    dashboardAuth,
+    notificationDigestScheduler,
+    now: () => new Date('2026-07-20T06:35:00.000Z'),
+    async flushNotifications() {
+      flushCalls += 1;
+      const eventId = `evt-manual-${eventSequence}`;
+      if (flushMode === 'delivered') {
+        db.prepare(`
+          UPDATE agent_outbox_events
+          SET delivery_status = 'delivered', delivered_at = ?
+          WHERE event_id = ?
+        `).run(new Date().toISOString(), eventId);
+        return;
+      }
+      if (flushMode === 'failed') throw new Error('flush failed');
+    },
+  });
+  await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
+  const baseUrl = `http://127.0.0.1:${app.address().port}`;
+  const post = () => fetch(`${baseUrl}/dashboard/daily-report/send`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: '',
+  });
+
+  try {
+    const beforeGet = db.prepare('SELECT COUNT(*) AS count FROM agent_outbox_events').get().count;
+    const confirmation = await fetch(`${baseUrl}/dashboard/daily-report/send`);
+    assert.equal(confirmation.status, 200);
+    const confirmationHtml = await confirmation.text();
+    assert.match(confirmationHtml, /确认发送当前日报|发送当前日报/);
+    assert.match(confirmationHtml, /method="post" action="\/dashboard\/daily-report\/send"/);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM agent_outbox_events').get().count, beforeGet);
+    assert.equal(runCalls, 0);
+    assert.equal(manualStatuses[0].label, '飞书通知正常');
+    assert.equal(manualStatuses[0].date, '2026-07-20');
+
+    const dashboard = await fetch(`${baseUrl}/dashboard`);
+    const dashboardHtml = await dashboard.text();
+    assert.match(dashboardHtml, /飞书通知正常/);
+    assert.match(dashboardHtml, /href="\/dashboard\/daily-report\/send"/);
+    assert.doesNotMatch(dashboardHtml, /立即发送日报/);
+
+    scenario = 'enqueued';
+    flushMode = 'delivered';
+    const sent = await post();
+    assert.equal(sent.status, 303);
+    assert.equal(sent.headers.get('location'), '/dashboard?notice=daily_report_sent');
+    assert.equal(flushCalls, 1);
+    assert.equal(db.prepare("SELECT delivery_status FROM agent_outbox_events WHERE event_id = 'evt-manual-1'").get().delivery_status, 'delivered');
+    const sentNotice = await (await fetch(`${baseUrl}${sent.headers.get('location')}`)).text();
+    assert.match(sentNotice, /日报已发送/);
+
+    scenario = 'duplicate';
+    const duplicate = await post();
+    assert.equal(duplicate.headers.get('location'), '/dashboard?notice=daily_report_duplicate');
+    assert.equal(flushCalls, 1);
+
+    scenario = 'protected_window';
+    const protectedResponse = await post();
+    assert.equal(protectedResponse.headers.get('location'), '/dashboard?notice=daily_report_protected');
+    assert.equal(flushCalls, 1);
+
+    scenario = 'dry_run';
+    const unavailableConfirmation = await fetch(`${baseUrl}/dashboard/daily-report/send`);
+    const unavailableConfirmationHtml = await unavailableConfirmation.text();
+    assert.match(unavailableConfirmationHtml, /当前为飞书演练模式，不能发送真实日报/);
+    assert.doesNotMatch(unavailableConfirmationHtml, /<form method="post" action="\/dashboard\/daily-report\/send"/);
+    const unavailable = await post();
+    assert.equal(unavailable.headers.get('location'), '/dashboard?notice=daily_report_unavailable');
+    assert.equal(flushCalls, 1);
+
+    scenario = 'enqueued';
+    flushMode = 'failed';
+    const queued = await post();
+    assert.equal(queued.headers.get('location'), '/dashboard?notice=daily_report_queued');
+    assert.equal(flushCalls, 2);
+    assert.equal(db.prepare("SELECT delivery_status FROM agent_outbox_events WHERE event_id = 'evt-manual-2'").get().delivery_status, 'pending');
+
+    scenario = 'failed';
+    const failed = await post();
+    assert.equal(failed.headers.get('location'), '/dashboard?notice=daily_report_failed');
+
+    const deniedGet = await fetch(`${baseUrl}/dashboard/daily-report/send`, { headers: { 'x-deny': '1' } });
+    assert.equal(deniedGet.status, 403);
+    const callsBeforeDeniedPost = runCalls;
+    const deniedPost = await fetch(`${baseUrl}/dashboard/daily-report/send`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { 'x-deny': '1', 'content-type': 'application/x-www-form-urlencoded' },
+      body: '',
+    });
+    assert.equal(deniedPost.status, 403);
+    assert.equal(runCalls, callsBeforeDeniedPost);
+  } finally {
+    await new Promise((resolve) => app.close(resolve));
+    db.close();
+  }
+});
+
 test('finding lifecycle HTTP routes expose history, map conflicts, and use dashboard POST + 303', async () => {
   const calls = [];
   const finding = { finding_id: 'finding/1', status: 'open', state_version: 3 };

@@ -212,6 +212,65 @@ test('agentIndexPage lists received agent ids linked to filtered dashboard', () 
   assert.ok(page.page.page_actions.some((action) => action.href === '/dashboard'));
 });
 
+test('manualDailyReportPage returns a server-rendered Beijing-time confirmation model', () => {
+  const status = {
+    label: '飞书通知正常',
+    tone: 'success',
+    href: '/dashboard/daily-report/send',
+    active: true,
+    allowed: true,
+    date: '2026-07-20',
+    window: { to: '2026-07-20T06:35:42.000Z' },
+    localTime: '2026-07-20 14:35:42',
+    timezoneOffsetMinutes: 480,
+  };
+  const page = createViz().manualDailyReportPage({ status });
+
+  assert.equal(page.page.title, '确认发送当前日报');
+  assert.equal(page.page.updated_at, '2026-07-20T06:35:42.000Z');
+  assert.equal(page.page.notification_status, status);
+  assert.deepEqual(page.summary_metrics, []);
+  assert.deepEqual(page.filters, []);
+
+  const section = page.sections.find((item) => item.id === 'manual_daily_report_confirmation');
+  assert.equal(section.type, 'confirmation');
+  assert.deepEqual(section.items.map((item) => item.label), ['操作', '统计日期', '统计范围', '覆盖范围']);
+  assert.equal(section.items.find((item) => item.label === '统计日期').value, '2026-07-20（北京时间）');
+  assert.equal(section.items.find((item) => item.label === '统计范围').value, '00:00 至 14:35');
+  assert.equal(section.items.find((item) => item.label === '覆盖范围').value, '全部 Agent 与业务链路');
+  assert.deepEqual(section.form, {
+    method: 'post',
+    action: '/dashboard/daily-report/send',
+    submit_label: '确认发送',
+    cancel_label: '返回',
+    cancel_href: '/dashboard',
+  });
+});
+
+test('manualDailyReportPage does not expose a POST action when sending is unavailable', () => {
+  const page = createViz().manualDailyReportPage({
+    status: {
+      label: '飞书通知未启用',
+      tone: 'neutral',
+      href: '/dashboard/daily-report/send',
+      active: false,
+      allowed: false,
+      message: '当前为演练模式，不能发送真实日报。',
+      date: '2026-07-20',
+      window: { to: '2026-07-20T06:35:00.000Z' },
+      localTime: '14:35',
+      timezoneOffsetMinutes: 480,
+    },
+  });
+  const section = page.sections[0];
+
+  assert.equal(section.allowed, false);
+  assert.equal(section.description, '当前为演练模式，不能发送真实日报。');
+  assert.equal(section.form.action, undefined);
+  assert.equal(section.form.submit_label, undefined);
+  assert.equal(section.form.cancel_href, '/dashboard');
+});
+
 test('overviewPage filters findings by agent id and links back to agent index', () => {
   const page = createViz({
     findings: [
@@ -355,6 +414,7 @@ test('visualization view models use Chinese UI labels without mojibake', () => {
   const pages = [
     viz.agentIndexPage(),
     viz.overviewPage(),
+    viz.manualDailyReportPage(),
     viz.reviewDetailPage('r-degraded'),
     viz.findingDetailPage('f-critical'),
   ];
@@ -701,6 +761,7 @@ test('visualization view models remain server-renderable data only', () => {
   const viz = createViz();
   const payload = JSON.stringify([
     viz.overviewPage(),
+    viz.manualDailyReportPage(),
     viz.reviewDetailPage('r-degraded'),
     viz.findingDetailPage('f-critical'),
   ]);

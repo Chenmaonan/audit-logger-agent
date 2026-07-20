@@ -404,6 +404,92 @@ test('renderDashboard renders lifecycle notices and SSR action forms without bro
   assert.equal(html.includes('<script'), false);
 });
 
+test('renderDashboard renders a natural notification status link without exposing its hidden action', () => {
+  const html = renderDashboard({
+    page: {
+      title: '审计审查总览',
+      notification_status: {
+        label: '飞书通知正常 <unsafe>',
+        tone: 'success',
+        href: '/dashboard/daily-report/send?next=1&source=<unsafe>',
+        active: true,
+      },
+    },
+    sections: [{ id: 'overview', type: 'callout', title: '运行概览', body: '运行正常' }],
+  });
+
+  assert.ok(html.includes('class="notification-status active" data-tone="success" aria-label="飞书通知状态"'));
+  assert.ok(html.includes('href="/dashboard/daily-report/send?next=1&amp;source=&lt;unsafe&gt;"'));
+  assert.ok(html.includes('class="notification-status-icon"'));
+  assert.ok(html.includes('飞书通知正常 &lt;unsafe&gt;'));
+  assert.equal(html.includes('title="'), false);
+  assert.equal(html.includes('发送日报'), false);
+  assert.equal(html.includes('立即发送'), false);
+  assert.equal(html.includes('触发日报'), false);
+});
+
+test('renderDashboard renders an escaped POST confirmation form with return action', () => {
+  const html = renderDashboard({
+    page: { title: '确认发送当前日报' },
+    sections: [{
+      id: 'manual_daily_report_confirmation',
+      type: 'confirmation',
+      title: '发送当前日报 <确认>',
+      description: '核对范围 & 确认',
+      items: [
+        { label: '操作', value: '发送当前日报' },
+        { label: '统计日期', value: '2026-07-20（北京时间）' },
+        { label: '统计范围', value: '00:00 至 14:35' },
+        { label: '覆盖范围', value: '全部 Agent 与 <业务链路>' },
+      ],
+      form: {
+        method: 'post',
+        action: '/dashboard/daily-report/send?source=<manual>&next=1',
+        submit_label: '确认发送 <日报>',
+        cancel_label: '返回 & 总览',
+        cancel_href: '/dashboard?from=<confirm>&x=1',
+      },
+    }],
+  });
+
+  assert.ok(html.includes('<section id="manual_daily_report_confirmation" class="data-section confirmation-section">'));
+  assert.ok(html.includes('发送当前日报 &lt;确认&gt;'));
+  assert.equal(html.includes('发送当前日报 &amp;lt;确认&amp;gt;'), false);
+  assert.ok(html.includes('核对范围 &amp; 确认'));
+  assert.ok(html.includes('<dt>统计日期</dt><dd>2026-07-20（北京时间）</dd>'));
+  assert.ok(html.includes('<dt>统计范围</dt><dd>00:00 至 14:35</dd>'));
+  assert.ok(html.includes('全部 Agent 与 &lt;业务链路&gt;'));
+  assert.ok(html.includes('<form method="post" action="/dashboard/daily-report/send?source=&lt;manual&gt;&amp;next=1" class="confirmation-form">'));
+  assert.ok(html.includes('<a href="/dashboard?from=&lt;confirm&gt;&amp;x=1" class="confirmation-cancel">返回 &amp; 总览</a>'));
+  assert.ok(html.includes('<button type="submit" class="form-submit confirmation-submit">确认发送 &lt;日报&gt;</button>'));
+  assert.equal(html.includes('<script'), false);
+  assert.equal(html.includes('fetch('), false);
+});
+
+test('renderDashboard shows unavailable confirmation state without a POST form', () => {
+  const html = renderDashboard({
+    page: { title: '确认发送当前日报' },
+    sections: [{
+      id: 'manual_daily_report_confirmation',
+      type: 'confirmation',
+      title: '发送当前日报',
+      description: '临近定时报送时段，请等待自动日报。',
+      allowed: false,
+      items: [
+        { label: '统计日期', value: '2026-07-20（北京时间）' },
+        { label: '统计范围', value: '00:00 至 16:58' },
+      ],
+      form: { cancel_label: '返回', cancel_href: '/dashboard' },
+    }],
+  });
+
+  assert.ok(html.includes('临近定时报送时段，请等待自动日报。'));
+  assert.ok(html.includes('class="confirmation-form confirmation-unavailable" role="status"'));
+  assert.ok(html.includes('<a href="/dashboard" class="confirmation-cancel">返回</a>'));
+  assert.equal(html.includes('<form method="post"'), false);
+  assert.equal(html.includes('<button type="submit"'), false);
+});
+
 test('renderDashboard default UI text is readable Chinese without mojibake', () => {
   const html = renderDashboard({
     sections: [{

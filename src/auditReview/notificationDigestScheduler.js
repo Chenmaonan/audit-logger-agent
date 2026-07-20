@@ -9,6 +9,7 @@ const DAILY_REPORT_PRIORITY = 100;
 const SLOT_RETRY_BASE_MS = 2 * 1000;
 const SLOT_RETRY_MAX_MS = 5 * 60 * 1000;
 const ON_TIME_THRESHOLD_MS = 10 * 1000;
+const MANUAL_PROTECTED_WINDOW_MS = 5 * 60 * 1000;
 
 function normalizedHours(value) {
   const hours = (Array.isArray(value) ? value : DEFAULT_HOURS)
@@ -73,6 +74,16 @@ function offsetLabel(offsetMinutes) {
 function localIso(date, offsetMinutes) {
   const shifted = shiftedDate(date, offsetMinutes).toISOString().replace(/Z$/, '');
   return `${shifted}${offsetLabel(offsetMinutes).slice(3)}`;
+}
+
+function validDate(value, label) {
+  const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error(`${label} is invalid`);
+  return date;
+}
+
+function manualMinuteKey(date, offsetMinutes) {
+  return shiftedDate(date, offsetMinutes).toISOString().slice(0, 16).replace('T', ':');
 }
 
 export function latestDailyReportSlotAt(now = new Date(), {
@@ -407,29 +418,8 @@ export function createNotificationDigestScheduler({
   function runNow({ scheduledFor = now() } = {}) {
     if (!enabled) return { enqueued: false, reason: 'disabled', groups: [] };
     if (feishuMode === 'disabled') return { enqueued: false, reason: 'disabled', groups: [] };
-    const window = dailyReportWindow(scheduledFor, timezoneOffsetMinutes);
-    const summary = loadDailySummary(db, window);
-    const group = {
-      ...summary,
-      highest_severity: summary.critical_count > 0 ? 'critical' : summary.high_risk_count > 0 ? 'high' : 'none',
-    };
-    const payloads = buildDailyReportPayloads({
-      date: window.date,
-      generatedAt: scheduledFor.toISOString(),
-      window: { from: window.from, to: window.to },
-      timezoneOffsetMinutes,
-      group,
-      dashboardUrl,
-      maxPayloadBytes: cardConfig.maxPayloadBytes,
-      foldThresholdChars: cardConfig.foldThresholdChars,
-    });
-    if (payloads.length !== 1) {
-      throw new Error(`Daily report must render exactly one payload, received ${payloads.length}`);
-    }
-    const rendered = [{
-      group,
-      payloads,
-    }];
+    const renderedReport = renderReport(scheduledFor);
+    const { window, rendered } = renderedReport;
     if (feishuMode === 'dry-run') {
       return {
         enqueued: false,
@@ -460,6 +450,99 @@ export function createNotificationDigestScheduler({
       });
     }
     return { enqueued: enqueuedCount > 0, enqueuedCount, payloadCount, window, groups: rendered };
+  }
+
+  function renderReport(generatedAt) {
+    const generated = validDate(generatedAt, 'Daily report generation time');
+    const window = dailyReportWindow(generated, timezoneOffsetMinutes);
+    const summary = loadDailySummary(db, window);
+    const group = {
+      ...summary,
+      highest_severity: summary.critical_count > 0 ? 'critical' : summary.high_risk_count > 0 ? 'high' : 'none',
+    };
+    const payloads = buildDailyReportPayloads({
+      date: window.date,
+      generatedAt: generated.toISOString(),
+      window: { from: window.from, to: window.to },
+      timezoneOffsetMinutes,
+      group,
+      dashboardUrl,
+      maxPayloadBytes: cardConfig.maxPayloadBytes,
+      foldThresholdChars: cardConfig.foldThresholdChars,
+    });
+    if (payloads.length !== 1) {
+      throw new Error(`Daily report must render exactly one payload, received ${payloads.length}`);
+    }
+    const rendered = [{
+      group,
+      payloads,
+    }];
+    return { generatedAt: generated, window, rendered };
+  }
+
+  function getManualSendStatus({ at = now() } = {}) {
+    const current = validDate(at, 'Manual daily report time');
+    const window = dailyReportWindow(current, timezoneOffsetMinutes);
+    const status = {
+      allowed: false,
+      reason: 'disabled',
+      date: window.date,
+      window: { from: window.from, to: window.to },
+      localTime: localIso(current, timezoneOffsetMinutes),
+      timezone: offsetLabel(timezoneOffsetMinutes),
+      timezoneOffsetMinutes,
+    };
+    if (!enabled || feishuMode === 'disabled') return status;
+    if (feishuMode !== 'live') return { ...status, reason: 'dry_run' };
+
+    const local = localParts(current, timezoneOffsetMinutes);
+    const protectedWindow = hours.some((hour) => {
+      const scheduledFor = localTimeToUtc({ ...local, hour }, timezoneOffsetMinutes);
+      return Math.abs(current.getTime() - scheduledFor.getTime()) <= MANUAL_PROTECTED_WINDOW_MS;
+    });
+    if (protectedWindow) return { ...status, reason: 'protected_window' };
+    return { ...status, allowed: true, reason: 'allowed' };
+  }
+
+  function runManual({ generatedAt = now() } = {}) {
+    const generated = validDate(generatedAt, 'Manual daily report generation time');
+    const status = getManualSendStatus({ at: generated });
+    const base = {
+      ...status,
+      eventId: null,
+      enqueued: false,
+      enqueuedCount: 0,
+      payloadCount: 0,
+      groups: [],
+    };
+    if (!status.allowed) return base;
+
+    const { window, rendered } = renderReport(generated);
+    const payload = rendered[0].payloads[0];
+    const minuteKey = manualMinuteKey(generated, timezoneOffsetMinutes);
+    const enqueueResult = outboxStore.enqueue({
+      runId: `daily_manual_${minuteKey.replaceAll(':', '_')}`,
+      type: 'audit_daily_trace_report',
+      payload,
+      deliveryMode: 'feishu_bot',
+      priority: DAILY_REPORT_PRIORITY,
+      callbackUrl: null,
+      maxAttempts,
+      dedupeKey: `feishu_daily_manual:${minuteKey}`,
+    });
+    const enqueued = enqueueResult?.enqueued !== false;
+    const result = {
+      ...status,
+      reason: enqueued ? 'enqueued' : 'duplicate',
+      eventId: enqueueResult?.eventId ?? null,
+      enqueued,
+      enqueuedCount: enqueued ? 1 : 0,
+      payloadCount: 1,
+      window: { from: window.from, to: window.to },
+      groups: rendered,
+    };
+    if (enqueued) notifyEnqueued(result);
+    return result;
   }
 
   function slotDescriptor(scheduledFor, triggerType) {
@@ -643,7 +726,9 @@ export function createNotificationDigestScheduler({
     start,
     stop,
     runNow,
+    runManual,
     reconcileDueSlot,
+    getManualSendStatus,
     getHealthStatus,
     nextRunAt: () => nextDailyReportAt(now(), { hours, timezoneOffsetMinutes }),
   };

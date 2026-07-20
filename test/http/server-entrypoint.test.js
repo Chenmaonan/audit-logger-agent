@@ -164,6 +164,7 @@ test('server script retains the HTTP server and registers both shutdown signals'
   assert.match(source, /const server = listenHttpServer\(app,/);
   assert.match(source, /createFindingLifecycleService\(\{ reviewStore,/);
   assert.match(source, /findingLifecycleService,/);
+  assert.match(source, /flushNotifications:\s*\(\)\s*=>\s*eventPublisher\.flushPending\(20\)/);
   assert.match(source, /createGracefulShutdown\(\{/);
   assert.match(source, /process\.on\('SIGINT', handleShutdown\)/);
   assert.match(source, /process\.on\('SIGTERM', handleShutdown\)/);

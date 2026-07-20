@@ -296,6 +296,7 @@ const app = createHttpApp({
   toolSemanticMapper,
   retentionService,
   notificationDigestScheduler,
+  flushNotifications: () => eventPublisher.flushPending(20),
 });
 const portIndex = process.argv.indexOf('--port');
 const portArg = portIndex >= 0 ? Number(process.argv[portIndex + 1]) : 9320;

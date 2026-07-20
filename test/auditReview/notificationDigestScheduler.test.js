@@ -105,6 +105,25 @@ function config() {
   };
 }
 
+function dedupingOutbox() {
+  const attempts = [];
+  const inserted = [];
+  const eventIds = new Map();
+  return {
+    attempts,
+    inserted,
+    enqueue(event) {
+      attempts.push(event);
+      const existing = eventIds.get(event.dedupeKey);
+      if (existing) return { eventId: existing, enqueued: false };
+      const eventId = `evt-${eventIds.size + 1}`;
+      eventIds.set(event.dedupeKey, eventId);
+      inserted.push(event);
+      return { eventId, enqueued: true };
+    },
+  };
+}
+
 test('nextDailyReportAt uses Beijing 10:00 and 17:00 independent of host timezone', () => {
   assert.equal(
     nextDailyReportAt(new Date('2026-07-17T01:59:00.000Z')).toISOString(),
@@ -252,6 +271,167 @@ test('live daily run enqueues feishu_bot payloads with no callback URL and stabl
   }).runNow({ scheduledFor: new Date('2026-07-17T02:00:00.000Z') });
   assert.equal(morningCalls.length, 1);
   assert.notEqual(morningCalls[0].dedupeKey, firstKey);
+  db.close();
+});
+
+test('manual send status returns Beijing window and enforces inclusive protected windows', () => {
+  const db = makeDb();
+  const scheduler = createNotificationDigestScheduler({
+    db,
+    outboxStore: { enqueue() { throw new Error('must not enqueue'); } },
+    config: config(),
+    feishuMode: 'live',
+  });
+
+  const allowed = scheduler.getManualSendStatus({ at: new Date('2026-07-17T06:35:42.000Z') });
+  assert.deepEqual(allowed, {
+    allowed: true,
+    reason: 'allowed',
+    date: '2026-07-17',
+    window: {
+      from: '2026-07-16T16:00:00.000Z',
+      to: '2026-07-17T06:35:42.000Z',
+    },
+    localTime: '2026-07-17T14:35:42.000+08:00',
+    timezone: 'UTC+08:00',
+    timezoneOffsetMinutes: 480,
+  });
+
+  for (const at of [
+    '2026-07-17T01:55:00.000Z',
+    '2026-07-17T02:05:00.000Z',
+    '2026-07-17T08:55:00.000Z',
+    '2026-07-17T09:05:00.000Z',
+  ]) {
+    const protectedStatus = scheduler.getManualSendStatus({ at: new Date(at) });
+    assert.equal(protectedStatus.allowed, false);
+    assert.equal(protectedStatus.reason, 'protected_window');
+  }
+  assert.equal(
+    scheduler.getManualSendStatus({ at: new Date('2026-07-17T01:54:59.999Z') }).allowed,
+    true,
+  );
+  assert.equal(
+    scheduler.getManualSendStatus({ at: new Date('2026-07-17T02:05:00.001Z') }).allowed,
+    true,
+  );
+  const rejected = scheduler.runManual({ generatedAt: new Date('2026-07-17T02:00:00.000Z') });
+  assert.equal(rejected.reason, 'protected_window');
+  assert.equal(rejected.enqueuedCount, 0);
+  assert.equal(rejected.payloadCount, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM audit_notification_digest_slots').get().count, 0);
+  db.close();
+});
+
+test('manual send is rejected when notifications are disabled or not live', () => {
+  for (const mode of ['disabled', 'dry-run']) {
+    const db = makeDb();
+    const calls = [];
+    const scheduler = createNotificationDigestScheduler({
+      db,
+      outboxStore: { enqueue(event) { calls.push(event); } },
+      config: config(),
+      feishuMode: mode,
+    });
+    const result = scheduler.runManual({ generatedAt: new Date('2026-07-17T06:35:00.000Z') });
+    assert.equal(result.allowed, false);
+    assert.equal(result.reason, mode === 'dry-run' ? 'dry_run' : 'disabled');
+    assert.equal(result.eventId, null);
+    assert.equal(result.enqueuedCount, 0);
+    assert.equal(calls.length, 0);
+    db.close();
+  }
+
+  const db = makeDb();
+  const disabledConfig = config();
+  disabledConfig.auditReview.notification.enabled = false;
+  const result = createNotificationDigestScheduler({
+    db,
+    outboxStore: { enqueue() { throw new Error('must not enqueue'); } },
+    config: disabledConfig,
+    feishuMode: 'live',
+  }).runManual({ generatedAt: new Date('2026-07-17T06:35:00.000Z') });
+  assert.equal(result.allowed, false);
+  assert.equal(result.reason, 'disabled');
+  db.close();
+});
+
+test('manual send deduplicates within one Beijing minute and allows the next minute', async () => {
+  const db = makeDb();
+  insertSamples(db);
+  const outboxStore = dedupingOutbox();
+  const flushes = [];
+  const scheduler = createNotificationDigestScheduler({
+    db,
+    outboxStore,
+    config: config(),
+    feishuMode: 'live',
+    onEnqueued(result) { flushes.push(result.reason); },
+  });
+
+  const first = scheduler.runManual({ generatedAt: new Date('2026-07-17T06:35:10.000Z') });
+  const duplicate = scheduler.runManual({ generatedAt: new Date('2026-07-17T06:35:59.999Z') });
+  const nextMinute = scheduler.runManual({ generatedAt: new Date('2026-07-17T06:36:00.000Z') });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(first.reason, 'enqueued');
+  assert.equal(first.eventId, 'evt-1');
+  assert.equal(first.enqueuedCount, 1);
+  assert.equal(first.payloadCount, 1);
+  assert.equal(first.window.from, '2026-07-16T16:00:00.000Z');
+  assert.equal(first.window.to, '2026-07-17T06:35:10.000Z');
+  assert.equal(duplicate.reason, 'duplicate');
+  assert.equal(duplicate.eventId, first.eventId);
+  assert.equal(duplicate.enqueuedCount, 0);
+  assert.equal(nextMinute.reason, 'enqueued');
+  assert.equal(nextMinute.eventId, 'evt-2');
+  assert.deepEqual(
+    outboxStore.attempts.map((event) => event.dedupeKey),
+    [
+      'feishu_daily_manual:2026-07-17:14:35',
+      'feishu_daily_manual:2026-07-17:14:35',
+      'feishu_daily_manual:2026-07-17:14:36',
+    ],
+  );
+  assert.equal(outboxStore.inserted.length, 2);
+  assert.deepEqual(flushes, ['enqueued', 'enqueued']);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM audit_notification_digest_slots').get().count, 0);
+  const serialized = JSON.stringify(first.groups[0].payloads[0]);
+  assert.match(serialized, /审计信息日报/);
+  assert.match(serialized, /全局汇总 · 14:35/);
+  assert.doesNotMatch(serialized, /手动|人工触发/);
+  db.close();
+});
+
+test('manual send uses an isolated dedupe namespace and does not block the scheduled slot', async () => {
+  const db = makeDb();
+  insertSamples(db);
+  const outboxStore = dedupingOutbox();
+  const flushes = [];
+  const scheduler = createNotificationDigestScheduler({
+    db,
+    outboxStore,
+    config: config(),
+    feishuMode: 'live',
+    now: () => new Date('2026-07-17T02:00:00.000Z'),
+    ownerId: 'owner-manual-then-scheduled',
+    onEnqueued(result) { flushes.push(result.reason ?? result.status); },
+  });
+
+  const manual = scheduler.runManual({ generatedAt: new Date('2026-07-17T01:00:00.000Z') });
+  const scheduled = scheduler.reconcileDueSlot({ at: new Date('2026-07-17T02:00:00.000Z') });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(manual.reason, 'enqueued');
+  assert.equal(scheduled.status, 'enqueued');
+  assert.equal(outboxStore.inserted.length, 2);
+  assert.equal(outboxStore.inserted[0].dedupeKey, 'feishu_daily_manual:2026-07-17:09:00');
+  assert.match(outboxStore.inserted[1].dedupeKey, /^feishu_daily:/);
+  assert.notEqual(outboxStore.inserted[0].dedupeKey, outboxStore.inserted[1].dedupeKey);
+  const slots = db.prepare('SELECT * FROM audit_notification_digest_slots').all();
+  assert.equal(slots.length, 1);
+  assert.equal(slots[0].slot_key, 'daily:2026-07-17:10');
+  assert.deepEqual(flushes, ['enqueued', 'enqueued']);
   db.close();
 });
 

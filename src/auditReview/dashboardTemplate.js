@@ -43,6 +43,10 @@ function visibleSections(sections = []) {
         || (Array.isArray(section.next_actions) && section.next_actions.length > 0);
     }
     if (section.type === 'action_forms') return Array.isArray(section.forms) && section.forms.length > 0;
+    if (section.type === 'confirmation') {
+      return Array.isArray(section.items) && section.items.some((item) => hasValue(item?.value))
+        && (hasValue(section.form?.action) || section.allowed === false);
+    }
     return false;
   });
 }
@@ -114,17 +118,18 @@ function renderColumnClass(column) {
 }
 
 function renderDataSection({ id, title, className = '', body, collapsible = false }) {
+  const escapedTitle = escapeHtml(title ?? '');
   const classes = ['data-section', className, collapsible ? 'collapsible-section' : '']
     .filter(Boolean)
     .join(' ');
   if (collapsible) {
     return `<details${renderSectionIdAttr(id)} class="${classes}">
-    <summary class="section-summary"><span class="section-title">${title || '详细信息'}</span><span class="section-summary-hint">展开</span></summary>
+    <summary class="section-summary"><span class="section-title">${escapedTitle || '详细信息'}</span><span class="section-summary-hint">展开</span></summary>
     ${body}
   </details>`;
   }
   return `<section${renderSectionIdAttr(id)} class="${classes}">
-    ${title ? `<h2 class="section-title">${title}</h2>` : ''}
+    ${escapedTitle ? `<h2 class="section-title">${escapedTitle}</h2>` : ''}
     ${body}
   </section>`;
 }
@@ -204,6 +209,17 @@ function renderContextBadges(badges) {
   }).join('')}</div>`;
 }
 
+function renderNotificationStatus(status) {
+  if (!status || !hasValue(status.label)) return '';
+  const tone = escapeHtml(status.tone ?? 'neutral');
+  const activeClass = status.active === true ? ' active' : '';
+  const content = `<span class="status-marker" aria-hidden="true"></span><svg class="notification-status-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M21 3 9.5 14.5M21 3l-7.2 18-4.3-6.5L3 10.2 21 3Z"></path></svg><span>${escapeHtml(status.label)}</span>`;
+  if (hasValue(status.href)) {
+    return `<a href="${escapeHtml(status.href)}" class="notification-status${activeClass}" data-tone="${tone}" aria-label="飞书通知状态">${content}</a>`;
+  }
+  return `<span class="notification-status${activeClass}" data-tone="${tone}" aria-label="飞书通知状态">${content}</span>`;
+}
+
 function renderPageActions(actions) {
   if (!Array.isArray(actions) || actions.length === 0) return '';
   return `<div class="page-actions">${actions.map((action) => {
@@ -223,7 +239,7 @@ function renderNotices(notices) {
 function renderTableSection(section) {
   const id = section.id ?? '';
   const escapedId = escapeHtml(id);
-  const title = escapeHtml(section.title ?? '');
+  const title = section.title ?? '';
   const tableId = `table-${escapedId}`;
   const columns = Array.isArray(section.columns) ? section.columns : [];
   const rows = Array.isArray(section.rows) ? section.rows : [];
@@ -242,7 +258,7 @@ function renderTableSection(section) {
   return renderDataSection({
     id,
     title,
-    body: `<div class="table-scroll" tabindex="0" role="region" aria-label="${title}"><table id="${tableId}" class="data-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table></div>`,
+    body: `<div class="table-scroll" tabindex="0" role="region" aria-label="${escapeHtml(title)}"><table id="${tableId}" class="data-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table></div>`,
   });
 }
 
@@ -254,7 +270,7 @@ function isMonoMetaItem(item) {
 function renderDefinitionListSection(section) {
   const id = section.id ?? '';
   const escapedId = escapeHtml(id);
-  const title = escapeHtml(section.title ?? '');
+  const title = section.title ?? '';
   const items = Array.isArray(section.items) ? section.items.filter((item) => hasValue(item.value)) : [];
   if (items.length === 0) return '';
 
@@ -275,7 +291,7 @@ function renderDefinitionListSection(section) {
 
 function renderLinkListSection(section) {
   const id = section.id ?? '';
-  const title = escapeHtml(section.title ?? '');
+  const title = section.title ?? '';
   const links = Array.isArray(section.links) ? section.links : [];
   if (links.length === 0) return '';
 
@@ -290,7 +306,7 @@ function renderLinkListSection(section) {
 
 function renderCalloutSection(section) {
   const id = section.id ?? '';
-  const title = escapeHtml(section.title ?? '');
+  const title = section.title ?? '';
   const body = escapeHtml(section.body ?? '');
   if (!title && !body) return '';
   return renderDataSection({
@@ -303,7 +319,7 @@ function renderCalloutSection(section) {
 
 function renderRawLogListSection(section) {
   const id = section.id ?? '';
-  const title = escapeHtml(section.title ?? '');
+  const title = section.title ?? '';
   const snippets = Array.isArray(section.snippets) ? section.snippets.filter((snippet) => hasValue(snippet.body)) : [];
   if (snippets.length === 0) return '';
 
@@ -323,7 +339,7 @@ function renderRawLogListSection(section) {
 
 function renderTraceSequenceSection(section) {
   const id = section.id ?? '';
-  const title = escapeHtml(section.title ?? '');
+  const title = section.title ?? '';
   const steps = Array.isArray(section.steps) ? section.steps : [];
   if (steps.length === 0) return '';
 
@@ -363,7 +379,7 @@ function renderTraceSequenceSection(section) {
 
 function renderTraceAnalysisSection(section) {
   const id = section.id ?? '';
-  const title = escapeHtml(section.title ?? '');
+  const title = section.title ?? '';
   const riskPoints = Array.isArray(section.risk_points) ? section.risk_points.filter(hasValue) : [];
   const nextActions = Array.isArray(section.next_actions) ? section.next_actions.filter(hasValue) : [];
   if (!hasValue(section.purpose) && !hasValue(section.chain_summary) && riskPoints.length === 0 && nextActions.length === 0) return '';
@@ -400,9 +416,36 @@ function renderActionFormsSection(section) {
     </form>`).join('');
   return renderDataSection({
     id: section.id,
-    title: escapeHtml(section.title ?? ''),
+    title: section.title ?? '',
     className: 'finding-actions-section',
     body: `<div class="finding-action-grid">${body}</div>`,
+  });
+}
+
+function renderConfirmationSection(section) {
+  const items = Array.isArray(section.items) ? section.items.filter((item) => hasValue(item?.value)) : [];
+  const form = section.form ?? {};
+  if (items.length === 0) return '';
+  const rows = items.map((item) => `<div class="confirmation-row"><dt>${escapeHtml(item.label ?? '')}</dt><dd>${escapeHtml(item.value)}</dd></div>`).join('');
+  const method = String(form.method ?? 'post').toLowerCase() === 'get' ? 'get' : 'post';
+  const cancel = hasValue(form.cancel_href)
+    ? `<a href="${escapeHtml(form.cancel_href)}" class="confirmation-cancel">${escapeHtml(form.cancel_label ?? '返回')}</a>`
+    : '';
+  const allowed = section.allowed !== false && hasValue(form.action);
+  const controls = allowed
+    ? `<form method="${method}" action="${escapeHtml(form.action)}" class="confirmation-form">
+        ${cancel}
+        <button type="submit" class="form-submit confirmation-submit">${escapeHtml(form.submit_label ?? '确认')}</button>
+      </form>`
+    : `<div class="confirmation-form confirmation-unavailable" role="status">${cancel}</div>`;
+  const body = `${hasValue(section.description) ? `<p class="confirmation-description">${escapeHtml(section.description)}</p>` : ''}
+    <dl class="confirmation-details">${rows}</dl>
+    ${controls}`;
+  return renderDataSection({
+    id: section.id,
+    title: section.title ?? '',
+    className: 'confirmation-section',
+    body,
   });
 }
 
@@ -417,6 +460,7 @@ function renderSection(section) {
     case 'trace_sequence': return renderTraceSequenceSection(section);
     case 'trace_analysis': return renderTraceAnalysisSection(section);
     case 'action_forms': return renderActionFormsSection(section);
+    case 'confirmation': return renderConfirmationSection(section);
     default: return '';
   }
 }
@@ -447,6 +491,7 @@ export function renderDashboard(templateInput) {
   );
   const breadcrumbs = renderBreadcrumbs(page.breadcrumbs);
   const contextBadges = renderContextBadges(page.context_badges);
+  const notificationStatus = renderNotificationStatus(page.notification_status);
   const pageActions = renderPageActions(page.page_actions);
   const notices = renderNotices(templateInput?.notices);
   const sections = renderSections(templateInput?.sections);
@@ -563,6 +608,38 @@ a:hover {
   font-size: 12px;
   font-weight: 600;
 }
+.notification-status {
+  min-height: 30px;
+  padding: 4px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid transparent;
+  border-radius: var(--component-radius);
+  color: #CBD5E1;
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.notification-status:hover,
+.notification-status:focus-visible {
+  border-color: var(--tone-color);
+  background: #27344A;
+  color: var(--text-inverse);
+  text-decoration: none;
+}
+.notification-status .status-marker { color: var(--tone-color); }
+.notification-status-icon {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
 .page-actions {
   margin-bottom: 16px;
 }
@@ -641,6 +718,50 @@ a:hover {
   font-weight: 700;
 }
 .form-submit:hover { background: var(--action-primary-hover); }
+.confirmation-section {
+  max-width: 720px;
+  margin-inline: auto;
+}
+.confirmation-description {
+  margin: 0 0 16px;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+.confirmation-details {
+  margin: 0;
+  border-top: 1px solid var(--border-default);
+}
+.confirmation-row {
+  padding: 12px 0;
+  display: grid;
+  grid-template-columns: minmax(110px, 0.35fr) minmax(0, 1fr);
+  gap: 16px;
+  border-bottom: 1px solid var(--border-default);
+}
+.confirmation-row dt { color: var(--text-secondary); font-size: 13px; }
+.confirmation-row dd { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+.confirmation-form {
+  margin-top: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+.confirmation-cancel {
+  min-height: 40px;
+  padding: 8px 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  font-weight: 700;
+  text-decoration: none;
+}
+.confirmation-cancel:hover { background: var(--surface-subtle); text-decoration: none; }
+.confirmation-submit { min-width: 108px; }
 .summary-metrics {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -1156,6 +1277,10 @@ footer { text-align: center; color: var(--text-muted); font-size: 12px; padding:
   .meta-key {
     width: auto;
   }
+  .confirmation-row { grid-template-columns: 1fr; gap: 4px; }
+  .confirmation-form { align-items: stretch; flex-direction: column-reverse; }
+  .confirmation-cancel,
+  .confirmation-submit { width: 100%; }
 }
 @media (max-width: 375px) {
   .app-page,
@@ -1197,6 +1322,7 @@ footer { text-align: center; color: var(--text-muted); font-size: 12px; padding:
       <a href="/dashboard#reviews_with_findings" class="app-nav-link">审查批次</a>
     </nav>
     <div class="app-meta">
+      ${notificationStatus}
       ${contextBadges}
       <span class="updated-at">更新时间：${updatedAt}</span>
     </div>

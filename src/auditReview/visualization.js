@@ -129,6 +129,31 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function validTimezoneOffset(value, fallback = 480) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= -1440 && parsed <= 1440 ? parsed : fallback;
+}
+
+function manualReportPreview(generatedAt, timezoneOffsetMinutes) {
+  const parsed = new Date(generatedAt);
+  const date = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+  const shifted = new Date(date.getTime() + timezoneOffsetMinutes * 60 * 1000);
+  const year = shifted.getUTCFullYear();
+  const month = String(shifted.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(shifted.getUTCDate()).padStart(2, '0');
+  const hour = String(shifted.getUTCHours()).padStart(2, '0');
+  const minute = String(shifted.getUTCMinutes()).padStart(2, '0');
+  return {
+    date: `${year}-${month}-${day}`,
+    cutoff: `${hour}:${minute}`,
+  };
+}
+
+function previewLocalTime(value, fallback) {
+  const match = String(value ?? '').match(/(?:^|[T\s])(\d{2}):(\d{2})(?::\d{2})?/);
+  return match ? `${match[1]}:${match[2]}` : fallback;
+}
+
 function labelOf(map, value) {
   if (value === null || value === undefined) return '';
   return map[value] ?? String(value);
@@ -477,6 +502,11 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
   const vizConfig = defaultVisualizationConfig(config);
   const baseUrl = vizConfig.baseUrl ?? 'http://127.0.0.1:9320';
   const dashboardPath = vizConfig.dashboardPath ?? '/dashboard';
+  const dailyReportPath = `${dashboardPath.replace(/\/$/, '')}/daily-report/send`;
+  const timezoneOffsetMinutes = validTimezoneOffset(
+    config?.auditReview?.notification?.dailyReport?.timezoneOffsetMinutes
+      ?? config?.report?.timezoneOffsetMinutes,
+  );
   const traceAnalysisModel = model ?? config?.auditReview?.llmReview?.model ?? config?.planner?.model ?? null;
   const cacheDetailAnalysis = config?.auditReview?.llmBudget?.cacheDetailAnalysis !== false;
   const llmBudget = llmBudgetFromConfig(config);
@@ -578,6 +608,60 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
 
   function agentDashboardUrl(agentId) {
     return urlWithFilters(dashboardPath, { agentId });
+  }
+
+  function manualDailyReportPage({ status } = {}) {
+    const statusOffset = validTimezoneOffset(
+      status?.timezoneOffsetMinutes ?? status?.timezone_offset_minutes,
+      timezoneOffsetMinutes,
+    );
+    const generatedAt = status?.window?.to ?? nowIso();
+    const preview = manualReportPreview(generatedAt, statusOffset);
+    const reportDate = isPresent(status?.date) ? String(status.date) : preview.date;
+    const cutoff = previewLocalTime(status?.localTime ?? status?.local_time, preview.cutoff);
+    const allowed = status?.allowed !== false;
+    const unavailableReason = isPresent(status?.message)
+      ? String(status.message)
+      : '当前状态暂不可发送日报，请返回 Dashboard 稍后重试。';
+    return {
+      page: {
+        title: '确认发送当前日报',
+        subtitle: '核对统计范围后确认操作。',
+        updated_at: generatedAt,
+        breadcrumbs: [
+          { label: '总览', href: dashboardPath },
+          { label: '当前日报' },
+        ],
+        notification_status: status,
+      },
+      summary_metrics: [],
+      filters: [],
+      sections: [{
+        id: 'manual_daily_report_confirmation',
+        type: 'confirmation',
+        title: '发送当前日报',
+        description: allowed
+          ? '确认后将生成截至当前时刻的全局日报，并进入飞书通知流程。'
+          : unavailableReason,
+        allowed,
+        items: [
+          { label: '操作', value: '发送当前日报' },
+          { label: '统计日期', value: `${reportDate}（北京时间）` },
+          { label: '统计范围', value: `00:00 至 ${cutoff}` },
+          { label: '覆盖范围', value: '全部 Agent 与业务链路' },
+        ],
+        form: allowed ? {
+          method: 'post',
+          action: dailyReportPath,
+          submit_label: '确认发送',
+          cancel_label: '返回',
+          cancel_href: dashboardPath,
+        } : {
+          cancel_label: '返回',
+          cancel_href: dashboardPath,
+        },
+      }],
+    };
   }
 
   function countOpenFindingsBySeverity(filters = {}) {
@@ -1503,6 +1587,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     findingUrlFor,
     agentIndexPage,
     overviewPage,
+    manualDailyReportPage,
     reviewDetailPage,
     findingDetailPage,
     findingDetailPageWithAnalysis,
