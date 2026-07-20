@@ -41,6 +41,11 @@ function isHighRisk(toolName, patterns) {
   return (patterns ?? []).some((p) => matchGlob(toolName, p));
 }
 
+function isMappedHighRisk(row, highRiskMappedToolTypes) {
+  if (row?.mapping_status !== 'mapped' || typeof row.mapped_tool_type !== 'string') return false;
+  return highRiskMappedToolTypes.has(row.mapped_tool_type.toLowerCase());
+}
+
 function toEpochMs(ts) {
   if (ts == null) return null;
   const n = Date.parse(ts);
@@ -98,6 +103,12 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
   const repeatThreshold = policy.repeatThreshold ?? 5;
   const slowCallDurationMs = policy.slowCallDurationMs ?? 30000;
   const highRiskToolPatterns = policy.highRiskToolPatterns ?? [];
+  const highRiskMappedToolTypes = new Set(
+    (Array.isArray(policy.highRiskMappedToolTypes) ? policy.highRiskMappedToolTypes : [])
+      .filter((toolType) => typeof toolType === 'string')
+      .map((toolType) => toolType.trim().toLowerCase())
+      .filter(Boolean),
+  );
   const agentToolAllowlists = policy.agentToolAllowlists ?? {};
   const trustedChannels = policy.trustedChannels ?? [];
   const traceToolChainStepThreshold = policy.traceToolChainStepThreshold ?? 50;
@@ -195,10 +206,15 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
       }
 
       // 3a. high_risk_permission
-      const highRisk = isHighRisk(row.tool_name, highRiskToolPatterns);
+      const highRiskByToolName = isHighRisk(row.tool_name, highRiskToolPatterns);
+      const highRiskByMappedType = isMappedHighRisk(row, highRiskMappedToolTypes);
+      const highRisk = highRiskByToolName || highRiskByMappedType;
       if (highRisk) {
+        const reason = highRiskByToolName
+          ? 'tool_name matches high-risk pattern'
+          : `mapped_tool_type=${row.mapped_tool_type} is configured as high-risk`;
         candidates.push(
-          makeCandidate(row, 'high_risk_permission', `tool_name matches high-risk pattern`, { min_severity: 'high' }),
+          makeCandidate(row, 'high_risk_permission', reason, { min_severity: 'high' }),
         );
         // 5. abnormal channel for high-risk tool
         if (trustedChannels.length > 0 && row.channel != null && !trustedChannels.includes(row.channel)) {
@@ -236,8 +252,17 @@ export function createCandidateDetector({ db, riskPolicy } = {}) {
     if (totalEvents > maxEventsPerReview) {
       trimmed = true;
     }
-    // Cap candidates to bound LLM input.
-    const capped = candidates.slice(0, maxEventsPerReview);
+    // Cap candidates to bound LLM input, but never let lower-priority candidates
+    // displace known high-risk events that appeared later in the review window.
+    const capped = candidates
+      .map((candidate, index) => ({ candidate, index }))
+      .sort((left, right) => {
+        const priorityDelta = Number(right.candidate.min_severity === 'high')
+          - Number(left.candidate.min_severity === 'high');
+        return priorityDelta || left.index - right.index;
+      })
+      .slice(0, maxEventsPerReview)
+      .map(({ candidate }) => candidate);
 
     return {
       candidates: capped,
