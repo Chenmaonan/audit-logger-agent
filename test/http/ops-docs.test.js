@@ -59,6 +59,7 @@ test('Dokploy deployment guide covers required deployment, security, and recover
     'AUDIT_AGENT_LLM_BASE_URL',
     'AUDIT_AGENT_LLM_TIMEOUT_MS',
     'AUDIT_AGENT_DASHBOARD_TOKEN',
+    'AUDIT_AGENT_DASHBOARD_BASE_URL',
     'compose.dokploy.yaml',
     'Dockerfile',
     '/app/data',
@@ -76,4 +77,13 @@ test('Dokploy deployment guide covers required deployment, security, and recover
 
   assert.match(guide, /(严禁|不得)[^\n]*直接暴露[^\n]*服务/);
   assert.match(guide, /限制[^\n]*未认证[^\n]*来源/);
+});
+
+test('Dokploy compose passes the dashboard base URL environment variable into the container', () => {
+  const compose = readText('compose.dokploy.yaml');
+
+  assert.match(
+    compose,
+    /AUDIT_AGENT_DASHBOARD_BASE_URL:\s*\$\{AUDIT_AGENT_DASHBOARD_BASE_URL:-\}/,
+  );
 });
