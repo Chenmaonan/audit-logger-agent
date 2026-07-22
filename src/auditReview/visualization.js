@@ -1159,7 +1159,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
         secondary: event.status && labelOf(STATUS_LABELS, event.status) !== event.status ? event.status : undefined,
       },
       severity: {
-        text: event.severity ? labelOf(SEVERITY_LABELS, event.severity) : '未分级',
+        text: event.severity ? labelOf(SEVERITY_LABELS, event.severity) : '无风险',
         tone: event.severity ?? 'neutral',
       },
       duration_ms: {

@@ -730,21 +730,24 @@ test('reviewStore: listAgentEvents isolates, sorts and paginates events for one 
   db.close();
 });
 
-test('reviewStore: listAgentEvents orders associated event severity before paginating', () => {
+test('reviewStore: listAgentEvents projects the highest risk level to every event in the same trace before paginating', () => {
   const db = openDb();
   db.exec(`
     CREATE TABLE audit_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts TEXT NOT NULL,
       agent_id TEXT NOT NULL,
+      trace_id TEXT,
       event TEXT NOT NULL
     );
   `);
-  const insertEvent = db.prepare(`INSERT INTO audit_events (ts, agent_id, event) VALUES (?, ?, ?)`);
-  insertEvent.run('2026-07-03T10:04:00.000Z', 'agent-a', 'unclassified-newest');
-  insertEvent.run('2026-07-03T10:03:00.000Z', 'agent-a', 'low');
-  insertEvent.run('2026-07-03T10:02:00.000Z', 'agent-a', 'critical');
-  insertEvent.run('2026-07-03T10:01:00.000Z', 'agent-a', 'high');
+  const insertEvent = db.prepare(`INSERT INTO audit_events (ts, agent_id, trace_id, event) VALUES (?, ?, ?, ?)`);
+  insertEvent.run('2026-07-03T10:06:00.000Z', 'agent-a', 'trace-none', 'no-risk-newest');
+  insertEvent.run('2026-07-03T10:05:00.000Z', 'agent-a', 'trace-high', 'high');
+  insertEvent.run('2026-07-03T10:04:00.000Z', 'agent-a', 'trace-critical', 'critical-evidence');
+  insertEvent.run('2026-07-03T10:03:00.000Z', 'agent-a', 'trace-critical', 'critical-related');
+  insertEvent.run('2026-07-03T10:02:00.000Z', 'agent-b', 'trace-critical', 'other-agent');
+  insertEvent.run('2026-07-03T10:01:00.000Z', 'agent-a', 'trace_null', 'placeholder-trace');
   const insertFinding = db.prepare(`
     INSERT INTO audit_review_findings (
       finding_id, review_id, finding_hash, category, severity, title, summary,
@@ -753,9 +756,11 @@ test('reviewStore: listAgentEvents orders associated event severity before pagin
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   for (const [findingId, severity, eventId] of [
-    ['finding-low', 'low', 2],
     ['finding-critical', 'critical', 3],
-    ['finding-high', 'high', 4],
+    ['finding-critical-lower', 'medium', 4],
+    ['finding-high', 'high', 2],
+    ['finding-other-agent', 'critical', 5],
+    ['finding-placeholder', 'critical', 6],
   ]) {
     insertFinding.run(
       findingId,
@@ -773,24 +778,34 @@ test('reviewStore: listAgentEvents orders associated event severity before pagin
       'reviewer-v1',
     );
   }
+  db.prepare('UPDATE audit_review_findings SET agent_id = ?, trace_id = ? WHERE finding_id = ?').run('agent-a', 'trace-critical', 'finding-critical');
+  db.prepare('UPDATE audit_review_findings SET agent_id = ?, trace_id = ? WHERE finding_id = ?').run('agent-a', 'trace-critical', 'finding-critical-lower');
+  db.prepare('UPDATE audit_review_findings SET agent_id = ?, trace_id = ? WHERE finding_id = ?').run('agent-a', 'trace-high', 'finding-high');
+  db.prepare('UPDATE audit_review_findings SET agent_id = ?, trace_id = ? WHERE finding_id = ?').run('agent-b', 'trace-critical', 'finding-other-agent');
+  db.prepare('UPDATE audit_review_findings SET agent_id = ?, trace_id = ? WHERE finding_id = ?').run('agent-a', 'trace_null', 'finding-placeholder');
   const insertOccurrence = db.prepare(`
     INSERT INTO audit_review_finding_occurrences (
       occurrence_id, finding_id, review_id, severity, title, summary,
       evidence_event_ids_json, observed_at, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  insertOccurrence.run('occ-low', 'finding-low', 'review-1', 'low', 'Low', 'Low event', '[2]', '2026-07-03T10:04:00.000Z', '2026-07-03T10:04:00.000Z');
-  insertOccurrence.run('occ-critical', 'finding-critical', 'review-1', 'critical', 'Critical', 'Critical event', '[3]', '2026-07-03T10:04:00.000Z', '2026-07-03T10:04:00.000Z');
-  insertOccurrence.run('occ-high', 'finding-high', 'review-1', 'high', 'High', 'High event', '[4]', '2026-07-03T10:04:00.000Z', '2026-07-03T10:04:00.000Z');
+  insertOccurrence.run('occ-critical', 'finding-critical', 'review-1', 'critical', 'Critical', 'Critical event', '[3]', '2026-07-03T10:06:00.000Z', '2026-07-03T10:06:00.000Z');
+  insertOccurrence.run('occ-critical-lower', 'finding-critical-lower', 'review-1', 'medium', 'Medium', 'Related event', '[4]', '2026-07-03T10:06:00.000Z', '2026-07-03T10:06:00.000Z');
+  insertOccurrence.run('occ-high', 'finding-high', 'review-1', 'high', 'High', 'High event', '[2]', '2026-07-03T10:06:00.000Z', '2026-07-03T10:06:00.000Z');
+  insertOccurrence.run('occ-other-agent', 'finding-other-agent', 'review-1', 'critical', 'Critical', 'Other agent event', '[5]', '2026-07-03T10:06:00.000Z', '2026-07-03T10:06:00.000Z');
+  insertOccurrence.run('occ-placeholder', 'finding-placeholder', 'review-1', 'critical', 'Critical', 'Placeholder trace event', '[6]', '2026-07-03T10:06:00.000Z', '2026-07-03T10:06:00.000Z');
 
   const store = createReviewStore(db);
   const firstPage = store.listAgentEvents({ agentId: 'agent-a', sort: 'severity_desc', limit: 2 });
   const secondPage = store.listAgentEvents({ agentId: 'agent-a', sort: 'severity_desc', limit: 2, offset: 2 });
+  const thirdPage = store.listAgentEvents({ agentId: 'agent-a', sort: 'severity_desc', limit: 2, offset: 4 });
 
-  assert.deepEqual(firstPage.map((row) => row.event), ['critical', 'high']);
-  assert.deepEqual(firstPage.map((row) => row.severity), ['critical', 'high']);
-  assert.deepEqual(secondPage.map((row) => row.event), ['low', 'unclassified-newest']);
-  assert.deepEqual(secondPage.map((row) => row.severity), ['low', null]);
+  assert.deepEqual(firstPage.map((row) => row.event), ['critical-evidence', 'critical-related']);
+  assert.deepEqual(firstPage.map((row) => row.severity), ['critical', 'critical']);
+  assert.deepEqual(secondPage.map((row) => row.event), ['high', 'no-risk-newest']);
+  assert.deepEqual(secondPage.map((row) => row.severity), ['high', null]);
+  assert.deepEqual(thirdPage.map((row) => row.event), ['placeholder-trace']);
+  assert.deepEqual(thirdPage.map((row) => row.severity), [null]);
   db.close();
 });
 

@@ -326,7 +326,7 @@ test('overviewPage filters findings by agent id and links back to agent index', 
   ]);
   assert.deepEqual(logsSection.rows.map((row) => row.event.text), ['tool.end', 'tool.start']);
   assert.equal(logsSection.rows[0].status.text, '内部错误');
-  assert.equal(logsSection.rows[0].severity.text, '未分级');
+  assert.equal(logsSection.rows[0].severity.text, '无风险');
   assert.equal(logsSection.rows[0].duration_ms.text, '640 ms');
   assert.equal(logsSection.rows[0].span_id.text, 'span-1');
   const rawLogs = page.sections.find((section) => section.id === 'agent_raw_logs');
@@ -438,6 +438,20 @@ test('overviewPage resets Agent log pagination and anchors the sort controls at 
     sortFilter.options.find((option) => option.value === 'time_desc').href,
     '/dashboard?agent_id=agent-1&sort=time_desc&log_page=1#agent_logs',
   );
+});
+
+test('overviewPage labels risk-projected and no-risk Agent logs distinctly', () => {
+  const events = [
+    traceEvent(2, { agent_id: 'agent-1', severity: 'critical' }),
+    traceEvent(1, { agent_id: 'agent-1', severity: null }),
+  ];
+  const page = createViz({ traceEvents: events }).overviewPage({ agentId: 'agent-1', sort: 'severity_desc' });
+  const logs = page.sections.find((section) => section.id === 'agent_logs');
+
+  assert.equal(logs.rows[0].severity.text, '严重');
+  assert.equal(logs.rows[0].severity.tone, 'critical');
+  assert.equal(logs.rows[1].severity.text, '无风险');
+  assert.equal(logs.rows[1].severity.tone, 'neutral');
 });
 
 test('overviewPage combines filters, preserves them in GET links, and exposes clear links', () => {

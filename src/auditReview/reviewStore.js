@@ -404,9 +404,10 @@ export function createReviewStore(db) {
   function getListAgentEventsStmt() {
     if (!listAgentEventsStmt) {
       listAgentEventsStmt = db.prepare(`
-        WITH event_severity AS (
+        WITH trace_severity AS (
           SELECT
-            CAST(evidence.value AS INTEGER) AS event_id,
+            findings.agent_id,
+            findings.trace_id,
             MAX(CASE occurrences.severity
               WHEN 'critical' THEN 4
               WHEN 'high' THEN 3
@@ -415,12 +416,15 @@ export function createReviewStore(db) {
               ELSE 0
             END) AS severity_rank
           FROM audit_review_finding_occurrences occurrences
-          JOIN json_each(occurrences.evidence_event_ids_json) evidence
-          GROUP BY CAST(evidence.value AS INTEGER)
+          JOIN audit_review_findings findings ON findings.finding_id = occurrences.finding_id
+          WHERE findings.agent_id = @agent_id
+            AND NULLIF(TRIM(findings.trace_id), '') IS NOT NULL
+            AND findings.trace_id <> 'trace_null'
+          GROUP BY findings.agent_id, findings.trace_id
         )
         SELECT
           events.*,
-          CASE event_severity.severity_rank
+          CASE trace_severity.severity_rank
             WHEN 4 THEN 'critical'
             WHEN 3 THEN 'high'
             WHEN 2 THEN 'medium'
@@ -428,10 +432,14 @@ export function createReviewStore(db) {
             ELSE NULL
           END AS severity
         FROM audit_events events
-        LEFT JOIN event_severity ON event_severity.event_id = events.id
+        LEFT JOIN trace_severity
+          ON trace_severity.agent_id = events.agent_id
+          AND trace_severity.trace_id = events.trace_id
+          AND NULLIF(TRIM(events.trace_id), '') IS NOT NULL
+          AND events.trace_id <> 'trace_null'
         WHERE events.agent_id = @agent_id
         ORDER BY
-          CASE WHEN @sort = 'severity_desc' THEN COALESCE(event_severity.severity_rank, 0) ELSE 0 END DESC,
+          CASE WHEN @sort = 'severity_desc' THEN COALESCE(trace_severity.severity_rank, 0) ELSE 0 END DESC,
           events.ts DESC,
           events.id DESC
         LIMIT @limit OFFSET @offset
@@ -911,7 +919,7 @@ export function createReviewStore(db) {
       try {
         return getListAgentEventsStmt().all(query);
       } catch (error) {
-        if (/no such table:\s*audit_review_finding_occurrences/i.test(error?.message ?? '')) {
+        if (/no such (?:table|column):\s*(?:audit_review_finding_occurrences|audit_review_findings|(?:\w+\.)?trace_id)/i.test(error?.message ?? '')) {
           try {
             return getListAgentEventsFallbackStmt().all(query);
           } catch (fallbackError) {
