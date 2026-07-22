@@ -730,6 +730,52 @@ test('scheduler.runAfterIngest runs an immediate review and resets the scheduled
   db.close();
 });
 
+test('scheduler.runAfterIngest coalesces a burst and keeps one follow-up for events received during review', async () => {
+  const db = makeDb();
+  insertEvent(db, 1, {
+    ts: '2026-07-03T10:29:00.000Z',
+    tool_name: 'some.query',
+    status: 'INTERNAL',
+    event: 'tool.end',
+  });
+
+  let llmCalls = 0;
+  let releaseFirstReview;
+  let firstReviewStarted;
+  const firstReviewStartedPromise = new Promise((resolve) => { firstReviewStarted = resolve; });
+  const fallbackLlm = makeFakeLlmClient();
+  const deps = buildRealDeps(db, {
+    llmClient: {
+      async createStructuredResponse(args) {
+        llmCalls += 1;
+        if (llmCalls === 1) {
+          firstReviewStarted();
+          await new Promise((resolve) => { releaseFirstReview = resolve; });
+        }
+        return fallbackLlm.createStructuredResponse(args);
+      },
+    },
+  });
+  const scheduler = createAuditReviewScheduler({ db, ...deps, now: () => new Date('2026-07-03T10:30:00.000Z') });
+
+  const first = scheduler.runAfterIngest();
+  const queuedBeforeStart = scheduler.runAfterIngest();
+  await firstReviewStartedPromise;
+  const duringReview = Array.from({ length: 8 }, () => scheduler.runAfterIngest());
+  releaseFirstReview();
+
+  const results = await Promise.all([first, queuedBeforeStart, ...duringReview]);
+  assert.ok(results.every((result) => result.status === 'completed'));
+  assert.equal(llmCalls, 2, 'a running ingest review gets at most one trailing review');
+  const runs = deps.reviewStore.listRuns({ limit: 10 }).filter((run) => run.trigger_type === 'ingest');
+  assert.equal(runs.length, 2);
+
+  await scheduler.runAfterIngest();
+  assert.equal(llmCalls, 3, 'a later ingest starts a fresh drain after the prior one finishes');
+
+  db.close();
+});
+
 test('scheduler.runManual queues behind an in-flight review instead of skipping', async () => {
   const db = makeDb();
   insertEvent(db, 1, {

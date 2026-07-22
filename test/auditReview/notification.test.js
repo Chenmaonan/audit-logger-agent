@@ -375,7 +375,7 @@ test('Feishu display names do not change raw identity dedupe keys', () => {
   assert.equal(renderWithDisplayName('显示名称一'), renderWithDisplayName('显示名称二'));
 });
 
-test('feishu notifier keeps review batches separate even for the same agent and trace', () => {
+test('feishu notifier keeps the same persisted risk deduplicated across review batches', () => {
   const outbox = makeFakeOutboxStore();
   const notifier = createReviewNotifier({
     outboxStore: outbox,
@@ -384,18 +384,24 @@ test('feishu notifier keeps review batches separate even for the same agent and 
   });
 
   notifier.enqueueHighRiskGroups({
-    findings: [{ severity: 'high', agent_id: 'a', trace_id: 't', title: '批次一风险', summary: '批次一摘要' }],
+    findings: [{ finding_hash: 'risk-one', severity: 'high', agent_id: 'a', trace_id: 't', title: '批次一风险', summary: '批次一摘要' }],
     reviewId: 'review-one',
     run: makeRun(),
   });
   notifier.enqueueHighRiskGroups({
-    findings: [{ severity: 'high', agent_id: 'a', trace_id: 't', title: '批次二风险', summary: '批次二摘要' }],
+    findings: [{ finding_hash: 'risk-one', severity: 'high', agent_id: 'a', trace_id: 't', title: '批次二风险', summary: '批次二摘要' }],
     reviewId: 'review-two',
     run: makeRun(),
   });
+  notifier.enqueueHighRiskGroups({
+    findings: [{ finding_hash: 'risk-two', severity: 'high', agent_id: 'a', trace_id: 't', title: '另一条风险', summary: '另一条摘要' }],
+    reviewId: 'review-three',
+    run: makeRun(),
+  });
 
-  assert.equal(outbox.calls.length, 2);
-  assert.notEqual(outbox.calls[0].dedupeKey, outbox.calls[1].dedupeKey);
+  assert.equal(outbox.calls.length, 3);
+  assert.equal(outbox.calls[0].dedupeKey, outbox.calls[1].dedupeKey);
+  assert.notEqual(outbox.calls[0].dedupeKey, outbox.calls[2].dedupeKey);
   assert.match(JSON.stringify(outbox.calls[0].payload), /批次一风险/);
   assert.doesNotMatch(JSON.stringify(outbox.calls[0].payload), /批次二风险/);
   assert.match(JSON.stringify(outbox.calls[1].payload), /批次二风险/);

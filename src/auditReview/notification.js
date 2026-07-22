@@ -99,6 +99,42 @@ function dedupeIdentity(prefix, values) {
   return `${prefix}:${digest}`;
 }
 
+function nonEmptyString(value) {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+function highRiskFindingIdentity(finding) {
+  if (nonEmptyString(finding?.finding_hash)) return ['finding_hash', finding.finding_hash];
+  if (nonEmptyString(finding?.finding_id ?? finding?.id)) return ['finding_id', finding.finding_id ?? finding.id];
+  const entity = finding?.entity ?? {};
+  return [
+    'fallback',
+    finding?.category ?? null,
+    finding?.severity ?? null,
+    finding?.tool_name ?? null,
+    finding?.entity_type ?? entity.type ?? null,
+    finding?.entity_id ?? entity.id ?? null,
+    finding?.normalized_error_code ?? null,
+  ];
+}
+
+function highRiskGroupDedupeKey({ reviewId, group, payloadIndex }) {
+  const hasCompleteIdentity = nonEmptyString(group.agentId) && nonEmptyString(group.traceId);
+  const riskIdentities = group.findings
+    .map(highRiskFindingIdentity)
+    .map((identity) => JSON.stringify(identity))
+    .sort();
+  return dedupeIdentity('feishu_alert_v2', [
+    // Missing agent/trace identities are isolated by review to avoid dropping
+    // unrelated findings that lack a safe cross-review identity.
+    ...(hasCompleteIdentity ? [] : [reviewId]),
+    group.agentId ?? null,
+    group.traceId ?? null,
+    riskIdentities,
+    payloadIndex,
+  ]);
+}
+
 export function createReviewNotifier({ outboxStore, config, feishuMode = 'disabled' }) {
   const notifyConfig = defaultNotificationConfig(config);
   const notificationsEnabled = notifyConfig.enabled !== false;
@@ -212,7 +248,7 @@ export function createReviewNotifier({ outboxStore, config, feishuMode = 'disabl
           deliveryMode: 'feishu_bot',
           callbackUrl: null,
           maxAttempts,
-          dedupeKey: dedupeIdentity('feishu_alert', [reviewId, group.agentId, group.traceId, index]),
+          dedupeKey: highRiskGroupDedupeKey({ reviewId, group, payloadIndex: index }),
         });
         if (result?.enqueued !== false) enqueuedCount += 1;
       });

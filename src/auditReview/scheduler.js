@@ -329,6 +329,9 @@ export function createAuditReviewScheduler({
   let refreshTimer = null;
   let started = false;
   let reviewChain = Promise.resolve();
+  let ingestDrainPromise = null;
+  let ingestReviewStarted = false;
+  let ingestFollowupRequested = false;
 
   function clearRefreshTimer() {
     if (refreshTimer) {
@@ -353,12 +356,13 @@ export function createAuditReviewScheduler({
     }, delayMs);
   }
 
-  function enqueueReview(triggerType, { rescheduleAfterReview = false } = {}) {
+  function enqueueReview(triggerType, { rescheduleAfterReview = false, onStart } = {}) {
     reviewChain = reviewChain
       .catch(() => {})
       .then(async () => {
         if (rescheduleAfterReview) clearScheduledTimer();
         try {
+          onStart?.();
           return await runOnce({ triggerType });
         } finally {
           if (rescheduleAfterReview && started) {
@@ -819,7 +823,31 @@ export function createAuditReviewScheduler({
   }
 
   function runAfterIngest() {
-    return enqueueReview('ingest', { rescheduleAfterReview: true });
+    if (ingestDrainPromise) {
+      // Batches arriving before their coalesced review starts are already covered.
+      // While it runs, retain only one trailing review for newly accepted events.
+      if (ingestReviewStarted) ingestFollowupRequested = true;
+      return ingestDrainPromise;
+    }
+
+    ingestDrainPromise = (async () => {
+      let result;
+      do {
+        ingestFollowupRequested = false;
+        ingestReviewStarted = false;
+        result = await enqueueReview('ingest', {
+          rescheduleAfterReview: true,
+          onStart: () => { ingestReviewStarted = true; },
+        });
+      } while (ingestFollowupRequested);
+      return result;
+    })().finally(() => {
+      ingestDrainPromise = null;
+      ingestReviewStarted = false;
+      ingestFollowupRequested = false;
+    });
+
+    return ingestDrainPromise;
   }
 
   function runManual() {
