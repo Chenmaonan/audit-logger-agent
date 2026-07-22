@@ -344,6 +344,8 @@ export function createReviewStore(db) {
   let deadLetterCountStmt = null;
   let traceEventsStmt = null;
   let listAgentsStmt = null;
+  let listAgentEventsStmt = null;
+  let countAgentEventsStmt = null;
   function getDeadLetterCountStmt() {
     if (!deadLetterCountStmt) {
       // Lazy prepare: agent_outbox_events may not exist in isolated tests
@@ -396,6 +398,28 @@ export function createReviewStore(db) {
       `);
     }
     return listAgentsStmt;
+  }
+
+  function getListAgentEventsStmt() {
+    if (!listAgentEventsStmt) {
+      listAgentEventsStmt = db.prepare(`
+        SELECT * FROM audit_events
+        WHERE agent_id = @agent_id
+        ORDER BY ts DESC, id DESC
+        LIMIT @limit OFFSET @offset
+      `);
+    }
+    return listAgentEventsStmt;
+  }
+
+  function getCountAgentEventsStmt() {
+    if (!countAgentEventsStmt) {
+      countAgentEventsStmt = db.prepare(`
+        SELECT COUNT(*) AS count FROM audit_events
+        WHERE agent_id = @agent_id
+      `);
+    }
+    return countAgentEventsStmt;
   }
 
   function insertSystemAction({ findingId, actionType, fromStatus, toStatus, createdAt, note = null }) {
@@ -831,6 +855,34 @@ export function createReviewStore(db) {
         return getListAgentsStmt().all({ limit: safeLimit, offset: safeOffset });
       } catch (error) {
         if (/no such table/i.test(error?.message ?? '')) return [];
+        throw error;
+      }
+    },
+
+    listAgentEvents({ agentId, limit = 100, offset = 0 } = {}) {
+      if (!agentId) return [];
+      const parsedLimit = Number(limit);
+      const parsedOffset = Number(offset);
+      const safeLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : 100;
+      const safeOffset = Number.isFinite(parsedOffset) && parsedOffset >= 0 ? Math.floor(parsedOffset) : 0;
+      try {
+        return getListAgentEventsStmt().all({
+          agent_id: agentId,
+          limit: safeLimit,
+          offset: safeOffset,
+        });
+      } catch (error) {
+        if (/no such table/i.test(error?.message ?? '')) return [];
+        throw error;
+      }
+    },
+
+    countAgentEvents({ agentId } = {}) {
+      if (!agentId) return 0;
+      try {
+        return getCountAgentEventsStmt().get({ agent_id: agentId })?.count ?? 0;
+      } catch (error) {
+        if (/no such table/i.test(error?.message ?? '')) return 0;
         throw error;
       }
     },

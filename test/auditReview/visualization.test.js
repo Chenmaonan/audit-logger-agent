@@ -109,6 +109,19 @@ function fakeStore(overrides = {}) {
     listTraceEvents({ traceId }) {
       return traceId === 'trace-critical-1' ? traceEvents : [];
     },
+    listAgentEvents({ agentId, limit = 100, offset = 0 }) {
+      if (agentId !== 'agent-1') return [];
+      return traceEvents
+        .filter((row) => (row.agent_id ?? 'agent-1') === agentId)
+        .slice()
+        .sort((left, right) => Date.parse(right.ts) - Date.parse(left.ts) || right.id - left.id)
+        .slice(offset, offset + limit);
+    },
+    countAgentEvents({ agentId }) {
+      return agentId === 'agent-1'
+        ? traceEvents.filter((row) => (row.agent_id ?? 'agent-1') === agentId).length
+        : 0;
+    },
     listRawEventsByIds({ eventIds }) {
       return traceEvents.filter((row) => eventIds.includes(row.id));
     },
@@ -163,7 +176,7 @@ test('overviewPage returns linked review and finding sections', () => {
   assert.ok(page.page.page_actions.some((action) => action.href.includes('/dashboard/audit-reviews/')));
 
   const findingsSection = page.sections.find((section) => section.id === 'pending_findings');
-  assert.equal(findingsSection.title, '待处理风险发现');
+  assert.equal(findingsSection.title, '风险发现');
   assert.deepEqual(findingsSection.columns.map((column) => column.key), [
     'title',
     'agent_tool',
@@ -288,14 +301,36 @@ test('overviewPage filters findings by agent id and links back to agent index', 
   assert.ok(page.page.page_actions.some((action) => action.href === '/'));
   assert.equal(page.page.page_actions.find((action) => action.href === '/').kind, 'secondary');
   assert.equal(page.page.page_actions.find((action) => action.label === '打开最高风险发现').kind, 'primary');
+  assert.equal(page.page.page_actions.some((action) => action.label === '打开最新降级审查'), false);
   assert.ok(page.summary_metrics.some((metric) => metric.href === '/dashboard?agent_id=agent-1&severity=critical#pending_findings'));
+  const logsSection = page.sections.find((section) => section.id === 'agent_logs');
+  assert.equal(logsSection.title, 'Agent 日志（第 1/1 页，共 2 条）');
+  assert.deepEqual(logsSection.columns.map((column) => column.key), [
+    'timestamp',
+    'event',
+    'tool_name',
+    'status',
+    'duration_ms',
+    'trace_id',
+    'span_id',
+    'summary',
+    'error_message',
+  ]);
+  assert.deepEqual(logsSection.rows.map((row) => row.event.text), ['tool.end', 'tool.start']);
+  assert.equal(logsSection.rows[0].status.text, '内部错误');
+  assert.equal(logsSection.rows[0].duration_ms.text, '640 ms');
+  assert.equal(logsSection.rows[0].span_id.text, 'span-1');
+  const rawLogs = page.sections.find((section) => section.id === 'agent_raw_logs');
+  assert.equal(rawLogs.title, '当前页原始日志');
+  assert.equal(rawLogs.collapsible, true);
+  assert.equal(rawLogs.snippets.length, 2);
   const findingsSection = page.sections.find((section) => section.id === 'pending_findings');
   assert.equal(findingsSection.rows.length, 1);
   assert.equal(findingsSection.rows[0].agent_tool.text, 'Agent One');
   assert.equal(JSON.stringify(page).includes('Other agent finding'), false);
 });
 
-test('overviewPage defaults the risk queue to open while explicit status overrides it', () => {
+test('overviewPage defaults the risk queue to all statuses while explicit status filters it', () => {
   const resolved = finding({
     finding_id: 'f-resolved',
     title: 'Resolved finding',
@@ -307,12 +342,72 @@ test('overviewPage defaults the risk queue to open while explicit status overrid
 
   const defaultPage = viz.overviewPage();
   const defaultQueue = defaultPage.sections.find((section) => section.id === 'pending_findings');
-  assert.deepEqual(defaultQueue.rows.map((row) => row.title.text), ['Critical delete failure']);
+  assert.equal(defaultQueue.title, '风险发现');
+  assert.deepEqual(defaultQueue.rows.map((row) => row.title.text), ['Critical delete failure', 'Resolved finding']);
+  const statusFilter = defaultPage.filters.find((filter) => filter.id === 'status');
+  assert.equal(statusFilter.value, '');
+  assert.equal(statusFilter.active_label, '全部状态');
+  assert.equal(statusFilter.options[0].label, '全部状态');
 
   const resolvedPage = viz.overviewPage({ status: 'resolved' });
   const resolvedQueue = resolvedPage.sections.find((section) => section.id === 'pending_findings');
   assert.equal(resolvedQueue.title, '风险发现（已解决）');
   assert.deepEqual(resolvedQueue.rows.map((row) => row.title.text), ['Resolved finding']);
+});
+
+test('overviewPage supports time and severity finding sorting with time descending as default', () => {
+  const latestLow = finding({
+    finding_id: 'f-latest-low',
+    title: 'Latest low',
+    severity: 'low',
+    trace_id: 'trace-latest-low',
+    last_seen_at: '2026-07-03T11:00:00.000Z',
+  });
+  const viz = createViz({ findings: [latestLow] });
+
+  const defaultQueue = viz.overviewPage().sections.find((section) => section.id === 'pending_findings');
+  assert.deepEqual(defaultQueue.rows.map((row) => row.title.text), ['Latest low', 'Critical delete failure']);
+
+  const severityPage = viz.overviewPage({ sort: 'severity_desc' });
+  const severityQueue = severityPage.sections.find((section) => section.id === 'pending_findings');
+  assert.deepEqual(severityQueue.rows.map((row) => row.title.text), ['Critical delete failure', 'Latest low']);
+  const sortFilter = severityPage.filters.find((filter) => filter.id === 'sort');
+  assert.equal(sortFilter.value, 'severity_desc');
+  assert.deepEqual(sortFilter.options.map((option) => option.label), ['按时间排序', '按严重级别排序']);
+  assert.equal(sortFilter.options.find((option) => option.value === 'severity_desc').active, true);
+});
+
+test('overviewPage paginates agent logs by 100 and preserves filters in navigation links', () => {
+  const events = traceEvents(205).map((event) => ({ ...event, agent_id: 'agent-1' }));
+  const page = createViz({ traceEvents: events }).overviewPage({
+    agentId: 'agent-1',
+    severity: 'high',
+    category: 'failed_call',
+    status: 'resolved',
+    reviewId: 'r-clean',
+    sort: 'severity_desc',
+    logPage: 2,
+  });
+
+  const logs = page.sections.find((section) => section.id === 'agent_logs');
+  assert.equal(logs.title, 'Agent 日志（第 2/3 页，共 205 条）');
+  assert.equal(logs.rows.length, 100);
+  assert.equal(logs.rows[0].event.text, 'tool.end');
+  assert.equal(logs.rows[0].tool_name.text, 'tool.105');
+  assert.equal(logs.rows[99].tool_name.text, 'tool.6');
+
+  const pagination = page.sections.find((section) => section.id === 'agent_log_pagination');
+  assert.deepEqual(pagination.links.map((link) => link.label), ['上一页', '下一页']);
+  assert.equal(
+    pagination.links[0].href,
+    '/dashboard?agent_id=agent-1&severity=high&category=failed_call&status=resolved&review_id=r-clean&sort=severity_desc&log_page=1#agent_logs',
+  );
+  assert.equal(
+    pagination.links[1].href,
+    '/dashboard?agent_id=agent-1&severity=high&category=failed_call&status=resolved&review_id=r-clean&sort=severity_desc&log_page=3#agent_logs',
+  );
+  const rawLogs = page.sections.find((section) => section.id === 'agent_raw_logs');
+  assert.equal(rawLogs.snippets.length, 100);
 });
 
 test('overviewPage combines filters, preserves them in GET links, and exposes clear links', () => {
@@ -405,7 +500,7 @@ test('overviewPage preserves pending_findings anchor for empty filtered results'
   const section = page.sections.find((item) => item.id === 'pending_findings');
 
   assert.equal(section.type, 'callout');
-  assert.equal(section.title, '待处理风险发现');
+  assert.equal(section.title, '风险发现');
   assert.match(section.body, /没有匹配/);
 });
 

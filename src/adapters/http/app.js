@@ -370,6 +370,18 @@ function optionalSearchParam(url, name) {
   return url.searchParams.get(name) || undefined;
 }
 
+function dashboardSortParam(url) {
+  const value = optionalSearchParam(url, 'sort');
+  return value === 'time_desc' || value === 'severity_desc' ? value : undefined;
+}
+
+function dashboardLogPageParam(url) {
+  const value = optionalSearchParam(url, 'log_page');
+  if (!value || !/^\d+$/.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 const MANUAL_DAILY_REPORT_PATH = '/dashboard/daily-report/send';
 
 const DAILY_REPORT_NOTICES = {
@@ -473,7 +485,7 @@ function decorateOverviewPage(page, { status, notice } = {}) {
   };
 }
 
-function dashboardFindingFilters(url, { includeReviewId = false } = {}) {
+function dashboardFindingFilters(url, { includeReviewId = false, includeOverviewControls = false } = {}) {
   const filters = {
     agentId: optionalSearchParam(url, 'agent_id'),
     severity: optionalSearchParam(url, 'severity'),
@@ -481,6 +493,10 @@ function dashboardFindingFilters(url, { includeReviewId = false } = {}) {
     status: optionalSearchParam(url, 'status'),
   };
   if (includeReviewId) filters.reviewId = optionalSearchParam(url, 'review_id');
+  if (includeOverviewControls) {
+    filters.sort = dashboardSortParam(url);
+    filters.logPage = dashboardLogPageParam(url);
+  }
   return filters;
 }
 
@@ -851,7 +867,10 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         const auth = dashboardAuth.authorizeDashboard(req);
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
-        const filters = dashboardFindingFilters(url, { includeReviewId: true });
+        const filters = dashboardFindingFilters(url, {
+          includeReviewId: true,
+          includeOverviewControls: true,
+        });
         const page = decorateOverviewPage(visualization.overviewPage(filters), {
           status: manualSendStatus(notificationDigestScheduler, now()),
           notice: optionalSearchParam(url, 'notice'),

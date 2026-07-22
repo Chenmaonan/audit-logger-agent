@@ -42,6 +42,7 @@ const ACTION_LABELS = {
 const TRACE_DISPLAY_STEP_LIMIT = 20;
 const TRACE_ANALYSIS_STEP_LIMIT = 20;
 const TRACE_ABNORMAL_STEP_THRESHOLD = 50;
+const AGENT_LOG_PAGE_SIZE = 100;
 
 const OVERVIEW_FINDINGS_COLUMNS = [
   { key: 'title', label: '风险标题 / 类别', priority: 'primary' },
@@ -79,12 +80,26 @@ const AGENT_INDEX_COLUMNS = [
   { key: 'last_event_at', label: '最新日志时间', priority: 'secondary' },
 ];
 
+const AGENT_LOG_COLUMNS = [
+  { key: 'timestamp', label: '时间', priority: 'primary' },
+  { key: 'event', label: '事件', priority: 'primary' },
+  { key: 'tool_name', label: '工具', priority: 'primary' },
+  { key: 'status', label: '状态', priority: 'primary' },
+  { key: 'duration_ms', label: '耗时', priority: 'secondary' },
+  { key: 'trace_id', label: 'Trace ID', priority: 'secondary' },
+  { key: 'span_id', label: 'Span ID', priority: 'metadata' },
+  { key: 'summary', label: '摘要', priority: 'secondary' },
+  { key: 'error_message', label: '错误', priority: 'metadata' },
+];
+
 const FILTER_QUERY_KEYS = [
   ['agentId', 'agent_id'],
   ['severity', 'severity'],
   ['category', 'category'],
   ['status', 'status'],
   ['reviewId', 'review_id'],
+  ['sort', 'sort'],
+  ['logPage', 'log_page'],
 ];
 
 const TRACE_ANALYSIS_SYSTEM_PROMPT = [
@@ -237,6 +252,18 @@ function compareFindings(left, right) {
   const rightOpen = right?.status === 'open' ? 1 : 0;
   if (rightOpen !== leftOpen) return rightOpen - leftOpen;
   return compareByIsoDesc(lastSeenAtOf(left), lastSeenAtOf(right));
+}
+
+function compareFindingsByTime(left, right) {
+  const timeDelta = compareByIsoDesc(lastSeenAtOf(left), lastSeenAtOf(right));
+  if (timeDelta !== 0) return timeDelta;
+  return severityRank(right?.severity) - severityRank(left?.severity);
+}
+
+function compareAgentEventsDesc(left, right) {
+  const timeDelta = compareByIsoDesc(left?.ts, right?.ts);
+  if (timeDelta !== 0) return timeDelta;
+  return Number(right?.id ?? 0) - Number(left?.id ?? 0);
 }
 
 function formatWindow(run) {
@@ -548,14 +575,14 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     return { ...filters, [key]: isPresent(value) ? value : undefined };
   }
 
-  function filterOptions({ values, currentValue, filters, key, hrefFor, allLabel }) {
+  function filterOptions({ values, currentValue, filters, key, hrefFor, allLabel, includeAll = true }) {
     return [
-      {
+      ...(includeAll ? [{
         value: '',
         label: allLabel,
         href: hrefFor(replaceFilter(filters, key, undefined)),
         active: !isPresent(currentValue),
-      },
+      }] : []),
       ...values.map(([value, label]) => ({
         value,
         label,
@@ -565,7 +592,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     ];
   }
 
-  function findingFiltersViewModel({ filters, hrefFor }) {
+  function findingFiltersViewModel({ filters, hrefFor, includeSort = false }) {
     const definitions = [
       {
         id: 'severity',
@@ -583,27 +610,52 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
         id: 'status',
         label: '状态',
         values: ['open', 'acknowledged', 'snoozed', 'resolved'].map((status) => [status, STATUS_LABELS[status]]),
-        allLabel: '默认（待处理）',
+        allLabel: '全部状态',
       },
     ];
+    if (includeSort) {
+      definitions.push({
+        id: 'sort',
+        label: '排序',
+        values: [
+          ['time_desc', '按时间排序'],
+          ['severity_desc', '按严重级别排序'],
+        ],
+        allLabel: '按时间排序',
+        includeAll: false,
+      });
+    }
 
-    return definitions.map((definition) => ({
-      id: definition.id,
-      label: definition.label,
-      value: filters[definition.id] ?? '',
-      active_label: isPresent(filters[definition.id])
-        ? labelOf(definition.id === 'severity' ? SEVERITY_LABELS : definition.id === 'category' ? CATEGORY_LABELS : STATUS_LABELS, filters[definition.id])
-        : definition.allLabel,
-      clear_href: hrefFor(replaceFilter(filters, definition.id, undefined)),
-      options: filterOptions({
-        values: definition.values,
-        currentValue: filters[definition.id],
-        filters,
-        key: definition.id,
-        hrefFor,
-        allLabel: definition.allLabel,
-      }),
-    }));
+    return definitions.map((definition) => {
+      const currentValue = definition.id === 'sort'
+        ? (filters.sort ?? 'time_desc')
+        : filters[definition.id];
+      const labelMap = definition.id === 'severity'
+        ? SEVERITY_LABELS
+        : definition.id === 'category'
+          ? CATEGORY_LABELS
+          : STATUS_LABELS;
+      return {
+        id: definition.id,
+        label: definition.label,
+        value: currentValue ?? '',
+        active_label: isPresent(currentValue)
+          ? (definition.values.find(([value]) => value === currentValue)?.[1] ?? labelOf(labelMap, currentValue))
+          : definition.allLabel,
+        clear_href: definition.id === 'sort'
+          ? undefined
+          : hrefFor(replaceFilter(filters, definition.id, undefined)),
+        options: filterOptions({
+          values: definition.values,
+          currentValue,
+          filters,
+          key: definition.id,
+          hrefFor,
+          allLabel: definition.allLabel,
+          includeAll: definition.includeAll,
+        }),
+      };
+    });
   }
 
   function agentDashboardUrl(agentId) {
@@ -775,6 +827,26 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     }
   }
 
+  function listAgentEvents(agentId, { limit = AGENT_LOG_PAGE_SIZE, offset = 0 } = {}) {
+    if (!agentId) return [];
+    try {
+      const rows = reviewStore.listAgentEvents?.({ agentId, limit, offset }) ?? [];
+      return Array.isArray(rows) ? rows : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function countAgentEvents(agentId) {
+    if (!agentId) return 0;
+    try {
+      const count = Number(reviewStore.countAgentEvents?.({ agentId }) ?? 0);
+      return Number.isFinite(count) && count >= 0 ? Math.floor(count) : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   function reserveDetailAnalysisBudget({ day, estimatedTokens }) {
     if (typeof reviewStore.reserveLlmUsage === 'function') {
       try {
@@ -882,20 +954,44 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     };
   }
 
-  function overviewPage({ agentId, severity, category, status, reviewId } = {}) {
-    const explicitFilters = { agentId, severity, category, status, reviewId };
+  function overviewPage({ agentId, severity, category, status, reviewId, sort, logPage } = {}) {
+    const effectiveSort = sort === 'severity_desc' ? 'severity_desc' : 'time_desc';
+    const requestedLogPage = Number(logPage);
+    const normalizedLogPage = Number.isInteger(requestedLogPage) && requestedLogPage > 0
+      ? requestedLogPage
+      : 1;
+    const totalAgentEvents = agentId ? countAgentEvents(agentId) : 0;
+    const totalLogPages = Math.max(1, Math.ceil(totalAgentEvents / AGENT_LOG_PAGE_SIZE));
+    const currentLogPage = Math.min(normalizedLogPage, totalLogPages);
+    const explicitFilters = {
+      agentId,
+      severity,
+      category,
+      status,
+      reviewId,
+      sort,
+      logPage: agentId && (isPresent(logPage) || currentLogPage > 1) ? currentLogPage : undefined,
+    };
     const queueFilters = {
       agentId,
       severity,
       category,
-      status: isPresent(status) ? status : 'open',
+      status,
       reviewId,
     };
     const summaryScope = { agentId, category, reviewId };
     const openBySev = countOpenFindingsBySeverity(summaryScope);
     const deadLetters = getDeadLetterCount();
     const runs = listRuns(20);
-    const findings = listFindings(1000, queueFilters).slice().sort(compareFindings);
+    const findings = listFindings(1000, queueFilters)
+      .slice()
+      .sort(effectiveSort === 'severity_desc' ? compareFindings : compareFindingsByTime);
+    const agentEvents = agentId
+      ? listAgentEvents(agentId, {
+          limit: AGENT_LOG_PAGE_SIZE,
+          offset: (currentLogPage - 1) * AGENT_LOG_PAGE_SIZE,
+        }).slice().sort(compareAgentEventsDesc)
+      : [];
     const agentAssociatedFindings = agentId ? listFindings(1000, { agentId }) : [];
     const relevantReviewIds = agentId
       ? new Set(agentAssociatedFindings.map((finding) => finding?.review_id).filter(isPresent))
@@ -978,23 +1074,13 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       };
       page_actions.push(fallbackPrimaryAction);
     }
-    const highestSeverityFinding = findings.find((finding) => finding?.finding_id);
+    const highestSeverityFinding = findings.slice().sort(compareFindings).find((finding) => finding?.finding_id);
     if (highestSeverityFinding) {
       page_actions.push({
         label: '打开最高风险发现',
         href: findingUrl(highestSeverityFinding.finding_id),
         kind: 'primary',
       });
-    }
-    const degradedRun = visibleRuns.find((run) => run?.status === 'completed_degraded' && run?.review_id);
-    if (degradedRun) {
-      const action = {
-        label: '打开最新降级审查',
-        href: reviewUrl(degradedRun.review_id),
-        kind: 'secondary',
-      };
-      page_actions.push(action);
-      fallbackPrimaryAction ??= action;
     }
     if (!page_actions.some((action) => action.kind === 'primary') && fallbackPrimaryAction) {
       fallbackPrimaryAction.kind = 'primary';
@@ -1058,10 +1144,110 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       },
     }));
 
-    const queueTitle = queueFilters.status === 'open'
-      ? '待处理风险发现'
-      : `风险发现（${labelOf(STATUS_LABELS, queueFilters.status)}）`;
+    const agentLogRows = agentEvents.map((event) => ({
+      timestamp: {
+        text: formatTime(event.ts),
+        mono: true,
+      },
+      event: {
+        text: event.event ?? '',
+        mono: true,
+      },
+      tool_name: {
+        text: event.tool_name ?? '',
+        mono: true,
+      },
+      status: {
+        text: labelOf(STATUS_LABELS, event.status),
+        tone: statusTone(event.status),
+        secondary: event.status && labelOf(STATUS_LABELS, event.status) !== event.status ? event.status : undefined,
+      },
+      duration_ms: {
+        text: isPresent(event.duration_ms) ? `${event.duration_ms} ms` : '',
+        mono: true,
+      },
+      trace_id: {
+        text: event.trace_id ?? '',
+        mono: true,
+      },
+      span_id: {
+        text: event.span_id ?? '',
+        secondary: event.parent_span_id ? `父 Span：${event.parent_span_id}` : undefined,
+        mono: true,
+      },
+      summary: event.result_summary ?? '',
+      error_message: {
+        text: event.error_message ?? '',
+        tone: isPresent(event.error_message) ? 'critical' : 'neutral',
+      },
+    }));
+    const agentRawLogSnippets = agentEvents
+      .filter((event) => isPresent(event?.raw_json))
+      .map((event) => ({
+        label: `日志 ID ${event.id ?? '-'} · ${formatTime(event.ts)} · ${event.event ?? '未知事件'}`,
+        body: typeof event.raw_json === 'string' ? event.raw_json : JSON.stringify(event.raw_json),
+      }));
+    const paginationLinks = [];
+    if (agentId && currentLogPage > 1) {
+      paginationLinks.push({
+        label: '上一页',
+        href: dashboardFilterUrl({
+          ...explicitFilters,
+          sort: effectiveSort,
+          logPage: currentLogPage - 1,
+        }, 'agent_logs'),
+      });
+    }
+    if (agentId && currentLogPage < totalLogPages) {
+      paginationLinks.push({
+        label: '下一页',
+        href: dashboardFilterUrl({
+          ...explicitFilters,
+          sort: effectiveSort,
+          logPage: currentLogPage + 1,
+        }, 'agent_logs'),
+      });
+    }
+
+    const queueTitle = isPresent(queueFilters.status)
+      ? `风险发现（${labelOf(STATUS_LABELS, queueFilters.status)}）`
+      : '风险发现';
     const sections = [];
+    if (agentId) {
+      if (agentLogRows.length > 0) {
+        sections.push({
+          id: 'agent_logs',
+          title: `Agent 日志（第 ${currentLogPage}/${totalLogPages} 页，共 ${totalAgentEvents} 条）`,
+          type: 'table',
+          columns: AGENT_LOG_COLUMNS,
+          rows: agentLogRows,
+        });
+      } else {
+        sections.push({
+          id: 'agent_logs',
+          title: 'Agent 日志',
+          type: 'callout',
+          body: '当前 Agent 没有可显示的日志。',
+        });
+      }
+      if (paginationLinks.length > 0) {
+        sections.push({
+          id: 'agent_log_pagination',
+          title: `日志分页（第 ${currentLogPage}/${totalLogPages} 页）`,
+          type: 'link_list',
+          links: paginationLinks,
+        });
+      }
+      if (agentRawLogSnippets.length > 0) {
+        sections.push({
+          id: 'agent_raw_logs',
+          title: '当前页原始日志',
+          type: 'raw_log_list',
+          collapsible: true,
+          snippets: agentRawLogSnippets,
+        });
+      }
+    }
     if (findingRows.length > 0) {
       sections.push({
         id: 'pending_findings',
@@ -1108,7 +1294,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     return {
       page: {
         title: agentId ? `Agent 日志审计：${agentId}` : '审计审查总览',
-        subtitle: agentId ? '查看该 Agent 的待处理风险和关联证据。' : '查看最近审查、待处理风险和关联证据。',
+        subtitle: agentId ? '查看该 Agent 的全部日志、风险发现和关联证据。' : '查看最近审查、风险发现和关联证据。',
         updated_at: updatedAt,
         breadcrumbs: agentId
           ? [{ label: 'Agent 列表', href: '/' }, { label: 'Agent 审计', href: agentDashboardUrl(agentId) }]
@@ -1120,6 +1306,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       filters: findingFiltersViewModel({
         filters: explicitFilters,
         hrefFor: (nextFilters) => dashboardFilterUrl(nextFilters),
+        includeSort: true,
       }),
       clear_filters_href: dashboardFilterUrl({ agentId }),
       sections,

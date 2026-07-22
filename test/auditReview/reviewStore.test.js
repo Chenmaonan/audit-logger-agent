@@ -694,6 +694,55 @@ test('reviewStore: listAgents returns empty when audit_events table is unavailab
   db.close();
 });
 
+test('reviewStore: listAgentEvents isolates, sorts and paginates events for one agent', () => {
+  const db = openDb();
+  db.exec(`
+    CREATE TABLE audit_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      event TEXT NOT NULL
+    );
+  `);
+  const insert = db.prepare(`INSERT INTO audit_events (ts, agent_id, event) VALUES (?, ?, ?)`);
+  insert.run('2026-07-03T10:00:00.000Z', 'agent-a', 'a-oldest');
+  insert.run('2026-07-03T10:02:00.000Z', 'agent-b', 'b-hidden');
+  insert.run('2026-07-03T10:01:00.000Z', 'agent-a', 'a-middle');
+  insert.run('2026-07-03T10:01:00.000Z', 'agent-a', 'a-newer-same-ts');
+  insert.run('2026-07-03T10:03:00.000Z', 'agent-a', 'a-newest');
+
+  const store = createReviewStore(db);
+
+  assert.deepEqual(
+    store.listAgentEvents({ agentId: 'agent-a', limit: 10 }).map((row) => row.event),
+    ['a-newest', 'a-newer-same-ts', 'a-middle', 'a-oldest'],
+  );
+  assert.deepEqual(
+    store.listAgentEvents({ agentId: 'agent-a', limit: 2, offset: 1 }).map((row) => row.event),
+    ['a-newer-same-ts', 'a-middle'],
+  );
+  assert.deepEqual(
+    store.listAgentEvents({ agentId: 'agent-a', limit: 'invalid', offset: -3 }).map((row) => row.event),
+    ['a-newest', 'a-newer-same-ts', 'a-middle', 'a-oldest'],
+  );
+  assert.equal(store.countAgentEvents({ agentId: 'agent-a' }), 4);
+  assert.equal(store.countAgentEvents({ agentId: 'agent-b' }), 1);
+  db.close();
+});
+
+test('reviewStore: agent event queries reject empty agent IDs and tolerate a missing table', () => {
+  const db = openDb();
+  const store = createReviewStore(db);
+
+  assert.deepEqual(store.listAgentEvents({ agentId: '' }), []);
+  assert.deepEqual(store.listAgentEvents({}), []);
+  assert.equal(store.countAgentEvents({ agentId: '' }), 0);
+  assert.equal(store.countAgentEvents({}), 0);
+  assert.deepEqual(store.listAgentEvents({ agentId: 'agent-a' }), []);
+  assert.equal(store.countAgentEvents({ agentId: 'agent-a' }), 0);
+  db.close();
+});
+
 test('reviewStore: listTraceEvents returns audit events for a trace in chronological order', () => {
   const db = openDb();
   db.exec(`

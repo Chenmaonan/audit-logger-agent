@@ -72,7 +72,7 @@ test('dashboard routes pass normalized finding filters to visualization', async 
 
   try {
     const overview = await fetch(
-      `${baseUrl}/dashboard?agent_id=agent%2Fone&severity=high&category=failed_call&status=resolved&review_id=review-1`,
+      `${baseUrl}/dashboard?agent_id=agent%2Fone&severity=high&category=failed_call&status=resolved&review_id=review-1&sort=severity_desc&log_page=3`,
     );
     assert.equal(overview.status, 200);
     assert.equal(overview.headers.get('cache-control'), 'no-store');
@@ -84,11 +84,13 @@ test('dashboard routes pass normalized finding filters to visualization', async 
         category: 'failed_call',
         status: 'resolved',
         reviewId: 'review-1',
+        sort: 'severity_desc',
+        logPage: 3,
       },
     });
 
     const empty = await fetch(
-      `${baseUrl}/dashboard?agent_id=&severity=&category=&status=&review_id=`,
+      `${baseUrl}/dashboard?agent_id=&severity=&category=&status=&review_id=&sort=invalid&log_page=0`,
     );
     assert.equal(empty.status, 200);
     assert.deepEqual(calls.shift(), {
@@ -99,6 +101,8 @@ test('dashboard routes pass normalized finding filters to visualization', async 
         category: undefined,
         status: undefined,
         reviewId: undefined,
+        sort: undefined,
+        logPage: undefined,
       },
     });
 
@@ -911,7 +915,14 @@ test('audit review HTTP integration smoke test', async () => {
       assert.equal(filteredApi.status, 200);
       const filteredBody = await filteredApi.json();
       assert.ok(filteredBody.count >= 1, 'filtered API should contain the agent finding');
-      assert.ok(filteredHtml.includes('待处理风险发现'), 'filtered dashboard should render the findings section');
+      assert.ok(filteredHtml.includes('风险发现'), 'filtered dashboard should render the findings section');
+      assert.ok(filteredHtml.includes('Agent 日志（第 1/1 页，共 3 条）'), 'agent dashboard should render all agent logs');
+      assert.ok(filteredHtml.includes('trace-ok-1'), 'agent dashboard should render the latest trace id');
+      assert.ok(filteredHtml.includes('span-ok-1'), 'agent dashboard should render the latest span id');
+      assert.ok(filteredHtml.includes('search ok'), 'agent dashboard should render normal non-finding logs');
+      assert.ok(filteredHtml.includes('当前页原始日志'), 'agent dashboard should expose current-page raw logs');
+      assert.ok(filteredHtml.includes('全部状态'), 'agent dashboard should default the status filter to all states');
+      assert.equal(filteredHtml.includes('打开最新降级审查'), false, 'dashboard should not render the degraded review shortcut');
       assert.ok(filteredHtml.includes('agent-test'), 'filtered dashboard should contain the agent id');
       assert.ok(filteredHtml.includes('db.delete'), 'filtered dashboard should contain the agent finding tool');
       assert.doesNotMatch(filteredHtml, MOJIBAKE_PATTERN);
