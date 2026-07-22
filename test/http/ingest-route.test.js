@@ -71,7 +71,7 @@ function readSpool(config, agentId, date = '2026-07-06') {
 }
 
 function insertAuditEvent(db, event) {
-  db.prepare(`
+  const result = db.prepare(`
     INSERT INTO audit_events (
       row_hash, ts, agent_id, trace_id, span_id, parent_span_id, event,
       tool_name, status, result_summary, duration_ms, channel, user_id,
@@ -86,6 +86,7 @@ function insertAuditEvent(db, event) {
     raw_json: JSON.stringify(event),
     ...event,
   });
+  return Number(result.lastInsertRowid);
 }
 
 test('resolveSpoolDir defaults to the normalized spool layout', () => {
@@ -223,7 +224,7 @@ test('POST /v1/ingest accepts JSON event batches and stores them immediately', a
 
 test('POST /v1/ingest prunes audit events immediately after accepted batches', async () => {
   await withIngestServer(async ({ baseUrl, db }) => {
-    insertAuditEvent(db, makeEvent({
+    const oldestEventId = insertAuditEvent(db, makeEvent({
       ts: '2026-07-05T01:00:00.000Z',
       trace_id: 'prune-oldest',
       span_id: 'span-prune-oldest',
@@ -233,6 +234,43 @@ test('POST /v1/ingest prunes audit events immediately after accepted batches', a
       trace_id: 'prune-middle',
       span_id: 'span-prune-middle',
     }));
+    db.prepare(`
+      INSERT INTO audit_review_runs (
+        review_id, window_from, window_to, status, trigger_type, finding_count,
+        risk_policy_version, reviewer_version, started_at
+      ) VALUES (
+        'prune-review', '2026-07-05T01:00:00.000Z', '2026-07-05T01:00:00.000Z',
+        'completed', 'ingest', 1, 'risk-policy-v1', 'reviewer-v1', '2026-07-05T01:00:00.000Z'
+      )
+    `).run();
+    db.prepare(`
+      INSERT INTO audit_review_findings (
+        finding_id, review_id, finding_hash, category, severity, title, summary,
+        evidence_event_ids_json, evidence_json, status, created_at, last_seen_at,
+        risk_policy_version, reviewer_version
+      ) VALUES (
+        'prune-finding', 'prune-review', 'prune-finding-hash', 'failed_call', 'medium',
+        'old finding', 'old finding', @evidence_event_ids_json, @evidence_json, 'open',
+        '2026-07-05T01:00:00.000Z', '2026-07-05T01:00:00.000Z',
+        'risk-policy-v1', 'reviewer-v1'
+      )
+    `).run({
+      evidence_event_ids_json: JSON.stringify([oldestEventId]),
+      evidence_json: JSON.stringify([{ event_id: oldestEventId, raw_json: '{"source":"oldest"}' }]),
+    });
+    db.prepare(`
+      INSERT INTO audit_review_finding_occurrences (
+        occurrence_id, finding_id, review_id, severity, title, summary,
+        evidence_event_ids_json, evidence_json, observed_at, created_at
+      ) VALUES (
+        'prune-occurrence', 'prune-finding', 'prune-review', 'medium', 'old finding', 'old finding',
+        @evidence_event_ids_json, @evidence_json,
+        '2026-07-05T01:00:00.000Z', '2026-07-05T01:00:00.000Z'
+      )
+    `).run({
+      evidence_event_ids_json: JSON.stringify([oldestEventId]),
+      evidence_json: JSON.stringify([{ event_id: oldestEventId, raw_json: '{"source":"oldest"}' }]),
+    });
 
     const response = await fetch(`${baseUrl}/v1/ingest`, {
       method: 'POST',
@@ -252,6 +290,9 @@ test('POST /v1/ingest prunes audit events immediately after accepted batches', a
       db.prepare(`SELECT trace_id FROM audit_events WHERE agent_id = 'remote-agent' ORDER BY ts ASC`).all().map((row) => row.trace_id),
       ['prune-middle', 'prune-newest'],
     );
+    assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM audit_review_findings`).get().count, 0);
+    assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM audit_review_finding_occurrences`).get().count, 0);
+    assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM audit_review_runs`).get().count, 0);
   }, {
     retention: {
       eventsHours: 48,

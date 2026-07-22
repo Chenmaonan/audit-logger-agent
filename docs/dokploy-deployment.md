@@ -42,6 +42,8 @@
 
 Compose 已声明命名卷 `audit-logger-data` 并挂载到 `/app/data`。该卷保存 SQLite 数据库、WAL/SHM 文件、接收 spool、captures 和临时运行数据；删除容器不会保留数据，删除该卷才会。
 
+日志 retention 会同步清理 Dashboard 派生数据：当 `audit_events` 因超过 `eventsHours` 或超过单 Agent 的 `maxEventsPerAgent` 上限而删除时，对应的 Finding Occurrence、原始证据快照、失去全部有效证据的 Finding，以及不再包含有效 Finding 的审查批次会一并删除，不区分 Finding 当前是待处理、已确认还是已解决。该清理不可逆；升级到包含此规则的版本前必须备份 `/app/data/db/audit.db` 及 WAL/SHM，生产部署后不要通过手工触发 prune 验证，先在复用相同目录结构的 Docker 测试卷中执行 dry-run 和正式清理对比。
+
 在 Dokploy 中保留该 Volume，不要改为容器临时文件系统。部署完成后，通过 Dokploy 健康检查或受控网络请求确认：
 
 ```text

@@ -15,8 +15,6 @@ const DEFAULT_RETENTION = {
   maxEventsPerAgent: DEFAULT_AUDIT_EVENT_MAX_PER_AGENT,
   runtimeRunsDays: 30,
   waitingStatesDays: 30,
-  resolvedFindingsDays: 30,
-  reviewRunsDays: 60,
   llmUsageDays: 90,
   outboxDays: 14,
   logFilesDays: 14,
@@ -96,24 +94,69 @@ function deleteBatched(db, { countSql, deleteSql, params, batchSize, dryRun }) {
   return { deleted: batches.reduce((sum, n) => sum + n, 0), batches };
 }
 
-function deleteResolvedFindings(db, { cutoff, batchSize, dryRun }) {
-  const params = { cutoff };
-  const total = countRows(db, `
-    SELECT COUNT(*) AS count
-    FROM audit_review_findings
-    WHERE status = 'resolved' AND resolved_at IS NOT NULL AND resolved_at < @cutoff
-  `, params);
-  if (dryRun || total === 0) {
-    return { deleted: total, batches: [] };
-  }
+function safeEvidenceArraySql(column) {
+  return `CASE
+    WHEN json_valid(${column}) THEN
+      CASE WHEN json_type(${column}) = 'array' THEN ${column} ELSE '[]' END
+    ELSE '[]'
+  END`;
+}
 
-  const selectIds = db.prepare(`
-    SELECT finding_id
-    FROM audit_review_findings
-    WHERE status = 'resolved' AND resolved_at IS NOT NULL AND resolved_at < @cutoff
-    ORDER BY resolved_at ASC, finding_id ASC
-    LIMIT @limit
-  `);
+function survivingAuditEventsCte() {
+  return `
+    WITH ranked_historical_events AS (
+      SELECT
+        id,
+        ROW_NUMBER() OVER (
+          PARTITION BY agent_id
+          ORDER BY ts DESC, rowid DESC
+        ) AS retained_rank
+      FROM audit_events
+      WHERE ts >= @auditCutoff AND ts < @preserveFrom
+    ),
+    surviving_events AS (
+      SELECT events.id
+      FROM audit_events events
+      LEFT JOIN ranked_historical_events ranked ON ranked.id = events.id
+      WHERE events.ts >= @auditCutoff
+        AND (events.ts >= @preserveFrom OR ranked.retained_rank <= @maxPerAgent)
+    )
+  `;
+}
+
+function hasEvidenceIdsSql(column) {
+  return `json_array_length(${safeEvidenceArraySql(column)}) > 0`;
+}
+
+function hasSurvivingEvidenceSql(column) {
+  return `EXISTS (
+    SELECT 1
+    FROM json_each(${safeEvidenceArraySql(column)}) evidence
+    INNER JOIN surviving_events events ON events.id = CAST(evidence.value AS INTEGER)
+  )`;
+}
+
+function staleOccurrenceSql(alias = 'occurrences') {
+  return `(
+    ${alias}.observed_at < @auditCutoff
+    OR (
+      ${hasEvidenceIdsSql(`${alias}.evidence_event_ids_json`)}
+      AND NOT ${hasSurvivingEvidenceSql(`${alias}.evidence_event_ids_json`)}
+    )
+  )`;
+}
+
+function staleFindingSql(alias = 'findings') {
+  return `(
+    ${alias}.last_seen_at < @auditCutoff
+    OR (
+      ${hasEvidenceIdsSql(`${alias}.evidence_event_ids_json`)}
+      AND NOT ${hasSurvivingEvidenceSql(`${alias}.evidence_event_ids_json`)}
+    )
+  )`;
+}
+
+function deleteFindingRows(db, findingIds) {
   const deleteActions = db.prepare(`DELETE FROM audit_finding_actions WHERE finding_id = ?`);
   const deleteOccurrences = db.prepare(`DELETE FROM audit_review_finding_occurrences WHERE finding_id = ?`);
   const deleteFinding = db.prepare(`DELETE FROM audit_review_findings WHERE finding_id = ?`);
@@ -126,17 +169,219 @@ function deleteResolvedFindings(db, { cutoff, batchSize, dryRun }) {
     }
     return deleted;
   });
+  return deleteBatch(findingIds);
+}
+
+function maxSeverityOf(occurrences) {
+  const rank = { low: 1, medium: 2, high: 3, critical: 4 };
+  return occurrences.reduce((highest, occurrence) => (
+    (rank[occurrence.severity] ?? 0) > (rank[highest] ?? 0) ? occurrence.severity : highest
+  ), occurrences[0]?.severity ?? null);
+}
+
+function rebaseFindingsFromOccurrences(db, findingIds) {
+  if (findingIds.size === 0) return;
+
+  const listOccurrences = db.prepare(`
+    SELECT *
+    FROM audit_review_finding_occurrences
+    WHERE finding_id = ?
+    ORDER BY observed_at ASC, occurrence_id ASC
+  `);
+  const updateFinding = db.prepare(`
+    UPDATE audit_review_findings
+    SET review_id = @first_review_id,
+        first_review_id = @first_review_id,
+        last_review_id = @last_review_id,
+        severity = @severity,
+        max_severity = @max_severity,
+        title = @title,
+        summary = @summary,
+        recommendation = @recommendation,
+        evidence_event_ids_json = @evidence_event_ids_json,
+        evidence_json = @evidence_json,
+        occurrence_count = @occurrence_count,
+        created_at = @created_at,
+        last_seen_at = @last_seen_at
+    WHERE finding_id = @finding_id
+  `);
+  const rebase = db.transaction((ids) => {
+    for (const findingId of ids) {
+      const occurrences = listOccurrences.all(findingId);
+      if (occurrences.length === 0) continue;
+      const first = occurrences[0];
+      const last = occurrences[occurrences.length - 1];
+      updateFinding.run({
+        finding_id: findingId,
+        first_review_id: first.review_id,
+        last_review_id: last.review_id,
+        severity: last.severity,
+        max_severity: maxSeverityOf(occurrences),
+        title: last.title,
+        summary: last.summary,
+        recommendation: last.recommendation ?? null,
+        evidence_event_ids_json: last.evidence_event_ids_json,
+        evidence_json: last.evidence_json ?? null,
+        occurrence_count: occurrences.length,
+        created_at: first.created_at,
+        last_seen_at: last.observed_at,
+      });
+    }
+  });
+  rebase([...findingIds]);
+}
+
+function deleteExpiredFindingOccurrences(db, {
+  auditCutoff,
+  preserveFrom,
+  maxPerAgent,
+  batchSize,
+  dryRun,
+}) {
+  const params = { auditCutoff, preserveFrom, maxPerAgent };
+  const cte = survivingAuditEventsCte();
+  const predicate = staleOccurrenceSql();
+  const total = countRows(db, `
+    ${cte}
+    SELECT COUNT(*) AS count
+    FROM audit_review_finding_occurrences occurrences
+    WHERE ${predicate}
+  `, params);
+  if (dryRun || total === 0) return { deleted: total, batches: [] };
+
+  const selectRows = db.prepare(`
+    ${cte}
+    SELECT occurrences.occurrence_id, occurrences.finding_id
+    FROM audit_review_finding_occurrences occurrences
+    WHERE ${predicate}
+    ORDER BY occurrences.observed_at ASC, occurrences.occurrence_id ASC
+    LIMIT @limit
+  `);
+  const deleteOccurrence = db.prepare(`DELETE FROM audit_review_finding_occurrences WHERE occurrence_id = ?`);
+  const deleteBatch = db.transaction((rows) => {
+    let deleted = 0;
+    for (const row of rows) deleted += deleteOccurrence.run(row.occurrence_id).changes;
+    return deleted;
+  });
+
+  const affectedFindingIds = new Set();
+  const batches = [];
+  while (true) {
+    const rows = selectRows.all({ ...params, limit: batchSize });
+    if (rows.length === 0) break;
+    for (const row of rows) affectedFindingIds.add(row.finding_id);
+    const deleted = deleteBatch(rows);
+    if (deleted === 0) break;
+    batches.push(deleted);
+    if (deleted < batchSize) break;
+  }
+  rebaseFindingsFromOccurrences(db, affectedFindingIds);
+  return { deleted: batches.reduce((sum, n) => sum + n, 0), batches };
+}
+
+function deleteExpiredFindings(db, {
+  auditCutoff,
+  preserveFrom,
+  maxPerAgent,
+  batchSize,
+  dryRun,
+}) {
+  const params = { auditCutoff, preserveFrom, maxPerAgent };
+  const cte = survivingAuditEventsCte();
+  const predicate = staleFindingSql();
+  const total = countRows(db, `
+    ${cte}
+    SELECT COUNT(*) AS count
+    FROM audit_review_findings findings
+    WHERE ${predicate}
+  `, params);
+  if (dryRun || total === 0) return { deleted: total, batches: [] };
+
+  const selectIds = db.prepare(`
+    ${cte}
+    SELECT findings.finding_id
+    FROM audit_review_findings findings
+    WHERE ${predicate}
+    ORDER BY findings.last_seen_at ASC, findings.finding_id ASC
+    LIMIT @limit
+  `);
 
   const batches = [];
   while (true) {
-    const findingIds = selectIds.all({ cutoff, limit: batchSize }).map((row) => row.finding_id);
+    const findingIds = selectIds.all({ ...params, limit: batchSize }).map((row) => row.finding_id);
     if (findingIds.length === 0) break;
-    const deleted = deleteBatch(findingIds);
+    const deleted = deleteFindingRows(db, findingIds);
     if (deleted === 0) break;
     batches.push(deleted);
     if (deleted < batchSize) break;
   }
   return { deleted: batches.reduce((sum, n) => sum + n, 0), batches };
+}
+
+function deleteExpiredReviewRuns(db, {
+  auditCutoff,
+  preserveFrom,
+  maxPerAgent,
+  batchSize,
+  dryRun,
+}) {
+  const cte = survivingAuditEventsCte();
+  const occurrenceIsStale = staleOccurrenceSql('occurrences');
+  const findingIsStale = staleFindingSql('findings');
+  return deleteBatched(db, {
+    countSql: `
+      ${cte}
+      SELECT COUNT(*) AS count
+      FROM audit_review_runs runs
+      WHERE (runs.started_at < @auditCutoff OR runs.finding_count > 0)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM audit_review_finding_occurrences occurrences
+          WHERE occurrences.review_id = runs.review_id
+            AND NOT ${occurrenceIsStale}
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM audit_review_findings findings
+          WHERE (
+              findings.review_id = runs.review_id
+              OR findings.first_review_id = runs.review_id
+              OR findings.last_review_id = runs.review_id
+            )
+            AND NOT ${findingIsStale}
+        )
+    `,
+    deleteSql: `
+      ${cte}
+      DELETE FROM audit_review_runs
+      WHERE rowid IN (
+        SELECT runs.rowid
+        FROM audit_review_runs runs
+        WHERE (runs.started_at < @auditCutoff OR runs.finding_count > 0)
+          AND NOT EXISTS (
+            SELECT 1
+            FROM audit_review_finding_occurrences occurrences
+            WHERE occurrences.review_id = runs.review_id
+              AND NOT ${occurrenceIsStale}
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM audit_review_findings findings
+            WHERE (
+                findings.review_id = runs.review_id
+                OR findings.first_review_id = runs.review_id
+                OR findings.last_review_id = runs.review_id
+              )
+              AND NOT ${findingIsStale}
+          )
+        ORDER BY runs.started_at ASC, runs.review_id ASC
+        LIMIT @limit
+      )
+    `,
+    params: { auditCutoff, preserveFrom, maxPerAgent },
+    batchSize,
+    dryRun,
+  });
 }
 
 function resolveMaybeRelative(baseDir, value) {
@@ -392,16 +637,45 @@ export function createRetentionService({ db, config, cursorStore = null, now = (
     return { ...params, deletion };
   }
 
+  function pruneAuditData({ cfg, nowDate, batchSize, dryRun }) {
+    const auditEvents = deleteAuditEvents({ cfg, nowDate, batchSize, dryRun });
+    const dashboardParams = {
+      auditCutoff: auditEvents.cutoff,
+      preserveFrom: auditEvents.preserveFrom,
+      maxPerAgent: auditEvents.maxPerAgent,
+      batchSize,
+      dryRun,
+    };
+    const findingOccurrences = deleteExpiredFindingOccurrences(db, dashboardParams);
+    const findings = deleteExpiredFindings(db, dashboardParams);
+    const reviewRuns = deleteExpiredReviewRuns(db, dashboardParams);
+    return {
+      cutoff: auditEvents.cutoff,
+      preserveFrom: auditEvents.preserveFrom,
+      maxPerAgent: auditEvents.maxPerAgent,
+      deletions: {
+        auditEvents: auditEvents.deletion,
+        findingOccurrences,
+        findings,
+        reviewRuns,
+      },
+    };
+  }
+
   function pruneAuditEvents({ dryRun = false, batchSize = DEFAULT_BATCH_SIZE } = {}) {
     const cfg = retentionConfig(config);
     const size = safeLimit(batchSize);
-    const pruned = deleteAuditEvents({ cfg, nowDate: now(), batchSize: size, dryRun });
+    const pruned = pruneAuditData({ cfg, nowDate: now(), batchSize: size, dryRun });
     return {
       dryRun,
       cutoff: pruned.cutoff,
       maxEventsPerAgent: pruned.maxPerAgent,
-      deleted: { auditEvents: pruned.deletion.deleted },
-      batches: { auditEvents: pruned.deletion.batches },
+      deleted: Object.fromEntries(
+        Object.entries(pruned.deletions).map(([key, value]) => [key, value.deleted]),
+      ),
+      batches: Object.fromEntries(
+        Object.entries(pruned.deletions).map(([key, value]) => [key, value.batches]),
+      ),
     };
   }
 
@@ -409,16 +683,17 @@ export function createRetentionService({ db, config, cursorStore = null, now = (
     const cfg = retentionConfig(config);
     const size = safeLimit(batchSize);
     const nowDate = now();
-    const auditEventsPruned = deleteAuditEvents({ cfg, nowDate, batchSize: size, dryRun });
+    const auditDataPruned = pruneAuditData({ cfg, nowDate, batchSize: size, dryRun });
     const result = {
       dryRun,
       cutoffs: {
-        auditEvents: auditEventsPruned.cutoff,
+        auditEvents: auditDataPruned.cutoff,
+        findingOccurrences: auditDataPruned.cutoff,
+        findings: auditDataPruned.cutoff,
+        reviewRuns: auditDataPruned.cutoff,
         agentRuns: cutoffIso(nowDate, cfg.runtimeRunsDays),
         agentRunSteps: cutoffIso(nowDate, cfg.runtimeRunsDays),
         agentWaitingStates: cutoffIso(nowDate, cfg.waitingStatesDays),
-        resolvedFindings: cutoffIso(nowDate, cfg.resolvedFindingsDays),
-        reviewRuns: cutoffIso(nowDate, cfg.reviewRunsDays),
         auditLlmUsage: cutoffDay(nowDate, cfg.llmUsageDays),
         outboxEvents: cutoffIso(nowDate, cfg.outboxDays),
         logFiles: cutoffIso(nowDate, cfg.logFilesDays),
@@ -427,11 +702,12 @@ export function createRetentionService({ db, config, cursorStore = null, now = (
       },
       deleted: {
         auditEvents: 0,
+        findingOccurrences: 0,
+        findings: 0,
         agentRuns: 0,
         agentRunSteps: 0,
         agentWaitingStates: 0,
         reviewRuns: 0,
-        resolvedFindings: 0,
         auditLlmUsage: 0,
         outboxEvents: 0,
         ingestCursors: 0,
@@ -442,11 +718,12 @@ export function createRetentionService({ db, config, cursorStore = null, now = (
       },
       batches: {
         auditEvents: [],
+        findingOccurrences: [],
+        findings: [],
         agentRuns: [],
         agentRunSteps: [],
         agentWaitingStates: [],
         reviewRuns: [],
-        resolvedFindings: [],
         auditLlmUsage: [],
         outboxEvents: [],
       },
@@ -454,7 +731,7 @@ export function createRetentionService({ db, config, cursorStore = null, now = (
     };
 
     const deletions = {
-      auditEvents: auditEventsPruned.deletion,
+      ...auditDataPruned.deletions,
       agentRunSteps: deleteBatched(db, {
         countSql: `
           SELECT COUNT(*) AS count
@@ -535,56 +812,6 @@ export function createRetentionService({ db, config, cursorStore = null, now = (
           )
         `,
         params: { cutoff: result.cutoffs.agentRuns },
-        batchSize: size,
-        dryRun,
-      }),
-      resolvedFindings: deleteResolvedFindings(db, {
-        cutoff: result.cutoffs.resolvedFindings,
-        batchSize: size,
-        dryRun,
-      }),
-      reviewRuns: deleteBatched(db, {
-        countSql: `
-          SELECT COUNT(*) AS count
-          FROM audit_review_runs runs
-          WHERE runs.started_at < @cutoff
-            AND NOT EXISTS (
-              SELECT 1
-              FROM audit_review_finding_occurrences occurrences
-              INNER JOIN audit_review_findings findings ON findings.finding_id = occurrences.finding_id
-              WHERE occurrences.review_id = runs.review_id
-                AND NOT (
-                  findings.status = 'resolved'
-                  AND findings.resolved_at IS NOT NULL
-                  AND findings.resolved_at < @resolvedFindingCutoff
-                )
-            )
-        `,
-        deleteSql: `
-          DELETE FROM audit_review_runs
-          WHERE rowid IN (
-            SELECT runs.rowid
-            FROM audit_review_runs runs
-            WHERE runs.started_at < @cutoff
-              AND NOT EXISTS (
-                SELECT 1
-                FROM audit_review_finding_occurrences occurrences
-                INNER JOIN audit_review_findings findings ON findings.finding_id = occurrences.finding_id
-                WHERE occurrences.review_id = runs.review_id
-                  AND NOT (
-                    findings.status = 'resolved'
-                    AND findings.resolved_at IS NOT NULL
-                    AND findings.resolved_at < @resolvedFindingCutoff
-                  )
-              )
-            ORDER BY runs.started_at ASC, runs.review_id ASC
-            LIMIT @limit
-          )
-        `,
-        params: {
-          cutoff: result.cutoffs.reviewRuns,
-          resolvedFindingCutoff: result.cutoffs.resolvedFindings,
-        },
         batchSize: size,
         dryRun,
       }),
