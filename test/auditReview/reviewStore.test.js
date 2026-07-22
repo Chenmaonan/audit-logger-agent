@@ -730,6 +730,70 @@ test('reviewStore: listAgentEvents isolates, sorts and paginates events for one 
   db.close();
 });
 
+test('reviewStore: listAgentEvents orders associated event severity before paginating', () => {
+  const db = openDb();
+  db.exec(`
+    CREATE TABLE audit_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      event TEXT NOT NULL
+    );
+  `);
+  const insertEvent = db.prepare(`INSERT INTO audit_events (ts, agent_id, event) VALUES (?, ?, ?)`);
+  insertEvent.run('2026-07-03T10:04:00.000Z', 'agent-a', 'unclassified-newest');
+  insertEvent.run('2026-07-03T10:03:00.000Z', 'agent-a', 'low');
+  insertEvent.run('2026-07-03T10:02:00.000Z', 'agent-a', 'critical');
+  insertEvent.run('2026-07-03T10:01:00.000Z', 'agent-a', 'high');
+  const insertFinding = db.prepare(`
+    INSERT INTO audit_review_findings (
+      finding_id, review_id, finding_hash, category, severity, title, summary,
+      evidence_event_ids_json, status, created_at, last_seen_at,
+      risk_policy_version, reviewer_version
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const [findingId, severity, eventId] of [
+    ['finding-low', 'low', 2],
+    ['finding-critical', 'critical', 3],
+    ['finding-high', 'high', 4],
+  ]) {
+    insertFinding.run(
+      findingId,
+      'review-1',
+      `hash-${findingId}`,
+      'failed_call',
+      severity,
+      `${severity} finding`,
+      `${severity} event`,
+      `[${eventId}]`,
+      'open',
+      '2026-07-03T10:04:00.000Z',
+      '2026-07-03T10:04:00.000Z',
+      'risk-v1',
+      'reviewer-v1',
+    );
+  }
+  const insertOccurrence = db.prepare(`
+    INSERT INTO audit_review_finding_occurrences (
+      occurrence_id, finding_id, review_id, severity, title, summary,
+      evidence_event_ids_json, observed_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insertOccurrence.run('occ-low', 'finding-low', 'review-1', 'low', 'Low', 'Low event', '[2]', '2026-07-03T10:04:00.000Z', '2026-07-03T10:04:00.000Z');
+  insertOccurrence.run('occ-critical', 'finding-critical', 'review-1', 'critical', 'Critical', 'Critical event', '[3]', '2026-07-03T10:04:00.000Z', '2026-07-03T10:04:00.000Z');
+  insertOccurrence.run('occ-high', 'finding-high', 'review-1', 'high', 'High', 'High event', '[4]', '2026-07-03T10:04:00.000Z', '2026-07-03T10:04:00.000Z');
+
+  const store = createReviewStore(db);
+  const firstPage = store.listAgentEvents({ agentId: 'agent-a', sort: 'severity_desc', limit: 2 });
+  const secondPage = store.listAgentEvents({ agentId: 'agent-a', sort: 'severity_desc', limit: 2, offset: 2 });
+
+  assert.deepEqual(firstPage.map((row) => row.event), ['critical', 'high']);
+  assert.deepEqual(firstPage.map((row) => row.severity), ['critical', 'high']);
+  assert.deepEqual(secondPage.map((row) => row.event), ['low', 'unclassified-newest']);
+  assert.deepEqual(secondPage.map((row) => row.severity), ['low', null]);
+  db.close();
+});
+
 test('reviewStore: agent event queries reject empty agent IDs and tolerate a missing table', () => {
   const db = openDb();
   const store = createReviewStore(db);

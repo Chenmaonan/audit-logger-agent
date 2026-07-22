@@ -279,7 +279,27 @@ test('renderDashboard renders real GET filter links, active state, and clear act
   assert.ok(html.includes('href="/dashboard?status=open" class="filter-clear">清除严重级别</a>'));
   assert.ok(html.includes('href="/dashboard?status=open" class="filter-clear-all">清除全部筛选</a>'));
   assert.equal(html.includes('<select'), false);
-  assert.equal(html.includes('disabled'), false);
+  assert.equal(html.includes('<select disabled'), false);
+});
+
+test('renderDashboard renders Agent log pagination with stable disabled controls', () => {
+  const html = renderDashboard({
+    page: { title: 'Agent 日志审计' },
+    sections: [{
+      id: 'agent_log_pagination',
+      type: 'pagination',
+      title: '日志分页（第 1/3 页）',
+      currentPage: 1,
+      totalPages: 3,
+      nextHref: '/dashboard?agent_id=agent-1&log_page=2#agent_logs',
+    }],
+  });
+
+  assert.ok(html.includes('<nav class="pagination-controls" aria-label="日志分页">'));
+  assert.ok(html.includes('class="pagination-control pagination-previous is-disabled" aria-disabled="true">上一页</span>'));
+  assert.ok(html.includes('<span class="pagination-status" aria-current="page">第 1 / 3 页</span>'));
+  assert.ok(html.includes('<a href="/dashboard?agent_id=agent-1&amp;log_page=2#agent_logs" class="pagination-control pagination-next">下一页</a>'));
+  assert.equal(html.includes('<ul class="link-list">'), false);
 });
 
 test('renderDashboard adds scoped responsive column classes from safe keys and priorities', () => {

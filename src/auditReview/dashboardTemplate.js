@@ -34,6 +34,7 @@ function visibleSections(sections = []) {
     if (section.type === 'table') return Array.isArray(section.rows) && section.rows.length > 0;
     if (section.type === 'definition_list') return Array.isArray(section.items) && section.items.some((item) => hasValue(item.value));
     if (section.type === 'link_list') return Array.isArray(section.links) && section.links.length > 0;
+    if (section.type === 'pagination') return Number(section.totalPages) > 1;
     if (section.type === 'callout') return hasValue(section.body) || hasValue(section.title);
     if (section.type === 'raw_log_list') return Array.isArray(section.snippets) && section.snippets.some((snippet) => hasValue(snippet.body));
     if (section.type === 'trace_sequence') return Array.isArray(section.steps) && section.steps.length > 0;
@@ -304,6 +305,30 @@ function renderLinkListSection(section) {
   return renderDataSection({ id, title, body: `<ul class="link-list">${items}</ul>` });
 }
 
+function renderPaginationControl({ href, label, direction }) {
+  const className = `pagination-control pagination-${direction}`;
+  if (!hasValue(href)) {
+    return `<span class="${className} is-disabled" aria-disabled="true">${escapeHtml(label)}</span>`;
+  }
+  return `<a href="${escapeHtml(href)}" class="${className}">${escapeHtml(label)}</a>`;
+}
+
+function renderPaginationSection(section) {
+  const currentPage = Number(section.currentPage);
+  const totalPages = Number(section.totalPages);
+  if (!Number.isInteger(currentPage) || !Number.isInteger(totalPages) || totalPages <= 1) return '';
+  return renderDataSection({
+    id: section.id ?? '',
+    title: section.title ?? '',
+    className: 'pagination-section',
+    body: `<nav class="pagination-controls" aria-label="日志分页">
+      ${renderPaginationControl({ href: section.previousHref, label: '上一页', direction: 'previous' })}
+      <span class="pagination-status" aria-current="page">第 ${currentPage} / ${totalPages} 页</span>
+      ${renderPaginationControl({ href: section.nextHref, label: '下一页', direction: 'next' })}
+    </nav>`,
+  });
+}
+
 function renderCalloutSection(section) {
   const id = section.id ?? '';
   const title = section.title ?? '';
@@ -455,6 +480,7 @@ function renderSection(section) {
     case 'table': return renderTableSection(section);
     case 'definition_list': return renderDefinitionListSection(section);
     case 'link_list': return renderLinkListSection(section);
+    case 'pagination': return renderPaginationSection(section);
     case 'callout': return renderCalloutSection(section);
     case 'raw_log_list': return renderRawLogListSection(section);
     case 'trace_sequence': return renderTraceSequenceSection(section);
@@ -836,6 +862,21 @@ a:hover {
 .raw-log-pre code { font-family: "JetBrains Mono", "Cascadia Code", monospace; }
 .link-list { list-style: none; padding: 0; margin: 0; }
 .link-list li { padding: 6px 0; }
+.pagination-section { padding: 12px 16px; }
+.pagination-controls { display: flex; align-items: center; justify-content: center; gap: 12px; }
+.pagination-control {
+  min-width: 72px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--accent);
+  background: var(--surface);
+  text-align: center;
+  text-decoration: none;
+}
+.pagination-control:hover { background: var(--surface-muted); text-decoration: none; }
+.pagination-control.is-disabled { color: var(--text-muted); background: var(--surface-muted); cursor: not-allowed; }
+.pagination-status { min-width: 96px; color: var(--text-muted); font-size: 13px; text-align: center; }
 .callout-body { font-size: 14px; color: var(--text); }
 .trace-sequence {
   list-style: none;

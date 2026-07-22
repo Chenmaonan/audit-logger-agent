@@ -109,12 +109,19 @@ function fakeStore(overrides = {}) {
     listTraceEvents({ traceId }) {
       return traceId === 'trace-critical-1' ? traceEvents : [];
     },
-    listAgentEvents({ agentId, limit = 100, offset = 0 }) {
+    listAgentEvents({ agentId, limit = 100, offset = 0, sort = 'time_desc' }) {
       if (agentId !== 'agent-1') return [];
       return traceEvents
         .filter((row) => (row.agent_id ?? 'agent-1') === agentId)
         .slice()
-        .sort((left, right) => Date.parse(right.ts) - Date.parse(left.ts) || right.id - left.id)
+        .sort((left, right) => {
+          const ranks = { critical: 4, high: 3, medium: 2, low: 1 };
+          if (sort === 'severity_desc') {
+            const severityDelta = (ranks[right.severity] ?? 0) - (ranks[left.severity] ?? 0);
+            if (severityDelta !== 0) return severityDelta;
+          }
+          return Date.parse(right.ts) - Date.parse(left.ts) || right.id - left.id;
+        })
         .slice(offset, offset + limit);
     },
     countAgentEvents({ agentId }) {
@@ -310,6 +317,7 @@ test('overviewPage filters findings by agent id and links back to agent index', 
     'event',
     'tool_name',
     'status',
+    'severity',
     'duration_ms',
     'trace_id',
     'span_id',
@@ -318,6 +326,7 @@ test('overviewPage filters findings by agent id and links back to agent index', 
   ]);
   assert.deepEqual(logsSection.rows.map((row) => row.event.text), ['tool.end', 'tool.start']);
   assert.equal(logsSection.rows[0].status.text, '内部错误');
+  assert.equal(logsSection.rows[0].severity.text, '未分级');
   assert.equal(logsSection.rows[0].duration_ms.text, '640 ms');
   assert.equal(logsSection.rows[0].span_id.text, 'span-1');
   const rawLogs = page.sections.find((section) => section.id === 'agent_raw_logs');
@@ -397,17 +406,38 @@ test('overviewPage paginates agent logs by 100 and preserves filters in navigati
   assert.equal(logs.rows[99].tool_name.text, 'tool.6');
 
   const pagination = page.sections.find((section) => section.id === 'agent_log_pagination');
-  assert.deepEqual(pagination.links.map((link) => link.label), ['上一页', '下一页']);
+  assert.equal(pagination.type, 'pagination');
+  assert.equal(pagination.currentPage, 2);
+  assert.equal(pagination.totalPages, 3);
   assert.equal(
-    pagination.links[0].href,
+    pagination.previousHref,
     '/dashboard?agent_id=agent-1&severity=high&category=failed_call&status=resolved&review_id=r-clean&sort=severity_desc&log_page=1#agent_logs',
   );
   assert.equal(
-    pagination.links[1].href,
+    pagination.nextHref,
     '/dashboard?agent_id=agent-1&severity=high&category=failed_call&status=resolved&review_id=r-clean&sort=severity_desc&log_page=3#agent_logs',
   );
   const rawLogs = page.sections.find((section) => section.id === 'agent_raw_logs');
   assert.equal(rawLogs.snippets.length, 100);
+});
+
+test('overviewPage resets Agent log pagination and anchors the sort controls at the logs', () => {
+  const events = traceEvents(205).map((event) => ({ ...event, agent_id: 'agent-1' }));
+  const page = createViz({ traceEvents: events }).overviewPage({
+    agentId: 'agent-1',
+    sort: 'time_desc',
+    logPage: 3,
+  });
+
+  const sortFilter = page.filters.find((filter) => filter.id === 'sort');
+  assert.equal(
+    sortFilter.options.find((option) => option.value === 'severity_desc').href,
+    '/dashboard?agent_id=agent-1&sort=severity_desc&log_page=1#agent_logs',
+  );
+  assert.equal(
+    sortFilter.options.find((option) => option.value === 'time_desc').href,
+    '/dashboard?agent_id=agent-1&sort=time_desc&log_page=1#agent_logs',
+  );
 });
 
 test('overviewPage combines filters, preserves them in GET links, and exposes clear links', () => {

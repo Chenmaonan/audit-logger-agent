@@ -345,6 +345,7 @@ export function createReviewStore(db) {
   let traceEventsStmt = null;
   let listAgentsStmt = null;
   let listAgentEventsStmt = null;
+  let listAgentEventsFallbackStmt = null;
   let countAgentEventsStmt = null;
   function getDeadLetterCountStmt() {
     if (!deadLetterCountStmt) {
@@ -403,13 +404,53 @@ export function createReviewStore(db) {
   function getListAgentEventsStmt() {
     if (!listAgentEventsStmt) {
       listAgentEventsStmt = db.prepare(`
-        SELECT * FROM audit_events
-        WHERE agent_id = @agent_id
-        ORDER BY ts DESC, id DESC
+        WITH event_severity AS (
+          SELECT
+            CAST(evidence.value AS INTEGER) AS event_id,
+            MAX(CASE occurrences.severity
+              WHEN 'critical' THEN 4
+              WHEN 'high' THEN 3
+              WHEN 'medium' THEN 2
+              WHEN 'low' THEN 1
+              ELSE 0
+            END) AS severity_rank
+          FROM audit_review_finding_occurrences occurrences
+          JOIN json_each(occurrences.evidence_event_ids_json) evidence
+          GROUP BY CAST(evidence.value AS INTEGER)
+        )
+        SELECT
+          events.*,
+          CASE event_severity.severity_rank
+            WHEN 4 THEN 'critical'
+            WHEN 3 THEN 'high'
+            WHEN 2 THEN 'medium'
+            WHEN 1 THEN 'low'
+            ELSE NULL
+          END AS severity
+        FROM audit_events events
+        LEFT JOIN event_severity ON event_severity.event_id = events.id
+        WHERE events.agent_id = @agent_id
+        ORDER BY
+          CASE WHEN @sort = 'severity_desc' THEN COALESCE(event_severity.severity_rank, 0) ELSE 0 END DESC,
+          events.ts DESC,
+          events.id DESC
         LIMIT @limit OFFSET @offset
       `);
     }
     return listAgentEventsStmt;
+  }
+
+  function getListAgentEventsFallbackStmt() {
+    if (!listAgentEventsFallbackStmt) {
+      listAgentEventsFallbackStmt = db.prepare(`
+        SELECT events.*, NULL AS severity
+        FROM audit_events events
+        WHERE events.agent_id = @agent_id
+        ORDER BY events.ts DESC, events.id DESC
+        LIMIT @limit OFFSET @offset
+      `);
+    }
+    return listAgentEventsFallbackStmt;
   }
 
   function getCountAgentEventsStmt() {
@@ -859,19 +900,25 @@ export function createReviewStore(db) {
       }
     },
 
-    listAgentEvents({ agentId, limit = 100, offset = 0 } = {}) {
+    listAgentEvents({ agentId, limit = 100, offset = 0, sort = 'time_desc' } = {}) {
       if (!agentId) return [];
       const parsedLimit = Number(limit);
       const parsedOffset = Number(offset);
       const safeLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : 100;
       const safeOffset = Number.isFinite(parsedOffset) && parsedOffset >= 0 ? Math.floor(parsedOffset) : 0;
+      const safeSort = sort === 'severity_desc' ? 'severity_desc' : 'time_desc';
+      const query = { agent_id: agentId, limit: safeLimit, offset: safeOffset, sort: safeSort };
       try {
-        return getListAgentEventsStmt().all({
-          agent_id: agentId,
-          limit: safeLimit,
-          offset: safeOffset,
-        });
+        return getListAgentEventsStmt().all(query);
       } catch (error) {
+        if (/no such table:\s*audit_review_finding_occurrences/i.test(error?.message ?? '')) {
+          try {
+            return getListAgentEventsFallbackStmt().all(query);
+          } catch (fallbackError) {
+            if (/no such table/i.test(fallbackError?.message ?? '')) return [];
+            throw fallbackError;
+          }
+        }
         if (/no such table/i.test(error?.message ?? '')) return [];
         throw error;
       }

@@ -85,6 +85,7 @@ const AGENT_LOG_COLUMNS = [
   { key: 'event', label: '事件', priority: 'primary' },
   { key: 'tool_name', label: '工具', priority: 'primary' },
   { key: 'status', label: '状态', priority: 'primary' },
+  { key: 'severity', label: '严重级别', priority: 'primary' },
   { key: 'duration_ms', label: '耗时', priority: 'secondary' },
   { key: 'trace_id', label: 'Trace ID', priority: 'secondary' },
   { key: 'span_id', label: 'Span ID', priority: 'metadata' },
@@ -258,12 +259,6 @@ function compareFindingsByTime(left, right) {
   const timeDelta = compareByIsoDesc(lastSeenAtOf(left), lastSeenAtOf(right));
   if (timeDelta !== 0) return timeDelta;
   return severityRank(right?.severity) - severityRank(left?.severity);
-}
-
-function compareAgentEventsDesc(left, right) {
-  const timeDelta = compareByIsoDesc(left?.ts, right?.ts);
-  if (timeDelta !== 0) return timeDelta;
-  return Number(right?.id ?? 0) - Number(left?.id ?? 0);
 }
 
 function formatWindow(run) {
@@ -644,13 +639,13 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
           : definition.allLabel,
         clear_href: definition.id === 'sort'
           ? undefined
-          : hrefFor(replaceFilter(filters, definition.id, undefined)),
+          : hrefFor(replaceFilter(filters, definition.id, undefined), definition.id),
         options: filterOptions({
           values: definition.values,
           currentValue,
           filters,
           key: definition.id,
-          hrefFor,
+          hrefFor: (nextFilters) => hrefFor(nextFilters, definition.id),
           allLabel: definition.allLabel,
           includeAll: definition.includeAll,
         }),
@@ -827,10 +822,10 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     }
   }
 
-  function listAgentEvents(agentId, { limit = AGENT_LOG_PAGE_SIZE, offset = 0 } = {}) {
+  function listAgentEvents(agentId, { limit = AGENT_LOG_PAGE_SIZE, offset = 0, sort = 'time_desc' } = {}) {
     if (!agentId) return [];
     try {
-      const rows = reviewStore.listAgentEvents?.({ agentId, limit, offset }) ?? [];
+      const rows = reviewStore.listAgentEvents?.({ agentId, limit, offset, sort }) ?? [];
       return Array.isArray(rows) ? rows : [];
     } catch {
       return [];
@@ -990,7 +985,8 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       ? listAgentEvents(agentId, {
           limit: AGENT_LOG_PAGE_SIZE,
           offset: (currentLogPage - 1) * AGENT_LOG_PAGE_SIZE,
-        }).slice().sort(compareAgentEventsDesc)
+          sort: effectiveSort,
+        })
       : [];
     const agentAssociatedFindings = agentId ? listFindings(1000, { agentId }) : [];
     const relevantReviewIds = agentId
@@ -1162,6 +1158,10 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
         tone: statusTone(event.status),
         secondary: event.status && labelOf(STATUS_LABELS, event.status) !== event.status ? event.status : undefined,
       },
+      severity: {
+        text: event.severity ? labelOf(SEVERITY_LABELS, event.severity) : '未分级',
+        tone: event.severity ?? 'neutral',
+      },
       duration_ms: {
         text: isPresent(event.duration_ms) ? `${event.duration_ms} ms` : '',
         mono: true,
@@ -1187,27 +1187,26 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
         label: `日志 ID ${event.id ?? '-'} · ${formatTime(event.ts)} · ${event.event ?? '未知事件'}`,
         body: typeof event.raw_json === 'string' ? event.raw_json : JSON.stringify(event.raw_json),
       }));
-    const paginationLinks = [];
-    if (agentId && currentLogPage > 1) {
-      paginationLinks.push({
-        label: '上一页',
-        href: dashboardFilterUrl({
-          ...explicitFilters,
-          sort: effectiveSort,
-          logPage: currentLogPage - 1,
-        }, 'agent_logs'),
-      });
-    }
-    if (agentId && currentLogPage < totalLogPages) {
-      paginationLinks.push({
-        label: '下一页',
-        href: dashboardFilterUrl({
-          ...explicitFilters,
-          sort: effectiveSort,
-          logPage: currentLogPage + 1,
-        }, 'agent_logs'),
-      });
-    }
+    const agentLogPagination = agentId && totalLogPages > 1
+      ? {
+          currentPage: currentLogPage,
+          totalPages: totalLogPages,
+          previousHref: currentLogPage > 1
+            ? dashboardFilterUrl({
+              ...explicitFilters,
+              sort: effectiveSort,
+              logPage: currentLogPage - 1,
+            }, 'agent_logs')
+            : undefined,
+          nextHref: currentLogPage < totalLogPages
+            ? dashboardFilterUrl({
+              ...explicitFilters,
+              sort: effectiveSort,
+              logPage: currentLogPage + 1,
+            }, 'agent_logs')
+            : undefined,
+        }
+      : null;
 
     const queueTitle = isPresent(queueFilters.status)
       ? `风险发现（${labelOf(STATUS_LABELS, queueFilters.status)}）`
@@ -1230,12 +1229,12 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
           body: '当前 Agent 没有可显示的日志。',
         });
       }
-      if (paginationLinks.length > 0) {
+      if (agentLogPagination) {
         sections.push({
           id: 'agent_log_pagination',
           title: `日志分页（第 ${currentLogPage}/${totalLogPages} 页）`,
-          type: 'link_list',
-          links: paginationLinks,
+          type: 'pagination',
+          ...agentLogPagination,
         });
       }
       if (agentRawLogSnippets.length > 0) {
@@ -1305,7 +1304,13 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       summary_metrics,
       filters: findingFiltersViewModel({
         filters: explicitFilters,
-        hrefFor: (nextFilters) => dashboardFilterUrl(nextFilters),
+        hrefFor: (nextFilters, filterId) => {
+          const isAgentLogSort = agentId && filterId === 'sort';
+          return dashboardFilterUrl(
+            isAgentLogSort ? { ...nextFilters, logPage: 1 } : nextFilters,
+            isAgentLogSort ? 'agent_logs' : 'pending_findings',
+          );
+        },
         includeSort: true,
       }),
       clear_filters_href: dashboardFilterUrl({ agentId }),
