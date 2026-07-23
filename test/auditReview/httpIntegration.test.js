@@ -946,7 +946,8 @@ test('audit review HTTP integration smoke test', async () => {
       assert.equal(matching.status, 200, 'GET dashboard with matching filters should be 200');
       assert.equal(matching.headers.get('cache-control'), 'no-store');
       const matchingHtml = await matching.text();
-      assert.ok(matchingHtml.includes(findingRecord.title), 'matching filters should retain the finding');
+      assert.ok(matchingHtml.includes(findingRecord.trace_id), 'matching filters should retain associated Agent logs');
+      assert.equal(matchingHtml.includes('id="pending_findings"'), false, 'Agent dashboard should not render duplicate findings');
       assert.equal(matchingHtml.includes('test-token-123'), false, 'filtered dashboard must not expose the API token');
 
       for (const [filterName, filterValue] of [
@@ -954,7 +955,6 @@ test('audit review HTTP integration smoke test', async () => {
         ['severity', 'critical'],
         ['category', 'failed_call'],
         ['status', 'resolved'],
-        ['review_id', 'other-review'],
       ]) {
         const params = new URLSearchParams({
           agent_id: findingRecord.agent_id,
@@ -968,9 +968,9 @@ test('audit review HTTP integration smoke test', async () => {
         assert.equal(excluded.status, 200, `GET dashboard with non-matching ${filterName} should be 200`);
         const excludedHtml = await excluded.text();
         assert.equal(
-          excludedHtml.includes(findingRecord.title),
+          excludedHtml.includes(findingRecord.trace_id),
           false,
-          `non-matching ${filterName} should exclude the finding`,
+          `non-matching ${filterName} should exclude associated Agent logs`,
         );
         assert.doesNotMatch(excludedHtml, MOJIBAKE_PATTERN);
       }

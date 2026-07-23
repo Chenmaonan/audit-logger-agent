@@ -412,7 +412,32 @@ export function createReviewStore(db) {
           AND (@log_event IS NULL OR events.event = @log_event)
           AND (@log_tool_name IS NULL OR events.tool_name = @log_tool_name)
           AND (@log_trace_id IS NULL OR events.trace_id = @log_trace_id)
-          AND (@log_status IS NULL OR events.status = @log_status)` : '';
+          AND (@log_status IS NULL OR events.status = @log_status)
+          AND (@severity IS NULL OR trace_severity.severity_rank = CASE @severity
+            WHEN 'critical' THEN 4
+            WHEN 'high' THEN 3
+            WHEN 'medium' THEN 2
+            WHEN 'low' THEN 1
+            ELSE -1
+          END)
+          AND (@category IS NULL OR EXISTS (
+            SELECT 1
+            FROM audit_review_findings category_findings
+            WHERE category_findings.agent_id = events.agent_id
+              AND category_findings.trace_id = events.trace_id
+              AND category_findings.category = @category
+              AND NULLIF(TRIM(events.trace_id), '') IS NOT NULL
+              AND events.trace_id <> 'trace_null'
+          ))
+          AND (@finding_status IS NULL OR EXISTS (
+            SELECT 1
+            FROM audit_review_findings status_findings
+            WHERE status_findings.agent_id = events.agent_id
+              AND status_findings.trace_id = events.trace_id
+              AND status_findings.status = @finding_status
+              AND NULLIF(TRIM(events.trace_id), '') IS NOT NULL
+              AND events.trace_id <> 'trace_null'
+          ))` : '';
     const statement = db.prepare(`
         WITH trace_severity AS (
           SELECT
@@ -485,13 +510,63 @@ export function createReviewStore(db) {
     const cached = filtered ? countAgentEventsFilteredStmt : countAgentEventsStmt;
     if (cached) return cached;
     const filterSql = filtered ? `
-          AND (@log_event IS NULL OR event = @log_event)
-          AND (@log_tool_name IS NULL OR tool_name = @log_tool_name)
-          AND (@log_trace_id IS NULL OR trace_id = @log_trace_id)
-          AND (@log_status IS NULL OR status = @log_status)` : '';
+          AND (@log_event IS NULL OR events.event = @log_event)
+          AND (@log_tool_name IS NULL OR events.tool_name = @log_tool_name)
+          AND (@log_trace_id IS NULL OR events.trace_id = @log_trace_id)
+          AND (@log_status IS NULL OR events.status = @log_status)
+          AND (@severity IS NULL OR trace_severity.severity_rank = CASE @severity
+            WHEN 'critical' THEN 4
+            WHEN 'high' THEN 3
+            WHEN 'medium' THEN 2
+            WHEN 'low' THEN 1
+            ELSE -1
+          END)
+          AND (@category IS NULL OR EXISTS (
+            SELECT 1
+            FROM audit_review_findings category_findings
+            WHERE category_findings.agent_id = events.agent_id
+              AND category_findings.trace_id = events.trace_id
+              AND category_findings.category = @category
+              AND NULLIF(TRIM(events.trace_id), '') IS NOT NULL
+              AND events.trace_id <> 'trace_null'
+          ))
+          AND (@finding_status IS NULL OR EXISTS (
+            SELECT 1
+            FROM audit_review_findings status_findings
+            WHERE status_findings.agent_id = events.agent_id
+              AND status_findings.trace_id = events.trace_id
+              AND status_findings.status = @finding_status
+              AND NULLIF(TRIM(events.trace_id), '') IS NOT NULL
+              AND events.trace_id <> 'trace_null'
+          ))` : '';
+    const traceSeveritySql = filtered ? `
+        WITH trace_severity AS (
+          SELECT
+            findings.agent_id,
+            findings.trace_id,
+            MAX(CASE occurrences.severity
+              WHEN 'critical' THEN 4
+              WHEN 'high' THEN 3
+              WHEN 'medium' THEN 2
+              WHEN 'low' THEN 1
+              ELSE 0
+            END) AS severity_rank
+          FROM audit_review_finding_occurrences occurrences
+          JOIN audit_review_findings findings ON findings.finding_id = occurrences.finding_id
+          WHERE findings.agent_id = @agent_id
+            AND NULLIF(TRIM(findings.trace_id), '') IS NOT NULL
+            AND findings.trace_id <> 'trace_null'
+          GROUP BY findings.agent_id, findings.trace_id
+        )` : '';
+    const traceSeverityJoinSql = filtered ? `
+        LEFT JOIN trace_severity
+          ON trace_severity.agent_id = events.agent_id
+          AND trace_severity.trace_id = events.trace_id` : '';
     const statement = db.prepare(`
-        SELECT COUNT(*) AS count FROM audit_events
-        WHERE agent_id = @agent_id
+        ${traceSeveritySql}
+        SELECT COUNT(*) AS count FROM audit_events events
+        ${traceSeverityJoinSql}
+        WHERE events.agent_id = @agent_id
           ${filterSql}
       `);
     if (filtered) countAgentEventsFilteredStmt = statement;
@@ -955,6 +1030,9 @@ export function createReviewStore(db) {
       logToolName,
       logTraceId,
       logStatus,
+      severity,
+      category,
+      status,
     } = {}) {
       if (!agentId) return [];
       const parsedLimit = Number(limit);
@@ -962,7 +1040,8 @@ export function createReviewStore(db) {
       const safeLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : 100;
       const safeOffset = Number.isFinite(parsedOffset) && parsedOffset >= 0 ? Math.floor(parsedOffset) : 0;
       const safeSort = sort === 'severity_desc' ? 'severity_desc' : 'time_desc';
-      const hasLogFilters = Boolean(logEvent || logToolName || logTraceId || logStatus);
+      const hasRiskFilters = Boolean(severity || category || status);
+      const hasLogFilters = Boolean(logEvent || logToolName || logTraceId || logStatus || hasRiskFilters);
       const query = {
         agent_id: agentId,
         limit: safeLimit,
@@ -972,11 +1051,15 @@ export function createReviewStore(db) {
         log_tool_name: logToolName || null,
         log_trace_id: logTraceId || null,
         log_status: logStatus || null,
+        severity: severity || null,
+        category: category || null,
+        finding_status: status || null,
       };
       try {
         return getListAgentEventsStmt(hasLogFilters).all(query);
       } catch (error) {
         if (/no such (?:table|column):\s*(?:audit_review_finding_occurrences|audit_review_findings|(?:\w+\.)?(?:trace_id|event|tool_name|status))/i.test(error?.message ?? '')) {
+          if (hasRiskFilters) return [];
           try {
             return getListAgentEventsFallbackStmt(hasLogFilters).all(query);
           } catch (fallbackError) {
@@ -989,7 +1072,16 @@ export function createReviewStore(db) {
       }
     },
 
-    countAgentEvents({ agentId, logEvent, logToolName, logTraceId, logStatus } = {}) {
+    countAgentEvents({
+      agentId,
+      logEvent,
+      logToolName,
+      logTraceId,
+      logStatus,
+      severity,
+      category,
+      status,
+    } = {}) {
       if (!agentId) return 0;
       const query = {
         agent_id: agentId,
@@ -997,12 +1089,17 @@ export function createReviewStore(db) {
         log_tool_name: logToolName || null,
         log_trace_id: logTraceId || null,
         log_status: logStatus || null,
+        severity: severity || null,
+        category: category || null,
+        finding_status: status || null,
       };
-      const hasLogFilters = Boolean(logEvent || logToolName || logTraceId || logStatus);
+      const hasRiskFilters = Boolean(severity || category || status);
+      const hasLogFilters = Boolean(logEvent || logToolName || logTraceId || logStatus || hasRiskFilters);
       try {
         return getCountAgentEventsStmt(hasLogFilters).get(query)?.count ?? 0;
       } catch (error) {
-        if (/no such column/i.test(error?.message ?? '')) {
+        if (/no such (?:table|column)/i.test(error?.message ?? '')) {
+          if (hasRiskFilters) return 0;
           try {
             return getCountAgentEventsFallbackStmt().get(query)?.count ?? 0;
           } catch (fallbackError) {

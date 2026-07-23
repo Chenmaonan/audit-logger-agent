@@ -591,23 +591,23 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     ];
   }
 
-  function findingFiltersViewModel({ filters, hrefFor, includeSort = false }) {
+  function findingFiltersViewModel({ filters, hrefFor, includeSort = false, agentLogMode = false }) {
     const definitions = [
       {
         id: 'severity',
-        label: '严重级别',
+        label: agentLogMode ? '日志风险等级' : '严重级别',
         values: Object.entries(SEVERITY_LABELS),
         allLabel: '全部严重级别',
       },
       {
         id: 'category',
-        label: '类别',
+        label: agentLogMode ? '关联风险类别' : '类别',
         values: Object.entries(CATEGORY_LABELS),
         allLabel: '全部类别',
       },
       {
         id: 'status',
-        label: '状态',
+        label: agentLogMode ? '关联风险状态' : '状态',
         values: ['open', 'acknowledged', 'snoozed', 'resolved'].map((status) => [status, STATUS_LABELS[status]]),
         allLabel: '全部状态',
       },
@@ -834,6 +834,9 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     logToolName,
     logTraceId,
     logStatus,
+    severity,
+    category,
+    status,
   } = {}) {
     if (!agentId) return [];
     try {
@@ -846,6 +849,9 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
         logToolName,
         logTraceId,
         logStatus,
+        severity,
+        category,
+        status,
       }) ?? [];
       return Array.isArray(rows) ? rows : [];
     } catch {
@@ -853,7 +859,15 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     }
   }
 
-  function countAgentEvents(agentId, { logEvent, logToolName, logTraceId, logStatus } = {}) {
+  function countAgentEvents(agentId, {
+    logEvent,
+    logToolName,
+    logTraceId,
+    logStatus,
+    severity,
+    category,
+    status,
+  } = {}) {
     if (!agentId) return 0;
     try {
       const count = Number(reviewStore.countAgentEvents?.({
@@ -862,6 +876,9 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
         logToolName,
         logTraceId,
         logStatus,
+        severity,
+        category,
+        status,
       }) ?? 0);
       return Number.isFinite(count) && count >= 0 ? Math.floor(count) : 0;
     } catch {
@@ -990,7 +1007,13 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     logStatus,
   } = {}) {
     const effectiveSort = sort === 'severity_desc' ? 'severity_desc' : 'time_desc';
-    const logFilters = { logEvent, logToolName, logTraceId, logStatus };
+    const logFilters = {
+      logEvent,
+      logToolName,
+      logTraceId,
+      logStatus,
+      ...(agentId ? { severity, category, status } : {}),
+    };
     const requestedLogPage = Number(logPage);
     const normalizedLogPage = Number.isInteger(requestedLogPage) && requestedLogPage > 0
       ? requestedLogPage
@@ -1008,20 +1031,18 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       logPage: agentId && (isPresent(logPage) || currentLogPage > 1) ? currentLogPage : undefined,
       ...logFilters,
     };
-    const queueFilters = {
-      agentId,
-      severity,
-      category,
-      status,
-      reviewId,
-    };
+    const queueFilters = agentId
+      ? { agentId, reviewId }
+      : { agentId, severity, category, status, reviewId };
     const summaryScope = { agentId, category, reviewId };
     const openBySev = countOpenFindingsBySeverity(summaryScope);
     const deadLetters = getDeadLetterCount();
     const runs = listRuns(20);
-    const findings = listFindings(1000, queueFilters)
-      .slice()
-      .sort(compareFindingsByTime);
+    const findings = agentId
+      ? []
+      : listFindings(1000, queueFilters)
+          .slice()
+          .sort(compareFindingsByTime);
     const agentEvents = agentId
       ? listAgentEvents(agentId, {
           limit: AGENT_LOG_PAGE_SIZE,
@@ -1040,10 +1061,16 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     const updatedAt = nowIso();
     const openFindingTotal = Object.values(openBySev).reduce((sum, count) => sum + count, 0);
     const latestRun = visibleRuns[0] ?? null;
-    const severityHref = (nextSeverity) => dashboardFilterUrl({
-      ...summaryScope,
-      severity: nextSeverity,
-    });
+    const severityHref = (nextSeverity) => agentId
+      ? dashboardFilterUrl({
+          ...explicitFilters,
+          severity: nextSeverity,
+          logPage: 1,
+        }, 'agent_logs')
+      : dashboardFilterUrl({
+          ...summaryScope,
+          severity: nextSeverity,
+        });
 
     const summary_metrics = [
       { label: SEVERITY_LABELS.critical, value: openBySev.critical, tone: 'critical', href: severityHref('critical') },
@@ -1071,13 +1098,22 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       });
     }
     if (severity) {
-      context_badges.push({ label: `严重级别：${labelOf(SEVERITY_LABELS, severity)}`, tone: severityTone(severity) });
+      context_badges.push({
+        label: `${agentId ? '日志风险等级' : '严重级别'}：${labelOf(SEVERITY_LABELS, severity)}`,
+        tone: severityTone(severity),
+      });
     }
     if (category) {
-      context_badges.push({ label: `类别：${labelOf(CATEGORY_LABELS, category)}`, tone: 'neutral' });
+      context_badges.push({
+        label: `${agentId ? '关联风险类别' : '类别'}：${labelOf(CATEGORY_LABELS, category)}`,
+        tone: 'neutral',
+      });
     }
     if (isPresent(status)) {
-      context_badges.push({ label: `状态：${labelOf(STATUS_LABELS, status)}`, tone: statusTone(status) });
+      context_badges.push({
+        label: `${agentId ? '关联风险状态' : '状态'}：${labelOf(STATUS_LABELS, status)}`,
+        tone: statusTone(status),
+      });
     }
     if (reviewId) {
       context_badges.push({ label: `审查批次：${reviewId}`, tone: 'neutral' });
@@ -1116,7 +1152,8 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       };
       page_actions.push(fallbackPrimaryAction);
     }
-    const highestSeverityFinding = findings.slice().sort(compareFindings).find((finding) => finding?.finding_id);
+    const actionFindings = agentId ? agentAssociatedFindings : findings;
+    const highestSeverityFinding = actionFindings.slice().sort(compareFindings).find((finding) => finding?.finding_id);
     if (highestSeverityFinding) {
       page_actions.push({
         label: '打开最高风险发现',
@@ -1305,21 +1342,23 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
         });
       }
     }
-    if (findingRows.length > 0) {
-      sections.push({
-        id: 'pending_findings',
-        title: queueTitle,
-        type: 'table',
-        columns: OVERVIEW_FINDINGS_COLUMNS,
-        rows: findingRows,
-      });
-    } else {
-      sections.push({
-        id: 'pending_findings',
-        title: queueTitle,
-        type: 'callout',
-        body: '当前范围没有匹配的风险发现。可调整过滤条件或清除过滤后重试。',
-      });
+    if (!agentId) {
+      if (findingRows.length > 0) {
+        sections.push({
+          id: 'pending_findings',
+          title: queueTitle,
+          type: 'table',
+          columns: OVERVIEW_FINDINGS_COLUMNS,
+          rows: findingRows,
+        });
+      } else {
+        sections.push({
+          id: 'pending_findings',
+          title: queueTitle,
+          type: 'callout',
+          body: '当前范围没有匹配的风险发现。可调整过滤条件或清除过滤后重试。',
+        });
+      }
     }
     if (runsWithFindings.length > 0) {
       sections.push({
@@ -1351,7 +1390,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     return {
       page: {
         title: agentId ? `Agent 日志审计：${agentId}` : '审计审查总览',
-        subtitle: agentId ? '查看该 Agent 的全部日志、风险发现和关联证据。' : '查看最近审查、风险发现和关联证据。',
+        subtitle: agentId ? '查看该 Agent 的全部日志及关联风险标记。' : '查看最近审查、风险发现和关联证据。',
         updated_at: updatedAt,
         breadcrumbs: agentId
           ? [{ label: 'Agent 列表', href: '/' }, { label: 'Agent 审计', href: agentDashboardUrl(agentId) }]
@@ -1363,15 +1402,16 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       filters: findingFiltersViewModel({
         filters: explicitFilters,
         hrefFor: (nextFilters, filterId) => {
-          const isAgentLogSort = agentId && filterId === 'sort';
+          const isAgentLogFilter = Boolean(agentId);
           return dashboardFilterUrl(
-            isAgentLogSort ? { ...nextFilters, logPage: 1 } : nextFilters,
-            isAgentLogSort ? 'agent_logs' : 'pending_findings',
+            isAgentLogFilter ? { ...nextFilters, logPage: 1 } : nextFilters,
+            isAgentLogFilter ? 'agent_logs' : 'pending_findings',
           );
         },
         includeSort: Boolean(agentId),
+        agentLogMode: Boolean(agentId),
       }),
-      clear_filters_href: dashboardFilterUrl({ agentId }),
+      clear_filters_href: dashboardFilterUrl({ agentId }, agentId ? 'agent_logs' : 'pending_findings'),
       sections,
     };
   }

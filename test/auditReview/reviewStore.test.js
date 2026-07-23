@@ -782,7 +782,9 @@ test('reviewStore: listAgentEvents projects the highest risk level to every even
       ts TEXT NOT NULL,
       agent_id TEXT NOT NULL,
       trace_id TEXT,
-      event TEXT NOT NULL
+      event TEXT NOT NULL,
+      tool_name TEXT,
+      status TEXT
     );
   `);
   const insertEvent = db.prepare(`INSERT INTO audit_events (ts, agent_id, trace_id, event) VALUES (?, ?, ?, ?)`);
@@ -799,23 +801,23 @@ test('reviewStore: listAgentEvents projects the highest risk level to every even
       risk_policy_version, reviewer_version
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  for (const [findingId, severity, eventId] of [
-    ['finding-critical', 'critical', 3],
-    ['finding-critical-lower', 'medium', 4],
-    ['finding-high', 'high', 2],
-    ['finding-other-agent', 'critical', 5],
-    ['finding-placeholder', 'critical', 6],
+  for (const [findingId, severity, eventId, category, status] of [
+    ['finding-critical', 'critical', 3, 'failed_call', 'open'],
+    ['finding-critical-lower', 'medium', 4, 'repeated_call', 'resolved'],
+    ['finding-high', 'high', 2, 'high_risk_permission', 'resolved'],
+    ['finding-other-agent', 'critical', 5, 'failed_call', 'open'],
+    ['finding-placeholder', 'critical', 6, 'failed_call', 'open'],
   ]) {
     insertFinding.run(
       findingId,
       'review-1',
       `hash-${findingId}`,
-      'failed_call',
+      category,
       severity,
       `${severity} finding`,
       `${severity} event`,
       `[${eventId}]`,
-      'open',
+      status,
       '2026-07-03T10:04:00.000Z',
       '2026-07-03T10:04:00.000Z',
       'risk-v1',
@@ -850,6 +852,26 @@ test('reviewStore: listAgentEvents projects the highest risk level to every even
   assert.deepEqual(secondPage.map((row) => row.severity), ['high', null]);
   assert.deepEqual(thirdPage.map((row) => row.event), ['placeholder-trace']);
   assert.deepEqual(thirdPage.map((row) => row.severity), [null]);
+  assert.deepEqual(
+    store.listAgentEvents({
+      agentId: 'agent-a',
+      severity: 'high',
+      category: 'high_risk_permission',
+      status: 'resolved',
+      sort: 'severity_desc',
+    }).map((row) => row.event),
+    ['high'],
+  );
+  assert.equal(store.countAgentEvents({
+    agentId: 'agent-a',
+    severity: 'critical',
+    category: 'repeated_call',
+    status: 'resolved',
+  }), 2);
+  assert.deepEqual(
+    store.listAgentEvents({ agentId: 'agent-a', status: 'resolved', sort: 'severity_desc' }).map((row) => row.event),
+    ['critical-evidence', 'critical-related', 'high'],
+  );
   db.close();
 });
 
@@ -863,6 +885,33 @@ test('reviewStore: agent event queries reject empty agent IDs and tolerate a mis
   assert.equal(store.countAgentEvents({}), 0);
   assert.deepEqual(store.listAgentEvents({ agentId: 'agent-a' }), []);
   assert.equal(store.countAgentEvents({ agentId: 'agent-a' }), 0);
+  db.close();
+});
+
+test('reviewStore: Agent risk filters return an empty result when review tables are unavailable', () => {
+  const db = openDb();
+  db.exec(`
+    CREATE TABLE audit_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      trace_id TEXT,
+      event TEXT,
+      tool_name TEXT,
+      status TEXT
+    );
+    INSERT INTO audit_events (ts, agent_id, trace_id, event)
+    VALUES ('2026-07-03T10:00:00.000Z', 'agent-a', 'trace-a', 'tool.end');
+  `);
+  const store = createReviewStore(db);
+  db.pragma('foreign_keys = OFF');
+  db.exec(`
+    DROP TABLE audit_review_finding_occurrences;
+    DROP TABLE audit_review_findings;
+  `);
+
+  assert.deepEqual(store.listAgentEvents({ agentId: 'agent-a', severity: 'high' }), []);
+  assert.equal(store.countAgentEvents({ agentId: 'agent-a', severity: 'high' }), 0);
   db.close();
 });
 

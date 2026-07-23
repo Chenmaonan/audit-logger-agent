@@ -75,6 +75,34 @@ function fakeStore(overrides = {}) {
       raw_json: '{"event":"tool.end","error_message":"permission denied"}',
     },
   ];
+  const severityRanks = { critical: 4, high: 3, medium: 2, low: 1 };
+  const associatedFindings = (row, agentId) => findings.filter((item) =>
+    item.agent_id === agentId && item.trace_id === row.trace_id);
+  const projectedSeverity = (row, agentId) => Object.hasOwn(row, 'severity')
+    ? row.severity
+    : associatedFindings(row, agentId)
+        .map((item) => item.severity)
+        .sort((left, right) => (severityRanks[right] ?? 0) - (severityRanks[left] ?? 0))[0]
+      ?? null;
+  const filteredAgentEvents = ({
+    agentId,
+    logEvent,
+    logToolName,
+    logTraceId,
+    logStatus,
+    severity,
+    category,
+    status,
+  }) => traceEvents
+    .filter((row) => (row.agent_id ?? 'agent-1') === agentId)
+    .map((row) => ({ ...row, severity: projectedSeverity(row, agentId) }))
+    .filter((row) => !logEvent || row.event === logEvent)
+    .filter((row) => !logToolName || row.tool_name === logToolName)
+    .filter((row) => !logTraceId || row.trace_id === logTraceId)
+    .filter((row) => !logStatus || row.status === logStatus)
+    .filter((row) => !severity || row.severity === severity)
+    .filter((row) => !category || associatedFindings(row, agentId).some((item) => item.category === category))
+    .filter((row) => !status || associatedFindings(row, agentId).some((item) => item.status === status));
 
   return {
     listFindings({ reviewId, severity, category, status, agentId } = {}) {
@@ -118,34 +146,52 @@ function fakeStore(overrides = {}) {
       logToolName,
       logTraceId,
       logStatus,
+      severity,
+      category,
+      status,
     }) {
       if (agentId !== 'agent-1') return [];
-      return traceEvents
-        .filter((row) => (row.agent_id ?? 'agent-1') === agentId)
-        .filter((row) => !logEvent || row.event === logEvent)
-        .filter((row) => !logToolName || row.tool_name === logToolName)
-        .filter((row) => !logTraceId || row.trace_id === logTraceId)
-        .filter((row) => !logStatus || row.status === logStatus)
+      return filteredAgentEvents({
+        agentId,
+        logEvent,
+        logToolName,
+        logTraceId,
+        logStatus,
+        severity,
+        category,
+        status,
+      })
         .slice()
         .sort((left, right) => {
-          const ranks = { critical: 4, high: 3, medium: 2, low: 1 };
           if (sort === 'severity_desc') {
-            const severityDelta = (ranks[right.severity] ?? 0) - (ranks[left.severity] ?? 0);
+            const severityDelta = (severityRanks[right.severity] ?? 0) - (severityRanks[left.severity] ?? 0);
             if (severityDelta !== 0) return severityDelta;
           }
           return Date.parse(right.ts) - Date.parse(left.ts) || right.id - left.id;
         })
         .slice(offset, offset + limit);
     },
-    countAgentEvents({ agentId, logEvent, logToolName, logTraceId, logStatus }) {
+    countAgentEvents({
+      agentId,
+      logEvent,
+      logToolName,
+      logTraceId,
+      logStatus,
+      severity,
+      category,
+      status,
+    }) {
       return agentId === 'agent-1'
-        ? traceEvents
-            .filter((row) => (row.agent_id ?? 'agent-1') === agentId)
-            .filter((row) => !logEvent || row.event === logEvent)
-            .filter((row) => !logToolName || row.tool_name === logToolName)
-            .filter((row) => !logTraceId || row.trace_id === logTraceId)
-            .filter((row) => !logStatus || row.status === logStatus)
-            .length
+        ? filteredAgentEvents({
+            agentId,
+            logEvent,
+            logToolName,
+            logTraceId,
+            logStatus,
+            severity,
+            category,
+            status,
+          }).length
         : 0;
     },
     listRawEventsByIds({ eventIds }) {
@@ -310,7 +356,7 @@ test('manualDailyReportPage does not expose a POST action when sending is unavai
   assert.equal(section.form.cancel_href, '/dashboard');
 });
 
-test('overviewPage filters findings by agent id and links back to agent index', () => {
+test('overviewPage renders only Agent logs and links back to agent index', () => {
   const page = createViz({
     findings: [
       finding({
@@ -328,7 +374,7 @@ test('overviewPage filters findings by agent id and links back to agent index', 
   assert.equal(page.page.page_actions.find((action) => action.href === '/').kind, 'secondary');
   assert.equal(page.page.page_actions.find((action) => action.label === '打开最高风险发现').kind, 'primary');
   assert.equal(page.page.page_actions.some((action) => action.label === '打开最新降级审查'), false);
-  assert.ok(page.summary_metrics.some((metric) => metric.href === '/dashboard?agent_id=agent-1&severity=critical#pending_findings'));
+  assert.ok(page.summary_metrics.some((metric) => metric.href === '/dashboard?agent_id=agent-1&severity=critical&log_page=1#agent_logs'));
   const logsSection = page.sections.find((section) => section.id === 'agent_logs');
   assert.equal(logsSection.title, 'Agent 日志（第 1/1 页，共 2 条）');
   assert.deepEqual(logsSection.columns.map((column) => column.key), [
@@ -349,16 +395,14 @@ test('overviewPage filters findings by agent id and links back to agent index', 
   assert.equal(logsSection.rows[0].status.href, '/dashboard?agent_id=agent-1&log_page=1&log_status=INTERNAL#agent_logs');
   assert.equal(logsSection.rows[0].trace_id.href, '/dashboard?agent_id=agent-1&log_page=1&log_trace_id=trace-critical-1#agent_logs');
   assert.equal(logsSection.rows[0].status.text, '内部错误');
-  assert.equal(logsSection.rows[0].severity.text, '无风险');
+  assert.equal(logsSection.rows[0].severity.text, '严重');
   assert.equal(logsSection.rows[0].duration_ms.text, '640 ms');
   assert.equal(logsSection.rows[0].span_id.text, 'span-1');
   const rawLogs = page.sections.find((section) => section.id === 'agent_raw_logs');
   assert.equal(rawLogs.title, '当前页原始日志');
   assert.equal(rawLogs.collapsible, true);
   assert.equal(rawLogs.snippets.length, 2);
-  const findingsSection = page.sections.find((section) => section.id === 'pending_findings');
-  assert.equal(findingsSection.rows.length, 1);
-  assert.equal(findingsSection.rows[0].agent_tool.text, 'Agent One');
+  assert.equal(page.sections.some((section) => section.id === 'pending_findings'), false);
   assert.equal(JSON.stringify(page).includes('Other agent finding'), false);
 });
 
@@ -403,8 +447,7 @@ test('overviewPage exposes time and severity sorting only for Agent logs', () =>
   assert.equal(defaultPage.filters.some((filter) => filter.id === 'sort'), false);
 
   const severityPage = viz.overviewPage({ agentId: 'agent-1', sort: 'severity_desc' });
-  const severityQueue = severityPage.sections.find((section) => section.id === 'pending_findings');
-  assert.deepEqual(severityQueue.rows.map((row) => row.title.text), ['Latest low', 'Critical delete failure']);
+  assert.equal(severityPage.sections.some((section) => section.id === 'pending_findings'), false);
   const sortFilter = severityPage.filters.find((filter) => filter.id === 'sort');
   assert.equal(sortFilter.label, '日志排序');
   assert.equal(sortFilter.value, 'severity_desc');
@@ -412,9 +455,12 @@ test('overviewPage exposes time and severity sorting only for Agent logs', () =>
   assert.equal(sortFilter.options.find((option) => option.value === 'severity_desc').active, true);
 });
 
-test('overviewPage paginates agent logs by 100 and preserves filters in navigation links', () => {
+test('overviewPage paginates filtered Agent logs by 100 and preserves filters in navigation links', () => {
   const events = traceEvents(205).map((event) => ({ ...event, agent_id: 'agent-1' }));
-  const page = createViz({ traceEvents: events }).overviewPage({
+  const page = createViz({
+    traceEvents: events,
+    finding: { severity: 'high', category: 'failed_call', status: 'resolved', review_id: 'r-clean' },
+  }).overviewPage({
     agentId: 'agent-1',
     severity: 'high',
     category: 'failed_call',
@@ -509,7 +555,7 @@ test('overviewPage labels risk-projected and no-risk Agent logs distinctly', () 
   assert.equal(logs.rows[1].severity.tone, 'neutral');
 });
 
-test('overviewPage combines filters, preserves them in GET links, and exposes clear links', () => {
+test('overviewPage applies every visible filter to Agent logs and removes the duplicate findings section', () => {
   const matching = finding({
     finding_id: 'f-matching',
     severity: 'high',
@@ -517,9 +563,9 @@ test('overviewPage combines filters, preserves them in GET links, and exposes cl
     status: 'resolved',
     review_id: 'r-clean',
     title: 'Matching resolved failure',
-    trace_id: 'trace-matching',
+    trace_id: 'trace-critical-1',
   });
-  const page = createViz({ findings: [matching] }).overviewPage({
+  const page = createViz({ finding: matching }).overviewPage({
     agentId: 'agent-1',
     severity: 'high',
     category: 'failed_call',
@@ -527,22 +573,27 @@ test('overviewPage combines filters, preserves them in GET links, and exposes cl
     reviewId: 'r-clean',
   });
 
-  const queue = page.sections.find((section) => section.id === 'pending_findings');
-  assert.deepEqual(queue.rows.map((row) => row.title.text), ['Matching resolved failure']);
+  const logs = page.sections.find((section) => section.id === 'agent_logs');
+  assert.equal(logs.title, 'Agent 日志（第 1/1 页，共 2 条）');
+  assert.equal(page.sections.some((section) => section.id === 'pending_findings'), false);
+  const severityFilter = page.filters.find((filter) => filter.id === 'severity');
   const categoryFilter = page.filters.find((filter) => filter.id === 'category');
   const statusFilter = page.filters.find((filter) => filter.id === 'status');
+  assert.equal(severityFilter.label, '日志风险等级');
+  assert.equal(categoryFilter.label, '关联风险类别');
+  assert.equal(statusFilter.label, '关联风险状态');
   assert.equal(categoryFilter.value, 'failed_call');
   assert.equal(statusFilter.value, 'resolved');
   assert.equal(
     categoryFilter.options.find((option) => option.value === 'anomalous_call').href,
-    '/dashboard?agent_id=agent-1&severity=high&category=anomalous_call&status=resolved&review_id=r-clean#pending_findings',
+    '/dashboard?agent_id=agent-1&severity=high&category=anomalous_call&status=resolved&review_id=r-clean&log_page=1#agent_logs',
   );
   assert.equal(
     statusFilter.options.find((option) => option.value === 'open').href,
-    '/dashboard?agent_id=agent-1&severity=high&category=failed_call&status=open&review_id=r-clean#pending_findings',
+    '/dashboard?agent_id=agent-1&severity=high&category=failed_call&status=open&review_id=r-clean&log_page=1#agent_logs',
   );
-  assert.equal(categoryFilter.clear_href, '/dashboard?agent_id=agent-1&severity=high&status=resolved&review_id=r-clean#pending_findings');
-  assert.equal(page.clear_filters_href, '/dashboard?agent_id=agent-1#pending_findings');
+  assert.equal(categoryFilter.clear_href, '/dashboard?agent_id=agent-1&severity=high&status=resolved&review_id=r-clean&log_page=1#agent_logs');
+  assert.equal(page.clear_filters_href, '/dashboard?agent_id=agent-1#agent_logs');
 });
 
 test('overviewPage summary always counts open findings without severity or status pollution', () => {
