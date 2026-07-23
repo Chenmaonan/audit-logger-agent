@@ -345,8 +345,12 @@ export function createReviewStore(db) {
   let traceEventsStmt = null;
   let listAgentsStmt = null;
   let listAgentEventsStmt = null;
+  let listAgentEventsFilteredStmt = null;
   let listAgentEventsFallbackStmt = null;
+  let listAgentEventsFilteredFallbackStmt = null;
   let countAgentEventsStmt = null;
+  let countAgentEventsFilteredStmt = null;
+  let countAgentEventsFallbackStmt = null;
   function getDeadLetterCountStmt() {
     if (!deadLetterCountStmt) {
       // Lazy prepare: agent_outbox_events may not exist in isolated tests
@@ -401,9 +405,15 @@ export function createReviewStore(db) {
     return listAgentsStmt;
   }
 
-  function getListAgentEventsStmt() {
-    if (!listAgentEventsStmt) {
-      listAgentEventsStmt = db.prepare(`
+  function getListAgentEventsStmt(filtered = false) {
+    const cached = filtered ? listAgentEventsFilteredStmt : listAgentEventsStmt;
+    if (cached) return cached;
+    const filterSql = filtered ? `
+          AND (@log_event IS NULL OR events.event = @log_event)
+          AND (@log_tool_name IS NULL OR events.tool_name = @log_tool_name)
+          AND (@log_trace_id IS NULL OR events.trace_id = @log_trace_id)
+          AND (@log_status IS NULL OR events.status = @log_status)` : '';
+    const statement = db.prepare(`
         WITH trace_severity AS (
           SELECT
             findings.agent_id,
@@ -438,37 +448,65 @@ export function createReviewStore(db) {
           AND NULLIF(TRIM(events.trace_id), '') IS NOT NULL
           AND events.trace_id <> 'trace_null'
         WHERE events.agent_id = @agent_id
+          ${filterSql}
         ORDER BY
           CASE WHEN @sort = 'severity_desc' THEN COALESCE(trace_severity.severity_rank, 0) ELSE 0 END DESC,
           events.ts DESC,
           events.id DESC
         LIMIT @limit OFFSET @offset
       `);
-    }
-    return listAgentEventsStmt;
+    if (filtered) listAgentEventsFilteredStmt = statement;
+    else listAgentEventsStmt = statement;
+    return statement;
   }
 
-  function getListAgentEventsFallbackStmt() {
-    if (!listAgentEventsFallbackStmt) {
-      listAgentEventsFallbackStmt = db.prepare(`
+  function getListAgentEventsFallbackStmt(filtered = false) {
+    const cached = filtered ? listAgentEventsFilteredFallbackStmt : listAgentEventsFallbackStmt;
+    if (cached) return cached;
+    const filterSql = filtered ? `
+          AND (@log_event IS NULL OR events.event = @log_event)
+          AND (@log_tool_name IS NULL OR events.tool_name = @log_tool_name)
+          AND (@log_trace_id IS NULL OR events.trace_id = @log_trace_id)
+          AND (@log_status IS NULL OR events.status = @log_status)` : '';
+    const statement = db.prepare(`
         SELECT events.*, NULL AS severity
         FROM audit_events events
         WHERE events.agent_id = @agent_id
+          ${filterSql}
         ORDER BY events.ts DESC, events.id DESC
         LIMIT @limit OFFSET @offset
       `);
-    }
-    return listAgentEventsFallbackStmt;
+    if (filtered) listAgentEventsFilteredFallbackStmt = statement;
+    else listAgentEventsFallbackStmt = statement;
+    return statement;
   }
 
-  function getCountAgentEventsStmt() {
-    if (!countAgentEventsStmt) {
-      countAgentEventsStmt = db.prepare(`
+  function getCountAgentEventsStmt(filtered = false) {
+    const cached = filtered ? countAgentEventsFilteredStmt : countAgentEventsStmt;
+    if (cached) return cached;
+    const filterSql = filtered ? `
+          AND (@log_event IS NULL OR event = @log_event)
+          AND (@log_tool_name IS NULL OR tool_name = @log_tool_name)
+          AND (@log_trace_id IS NULL OR trace_id = @log_trace_id)
+          AND (@log_status IS NULL OR status = @log_status)` : '';
+    const statement = db.prepare(`
+        SELECT COUNT(*) AS count FROM audit_events
+        WHERE agent_id = @agent_id
+          ${filterSql}
+      `);
+    if (filtered) countAgentEventsFilteredStmt = statement;
+    else countAgentEventsStmt = statement;
+    return statement;
+  }
+
+  function getCountAgentEventsFallbackStmt() {
+    if (!countAgentEventsFallbackStmt) {
+      countAgentEventsFallbackStmt = db.prepare(`
         SELECT COUNT(*) AS count FROM audit_events
         WHERE agent_id = @agent_id
       `);
     }
-    return countAgentEventsStmt;
+    return countAgentEventsFallbackStmt;
   }
 
   function insertSystemAction({ findingId, actionType, fromStatus, toStatus, createdAt, note = null }) {
@@ -908,20 +946,39 @@ export function createReviewStore(db) {
       }
     },
 
-    listAgentEvents({ agentId, limit = 100, offset = 0, sort = 'time_desc' } = {}) {
+    listAgentEvents({
+      agentId,
+      limit = 100,
+      offset = 0,
+      sort = 'time_desc',
+      logEvent,
+      logToolName,
+      logTraceId,
+      logStatus,
+    } = {}) {
       if (!agentId) return [];
       const parsedLimit = Number(limit);
       const parsedOffset = Number(offset);
       const safeLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : 100;
       const safeOffset = Number.isFinite(parsedOffset) && parsedOffset >= 0 ? Math.floor(parsedOffset) : 0;
       const safeSort = sort === 'severity_desc' ? 'severity_desc' : 'time_desc';
-      const query = { agent_id: agentId, limit: safeLimit, offset: safeOffset, sort: safeSort };
+      const hasLogFilters = Boolean(logEvent || logToolName || logTraceId || logStatus);
+      const query = {
+        agent_id: agentId,
+        limit: safeLimit,
+        offset: safeOffset,
+        sort: safeSort,
+        log_event: logEvent || null,
+        log_tool_name: logToolName || null,
+        log_trace_id: logTraceId || null,
+        log_status: logStatus || null,
+      };
       try {
-        return getListAgentEventsStmt().all(query);
+        return getListAgentEventsStmt(hasLogFilters).all(query);
       } catch (error) {
-        if (/no such (?:table|column):\s*(?:audit_review_finding_occurrences|audit_review_findings|(?:\w+\.)?trace_id)/i.test(error?.message ?? '')) {
+        if (/no such (?:table|column):\s*(?:audit_review_finding_occurrences|audit_review_findings|(?:\w+\.)?(?:trace_id|event|tool_name|status))/i.test(error?.message ?? '')) {
           try {
-            return getListAgentEventsFallbackStmt().all(query);
+            return getListAgentEventsFallbackStmt(hasLogFilters).all(query);
           } catch (fallbackError) {
             if (/no such table/i.test(fallbackError?.message ?? '')) return [];
             throw fallbackError;
@@ -932,11 +989,27 @@ export function createReviewStore(db) {
       }
     },
 
-    countAgentEvents({ agentId } = {}) {
+    countAgentEvents({ agentId, logEvent, logToolName, logTraceId, logStatus } = {}) {
       if (!agentId) return 0;
+      const query = {
+        agent_id: agentId,
+        log_event: logEvent || null,
+        log_tool_name: logToolName || null,
+        log_trace_id: logTraceId || null,
+        log_status: logStatus || null,
+      };
+      const hasLogFilters = Boolean(logEvent || logToolName || logTraceId || logStatus);
       try {
-        return getCountAgentEventsStmt().get({ agent_id: agentId })?.count ?? 0;
+        return getCountAgentEventsStmt(hasLogFilters).get(query)?.count ?? 0;
       } catch (error) {
+        if (/no such column/i.test(error?.message ?? '')) {
+          try {
+            return getCountAgentEventsFallbackStmt().get(query)?.count ?? 0;
+          } catch (fallbackError) {
+            if (/no such table/i.test(fallbackError?.message ?? '')) return 0;
+            throw fallbackError;
+          }
+        }
         if (/no such table/i.test(error?.message ?? '')) return 0;
         throw error;
       }

@@ -730,6 +730,50 @@ test('reviewStore: listAgentEvents isolates, sorts and paginates events for one 
   db.close();
 });
 
+test('reviewStore: Agent log filters are applied before time sorting and pagination', () => {
+  const db = openDb();
+  db.exec(`
+    CREATE TABLE audit_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      trace_id TEXT,
+      event TEXT,
+      tool_name TEXT,
+      status TEXT
+    );
+  `);
+  const insert = db.prepare(`
+    INSERT INTO audit_events (ts, agent_id, trace_id, event, tool_name, status)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  insert.run('2026-07-03T10:04:00.000Z', 'agent-a', 'trace-a', 'tool.end', 'db.delete', 'INTERNAL');
+  insert.run('2026-07-03T10:03:00.000Z', 'agent-a', 'trace-a', 'tool.start', 'db.delete', 'OK');
+  insert.run('2026-07-03T10:02:00.000Z', 'agent-a', 'trace-b', 'tool.end', 'db.read', 'OK');
+  insert.run('2026-07-03T10:01:00.000Z', 'agent-b', 'trace-a', 'tool.end', 'db.delete', 'INTERNAL');
+
+  const store = createReviewStore(db);
+  const filters = {
+    agentId: 'agent-a',
+    logEvent: 'tool.end',
+    logToolName: 'db.delete',
+    logTraceId: 'trace-a',
+    logStatus: 'INTERNAL',
+  };
+
+  assert.deepEqual(
+    store.listAgentEvents({ ...filters, sort: 'time_desc', limit: 1 }).map((row) => row.id),
+    [1],
+  );
+  assert.equal(store.countAgentEvents(filters), 1);
+  assert.equal(store.countAgentEvents({ agentId: 'agent-a', logEvent: 'tool.end' }), 2);
+  assert.deepEqual(
+    store.listAgentEvents({ agentId: 'agent-a', logEvent: 'tool.end', sort: 'time_desc' }).map((row) => row.id),
+    [1, 3],
+  );
+  db.close();
+});
+
 test('reviewStore: listAgentEvents projects the highest risk level to every event in the same trace before paginating', () => {
   const db = openDb();
   db.exec(`

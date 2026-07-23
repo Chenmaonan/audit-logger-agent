@@ -101,6 +101,10 @@ const FILTER_QUERY_KEYS = [
   ['reviewId', 'review_id'],
   ['sort', 'sort'],
   ['logPage', 'log_page'],
+  ['logEvent', 'log_event'],
+  ['logToolName', 'log_tool_name'],
+  ['logTraceId', 'log_trace_id'],
+  ['logStatus', 'log_status'],
 ];
 
 const TRACE_ANALYSIS_SYSTEM_PROMPT = [
@@ -611,7 +615,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     if (includeSort) {
       definitions.push({
         id: 'sort',
-        label: '排序',
+        label: '日志排序',
         values: [
           ['time_desc', '按时间排序'],
           ['severity_desc', '按严重级别排序'],
@@ -822,20 +826,43 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     }
   }
 
-  function listAgentEvents(agentId, { limit = AGENT_LOG_PAGE_SIZE, offset = 0, sort = 'time_desc' } = {}) {
+  function listAgentEvents(agentId, {
+    limit = AGENT_LOG_PAGE_SIZE,
+    offset = 0,
+    sort = 'time_desc',
+    logEvent,
+    logToolName,
+    logTraceId,
+    logStatus,
+  } = {}) {
     if (!agentId) return [];
     try {
-      const rows = reviewStore.listAgentEvents?.({ agentId, limit, offset, sort }) ?? [];
+      const rows = reviewStore.listAgentEvents?.({
+        agentId,
+        limit,
+        offset,
+        sort,
+        logEvent,
+        logToolName,
+        logTraceId,
+        logStatus,
+      }) ?? [];
       return Array.isArray(rows) ? rows : [];
     } catch {
       return [];
     }
   }
 
-  function countAgentEvents(agentId) {
+  function countAgentEvents(agentId, { logEvent, logToolName, logTraceId, logStatus } = {}) {
     if (!agentId) return 0;
     try {
-      const count = Number(reviewStore.countAgentEvents?.({ agentId }) ?? 0);
+      const count = Number(reviewStore.countAgentEvents?.({
+        agentId,
+        logEvent,
+        logToolName,
+        logTraceId,
+        logStatus,
+      }) ?? 0);
       return Number.isFinite(count) && count >= 0 ? Math.floor(count) : 0;
     } catch {
       return 0;
@@ -949,13 +976,26 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     };
   }
 
-  function overviewPage({ agentId, severity, category, status, reviewId, sort, logPage } = {}) {
+  function overviewPage({
+    agentId,
+    severity,
+    category,
+    status,
+    reviewId,
+    sort,
+    logPage,
+    logEvent,
+    logToolName,
+    logTraceId,
+    logStatus,
+  } = {}) {
     const effectiveSort = sort === 'severity_desc' ? 'severity_desc' : 'time_desc';
+    const logFilters = { logEvent, logToolName, logTraceId, logStatus };
     const requestedLogPage = Number(logPage);
     const normalizedLogPage = Number.isInteger(requestedLogPage) && requestedLogPage > 0
       ? requestedLogPage
       : 1;
-    const totalAgentEvents = agentId ? countAgentEvents(agentId) : 0;
+    const totalAgentEvents = agentId ? countAgentEvents(agentId, logFilters) : 0;
     const totalLogPages = Math.max(1, Math.ceil(totalAgentEvents / AGENT_LOG_PAGE_SIZE));
     const currentLogPage = Math.min(normalizedLogPage, totalLogPages);
     const explicitFilters = {
@@ -966,6 +1006,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       reviewId,
       sort,
       logPage: agentId && (isPresent(logPage) || currentLogPage > 1) ? currentLogPage : undefined,
+      ...logFilters,
     };
     const queueFilters = {
       agentId,
@@ -980,12 +1021,13 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     const runs = listRuns(20);
     const findings = listFindings(1000, queueFilters)
       .slice()
-      .sort(effectiveSort === 'severity_desc' ? compareFindings : compareFindingsByTime);
+      .sort(compareFindingsByTime);
     const agentEvents = agentId
       ? listAgentEvents(agentId, {
           limit: AGENT_LOG_PAGE_SIZE,
           offset: (currentLogPage - 1) * AGENT_LOG_PAGE_SIZE,
           sort: effectiveSort,
+          ...logFilters,
         })
       : [];
     const agentAssociatedFindings = agentId ? listFindings(1000, { agentId }) : [];
@@ -1040,6 +1082,10 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
     if (reviewId) {
       context_badges.push({ label: `审查批次：${reviewId}`, tone: 'neutral' });
     }
+    if (logEvent) context_badges.push({ label: `日志事件：${logEvent}`, tone: 'neutral' });
+    if (logToolName) context_badges.push({ label: `日志工具：${logToolName}`, tone: 'neutral' });
+    if (logTraceId) context_badges.push({ label: `Trace：${logTraceId}`, tone: 'neutral' });
+    if (logStatus) context_badges.push({ label: `日志状态：${logStatus}`, tone: statusTone(logStatus) });
     if (deadLetters > 0) {
       context_badges.push({
         label: `死信消息：${deadLetters}`,
@@ -1147,14 +1193,23 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       },
       event: {
         text: event.event ?? '',
+        href: isPresent(event.event)
+          ? dashboardFilterUrl({ ...explicitFilters, logEvent: event.event, logPage: 1 }, 'agent_logs')
+          : undefined,
         mono: true,
       },
       tool_name: {
         text: event.tool_name ?? '',
+        href: isPresent(event.tool_name)
+          ? dashboardFilterUrl({ ...explicitFilters, logToolName: event.tool_name, logPage: 1 }, 'agent_logs')
+          : undefined,
         mono: true,
       },
       status: {
         text: labelOf(STATUS_LABELS, event.status),
+        href: isPresent(event.status)
+          ? dashboardFilterUrl({ ...explicitFilters, logStatus: event.status, logPage: 1 }, 'agent_logs')
+          : undefined,
         tone: statusTone(event.status),
         secondary: event.status && labelOf(STATUS_LABELS, event.status) !== event.status ? event.status : undefined,
       },
@@ -1168,6 +1223,9 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
       },
       trace_id: {
         text: event.trace_id ?? '',
+        href: isPresent(event.trace_id)
+          ? dashboardFilterUrl({ ...explicitFilters, logTraceId: event.trace_id, logPage: 1 }, 'agent_logs')
+          : undefined,
         mono: true,
       },
       span_id: {
@@ -1311,7 +1369,7 @@ export function createVisualization({ reviewStore, config, llmClient, model } = 
             isAgentLogSort ? 'agent_logs' : 'pending_findings',
           );
         },
-        includeSort: true,
+        includeSort: Boolean(agentId),
       }),
       clear_filters_href: dashboardFilterUrl({ agentId }),
       sections,

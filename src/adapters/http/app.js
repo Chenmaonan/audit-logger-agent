@@ -496,6 +496,10 @@ function dashboardFindingFilters(url, { includeReviewId = false, includeOverview
   if (includeOverviewControls) {
     filters.sort = dashboardSortParam(url);
     filters.logPage = dashboardLogPageParam(url);
+    filters.logEvent = optionalSearchParam(url, 'log_event');
+    filters.logToolName = optionalSearchParam(url, 'log_tool_name');
+    filters.logTraceId = optionalSearchParam(url, 'log_trace_id');
+    filters.logStatus = optionalSearchParam(url, 'log_status');
   }
   return filters;
 }

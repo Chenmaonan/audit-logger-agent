@@ -109,10 +109,23 @@ function fakeStore(overrides = {}) {
     listTraceEvents({ traceId }) {
       return traceId === 'trace-critical-1' ? traceEvents : [];
     },
-    listAgentEvents({ agentId, limit = 100, offset = 0, sort = 'time_desc' }) {
+    listAgentEvents({
+      agentId,
+      limit = 100,
+      offset = 0,
+      sort = 'time_desc',
+      logEvent,
+      logToolName,
+      logTraceId,
+      logStatus,
+    }) {
       if (agentId !== 'agent-1') return [];
       return traceEvents
         .filter((row) => (row.agent_id ?? 'agent-1') === agentId)
+        .filter((row) => !logEvent || row.event === logEvent)
+        .filter((row) => !logToolName || row.tool_name === logToolName)
+        .filter((row) => !logTraceId || row.trace_id === logTraceId)
+        .filter((row) => !logStatus || row.status === logStatus)
         .slice()
         .sort((left, right) => {
           const ranks = { critical: 4, high: 3, medium: 2, low: 1 };
@@ -124,9 +137,15 @@ function fakeStore(overrides = {}) {
         })
         .slice(offset, offset + limit);
     },
-    countAgentEvents({ agentId }) {
+    countAgentEvents({ agentId, logEvent, logToolName, logTraceId, logStatus }) {
       return agentId === 'agent-1'
-        ? traceEvents.filter((row) => (row.agent_id ?? 'agent-1') === agentId).length
+        ? traceEvents
+            .filter((row) => (row.agent_id ?? 'agent-1') === agentId)
+            .filter((row) => !logEvent || row.event === logEvent)
+            .filter((row) => !logToolName || row.tool_name === logToolName)
+            .filter((row) => !logTraceId || row.trace_id === logTraceId)
+            .filter((row) => !logStatus || row.status === logStatus)
+            .length
         : 0;
     },
     listRawEventsByIds({ eventIds }) {
@@ -325,6 +344,10 @@ test('overviewPage filters findings by agent id and links back to agent index', 
     'error_message',
   ]);
   assert.deepEqual(logsSection.rows.map((row) => row.event.text), ['tool.end', 'tool.start']);
+  assert.equal(logsSection.rows[0].event.href, '/dashboard?agent_id=agent-1&log_page=1&log_event=tool.end#agent_logs');
+  assert.equal(logsSection.rows[0].tool_name.href, '/dashboard?agent_id=agent-1&log_page=1&log_tool_name=db.delete#agent_logs');
+  assert.equal(logsSection.rows[0].status.href, '/dashboard?agent_id=agent-1&log_page=1&log_status=INTERNAL#agent_logs');
+  assert.equal(logsSection.rows[0].trace_id.href, '/dashboard?agent_id=agent-1&log_page=1&log_trace_id=trace-critical-1#agent_logs');
   assert.equal(logsSection.rows[0].status.text, '内部错误');
   assert.equal(logsSection.rows[0].severity.text, '无风险');
   assert.equal(logsSection.rows[0].duration_ms.text, '640 ms');
@@ -364,7 +387,7 @@ test('overviewPage defaults the risk queue to all statuses while explicit status
   assert.deepEqual(resolvedQueue.rows.map((row) => row.title.text), ['Resolved finding']);
 });
 
-test('overviewPage supports time and severity finding sorting with time descending as default', () => {
+test('overviewPage exposes time and severity sorting only for Agent logs', () => {
   const latestLow = finding({
     finding_id: 'f-latest-low',
     title: 'Latest low',
@@ -374,13 +397,16 @@ test('overviewPage supports time and severity finding sorting with time descendi
   });
   const viz = createViz({ findings: [latestLow] });
 
-  const defaultQueue = viz.overviewPage().sections.find((section) => section.id === 'pending_findings');
+  const defaultPage = viz.overviewPage();
+  const defaultQueue = defaultPage.sections.find((section) => section.id === 'pending_findings');
   assert.deepEqual(defaultQueue.rows.map((row) => row.title.text), ['Latest low', 'Critical delete failure']);
+  assert.equal(defaultPage.filters.some((filter) => filter.id === 'sort'), false);
 
-  const severityPage = viz.overviewPage({ sort: 'severity_desc' });
+  const severityPage = viz.overviewPage({ agentId: 'agent-1', sort: 'severity_desc' });
   const severityQueue = severityPage.sections.find((section) => section.id === 'pending_findings');
-  assert.deepEqual(severityQueue.rows.map((row) => row.title.text), ['Critical delete failure', 'Latest low']);
+  assert.deepEqual(severityQueue.rows.map((row) => row.title.text), ['Latest low', 'Critical delete failure']);
   const sortFilter = severityPage.filters.find((filter) => filter.id === 'sort');
+  assert.equal(sortFilter.label, '日志排序');
   assert.equal(sortFilter.value, 'severity_desc');
   assert.deepEqual(sortFilter.options.map((option) => option.label), ['按时间排序', '按严重级别排序']);
   assert.equal(sortFilter.options.find((option) => option.value === 'severity_desc').active, true);
@@ -438,6 +464,35 @@ test('overviewPage resets Agent log pagination and anchors the sort controls at 
     sortFilter.options.find((option) => option.value === 'time_desc').href,
     '/dashboard?agent_id=agent-1&sort=time_desc&log_page=1#agent_logs',
   );
+});
+
+test('overviewPage filters Agent logs from linked event, tool, trace and status values', () => {
+  const events = [
+    traceEvent(4, { event: 'tool.end', tool_name: 'db.delete', trace_id: 'trace-a', status: 'INTERNAL' }),
+    traceEvent(3, { event: 'tool.start', tool_name: 'db.delete', trace_id: 'trace-a', status: 'OK' }),
+    traceEvent(2, { event: 'tool.end', tool_name: 'db.read', trace_id: 'trace-b', status: 'OK' }),
+  ];
+  const viz = createViz({ traceEvents: events });
+  const page = viz.overviewPage({
+    agentId: 'agent-1',
+    sort: 'time_desc',
+    logEvent: 'tool.end',
+    logToolName: 'db.delete',
+    logTraceId: 'trace-a',
+    logStatus: 'INTERNAL',
+  });
+  const logs = page.sections.find((section) => section.id === 'agent_logs');
+
+  assert.equal(logs.title, 'Agent 日志（第 1/1 页，共 1 条）');
+  assert.deepEqual(logs.rows.map((row) => row.tool_name.text), ['db.delete']);
+  assert.equal(
+    logs.rows[0].event.href,
+    '/dashboard?agent_id=agent-1&sort=time_desc&log_page=1&log_event=tool.end&log_tool_name=db.delete&log_trace_id=trace-a&log_status=INTERNAL#agent_logs',
+  );
+  assert.ok(page.page.context_badges.some((badge) => badge.label === '日志事件：tool.end'));
+  assert.ok(page.page.context_badges.some((badge) => badge.label === '日志工具：db.delete'));
+  assert.ok(page.page.context_badges.some((badge) => badge.label === 'Trace：trace-a'));
+  assert.ok(page.page.context_badges.some((badge) => badge.label === '日志状态：INTERNAL'));
 });
 
 test('overviewPage labels risk-projected and no-risk Agent logs distinctly', () => {

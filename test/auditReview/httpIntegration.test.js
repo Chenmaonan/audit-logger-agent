@@ -72,7 +72,7 @@ test('dashboard routes pass normalized finding filters to visualization', async 
 
   try {
     const overview = await fetch(
-      `${baseUrl}/dashboard?agent_id=agent%2Fone&severity=high&category=failed_call&status=resolved&review_id=review-1&sort=severity_desc&log_page=3`,
+      `${baseUrl}/dashboard?agent_id=agent%2Fone&severity=high&category=failed_call&status=resolved&review_id=review-1&sort=severity_desc&log_page=3&log_event=tool.end&log_tool_name=db.delete&log_trace_id=trace-1&log_status=INTERNAL`,
     );
     assert.equal(overview.status, 200);
     assert.equal(overview.headers.get('cache-control'), 'no-store');
@@ -86,6 +86,10 @@ test('dashboard routes pass normalized finding filters to visualization', async 
         reviewId: 'review-1',
         sort: 'severity_desc',
         logPage: 3,
+        logEvent: 'tool.end',
+        logToolName: 'db.delete',
+        logTraceId: 'trace-1',
+        logStatus: 'INTERNAL',
       },
     });
 
@@ -103,6 +107,10 @@ test('dashboard routes pass normalized finding filters to visualization', async 
         reviewId: undefined,
         sort: undefined,
         logPage: undefined,
+        logEvent: undefined,
+        logToolName: undefined,
+        logTraceId: undefined,
+        logStatus: undefined,
       },
     });
 
