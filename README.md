@@ -53,32 +53,71 @@ http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me
 
 常用入口：
 
-| 入口 | 地址 |
-| --- | --- |
-| Dashboard | `http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me/dashboard` |
-| 健康检查 | `http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me/health` |
+
+| 入口         | 地址                                                                                         |
+| ---------- | ------------------------------------------------------------------------------------------ |
+| Dashboard  | `http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me/dashboard` |
+| 健康检查       | `http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me/health`    |
 | Agent 日志发送 | `http://auditloggeragent-auditloggeragent-mue8ko-342fc3-18-141-240-9.traefik.me/v1/ingest` |
+
 
 上游 Agent 的 `AUDIT_INGEST_URL` 应配置为上述 Agent 日志发送地址。`/v1/ingest` 当前没有内建认证，生产环境应只允许可信 Agent 或受控网关访问该地址。
 
 ## 使用入口
 
-| 入口 | 用途 |
-| --- | --- |
-| `GET /health` | 查看服务与数据库健康状态 |
-| `GET /query` | 查询审计事件 |
-| `GET /report/daily` | 查看日报 |
-| `GET /report/errors` | 查看错误报表 |
-| `GET /report/tools` | 查看工具使用统计 |
-| `GET /dashboard` | 查看 Dashboard |
-| `POST /v1/ingest` | 接收其他 Agent 的审计事件 |
+
+| 入口                   | 用途               |
+| -------------------- | ---------------- |
+| `GET /health`        | 查看服务与数据库健康状态     |
+| `GET /query`         | 查询审计事件           |
+| `GET /report/daily`  | 查看日报             |
+| `GET /report/errors` | 查看错误报表           |
+| `GET /report/tools`  | 查看工具使用统计         |
+| `GET /dashboard`     | 查看 Dashboard     |
+| `POST /v1/ingest`    | 接收其他 Agent 的审计事件 |
+
 
 ## 文档
 
 - [Dokploy 部署说明](docs/dokploy-deployment.md)：生产部署、变量、域名、网络边界、Dashboard 和备份恢复。
-- [飞书 Bot 审计通知方案](docs/feishu-bot-notification-design.md)：分组、卡片折叠、发送安全门、日报调度与验证流程。
 - [其他 Agent 接入日志审计服务指南](docs/agent-audit-log-integration-guide.md)：可直接交给编码 Agent 执行，覆盖仓库审计、日志字段契约、自动改造流程、真实发送和 Dashboard 验收。
-- [功能优化路线图与 P0 实施规格](docs/functionality-optimization-plan.md)：先完成 Finding 数据一致性、证据快照和处置闭环，再按真实规模进入审查队列、分页、评测和运营阶段。
+
+## Audit Logger Agent 审计效率
+
+### 已落地的审计自动化环节
+
+
+| 审计环节      | 原先人工工作                    | Audit Logger Agent 已实现的自动化能力                            |
+| --------- | ------------------------- | ------------------------------------------------------- |
+| 日志接收与归集   | 收集分散日志、检查格式并落到统一位置        | `POST /v1/ingest` 接收并校验事件，保存到 SQLite 与 spool            |
+| 批量初筛      | 逐条查看失败、重复、慢调用和敏感操作        | 候选检测器自动识别失败、重复调用、慢调用、高风险工具和不完整链路                        |
+| 风险归类与证据关联 | 手工按 Agent、Trace、工具和时间拼接证据 | 审查调度生成结构化 Finding，并关联证据、Agent、Trace 和工具                 |
+| 运行查看与定位   | 导出日志、整理表格、在不同系统间查找        | Dashboard、查询和报表支持按 Agent、Trace、工具、状态和时间下钻               |
+| 告警与日报     | 整理高风险清单，再人工发送通知           | high/critical Finding 可聚合为飞书卡片；北京时间 10:00、17:00 可生成累计日报 |
+
+
+### 效率测算参考
+
+下表中 A-01 为已完成的同批日志实测；其余场景已按 A-01 的处理速率做保守线性外推，仍不是服务 SLA。
+
+
+| 场景                                                          | 人工耗时        | Audit Logger Agent 自动化后 | 大概省多少                  |
+| ----------------------------------------------------------- | ----------- | ----------------------- | ---------------------- |
+| A-01：20 条固定审计日志的规则初筛                                        | 约4 分 15 秒   | 约25 ms                  | 4 分 15.135 秒（99.990%）  |
+| 100 条审计事件初筛与链路完整性检查（外推）                                     | 约 21 分 16 秒 | 约 129 ms                | 约 21 分 16 秒（约 99.990%） |
+| 1 小时 Agent 运行日志巡检（按 20 条日志/小时外推）                            | 约 4 分 15 秒  | 约 25.765 ms             | 约 4 分 15 秒（约 99.990%）  |
+| 20 条异常/失败事件归类与证据归集（按 15 条 Finding 外推）                       | 约 5 分 40 秒  | 约 34.353 ms             | 约 5 分 40 秒（约 99.990%）  |
+| 20 条 high/critical Finding 的告警准备与汇总（按 15 条 Finding 外推，不含发送） | 约 5 分 40 秒  | 约 34.353 ms             | 约 5 分 40 秒（约 99.990%）  |
+
+
+但需要谨慎思考的是：大量的Agent运行日志，实际很少会做人工检查，绝大部分场景下都是直接检查运行结果。因此日志审计agent最佳的使用方式是配合权限审计agent形成闭环的审计体系。
+
+### 相关文档
+
+- [项目总览](#audit-logger-agent)
+- [其他 Agent 接入日志审计服务指南](docs/agent-audit-log-integration-guide.md)
+- [飞书 Bot 审计通知方案](docs/feishu-bot-notification-design.md)
+- [Dokploy 部署说明](docs/dokploy-deployment.md)
 
 ## 运行边界
 

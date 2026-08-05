@@ -43,6 +43,7 @@ docs/
 !docs/
 docs/*
 !docs/agent-audit-log-integration-guide.md
+!docs/agent-automation-efficiency.md
 !docs/dokploy-deployment.md
 !docs/feishu-bot-notification-design.md
 v1.5/
