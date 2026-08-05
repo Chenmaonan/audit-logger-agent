@@ -24,8 +24,451 @@ import { createReviewNotifier } from '../../src/auditReview/notification.js';
 import { createVisualization } from '../../src/auditReview/visualization.js';
 import { createDashboardAuth } from '../../src/auditReview/dashboardAuth.js';
 import { createAuditReviewScheduler } from '../../src/auditReview/scheduler.js';
+import { createFindingLifecycleService } from '../../src/auditReview/findingLifecycleService.js';
 import { createToolSemanticMapper } from '../../src/auditReview/toolSemanticMapper.js';
 import { createHttpApp } from '../../src/adapters/http/app.js';
+
+test('dashboard routes pass normalized finding filters to visualization', async () => {
+  const calls = [];
+  const page = {
+    page: { title: '过滤参数测试' },
+    summary_metrics: [],
+    filters: [],
+    sections: [],
+  };
+  const visualization = {
+    agentIndexPage() {
+      return page;
+    },
+    overviewPage(filters) {
+      calls.push({ route: 'overview', filters });
+      return page;
+    },
+    reviewDetailPage(reviewId, filters) {
+      calls.push({ route: 'review', reviewId, filters });
+      return page;
+    },
+  };
+  const dashboardAuth = createDashboardAuth({
+    config: { auditReview: { http: { allowedOrigins: [] } } },
+    env: {},
+  });
+  const app = createHttpApp({
+    db: {},
+    config: {},
+    scheduler: {},
+    reviewStore: {
+      getRun(reviewId) {
+        return reviewId === 'review-1' ? { review_id: reviewId } : null;
+      },
+    },
+    visualization,
+    dashboardAuth,
+  });
+
+  await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
+  const { port } = app.address();
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    const overview = await fetch(
+      `${baseUrl}/dashboard?agent_id=agent%2Fone&severity=high&category=failed_call&status=resolved&review_id=review-1&sort=severity_desc&log_page=3&log_event=tool.end&log_tool_name=db.delete&log_trace_id=trace-1&log_status=INTERNAL`,
+    );
+    assert.equal(overview.status, 200);
+    assert.equal(overview.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(calls.shift(), {
+      route: 'overview',
+      filters: {
+        agentId: 'agent/one',
+        severity: 'high',
+        category: 'failed_call',
+        status: 'resolved',
+        reviewId: 'review-1',
+        sort: 'severity_desc',
+        logPage: 3,
+        logEvent: 'tool.end',
+        logToolName: 'db.delete',
+        logTraceId: 'trace-1',
+        logStatus: 'INTERNAL',
+      },
+    });
+
+    const empty = await fetch(
+      `${baseUrl}/dashboard?agent_id=&severity=&category=&status=&review_id=&sort=invalid&log_page=0`,
+    );
+    assert.equal(empty.status, 200);
+    assert.deepEqual(calls.shift(), {
+      route: 'overview',
+      filters: {
+        agentId: undefined,
+        severity: undefined,
+        category: undefined,
+        status: undefined,
+        reviewId: undefined,
+        sort: undefined,
+        logPage: undefined,
+        logEvent: undefined,
+        logToolName: undefined,
+        logTraceId: undefined,
+        logStatus: undefined,
+      },
+    });
+
+    const review = await fetch(
+      `${baseUrl}/dashboard/audit-reviews/review-1?agent_id=agent-two&severity=medium&category=repeated_call&status=open`,
+    );
+    assert.equal(review.status, 200);
+    assert.equal(review.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(calls.shift(), {
+      route: 'review',
+      reviewId: 'review-1',
+      filters: {
+        agentId: 'agent-two',
+        severity: 'medium',
+        category: 'repeated_call',
+        status: 'open',
+      },
+    });
+  } finally {
+    await new Promise((resolve) => app.close(resolve));
+  }
+});
+
+test('dashboard manual daily report confirmation and POST map delivery outcomes without GET side effects', async () => {
+  const db = openDb(':memory:');
+  ensureRuntimeSchema(db);
+  let scenario = 'enqueued';
+  let flushMode = 'delivered';
+  let eventSequence = 0;
+  let flushCalls = 0;
+  let runCalls = 0;
+  const manualStatuses = [];
+  const insertOutbox = db.prepare(`
+    INSERT INTO agent_outbox_events (
+      event_id, run_id, type, payload_json, delivery_mode, delivery_status,
+      delivery_attempts, max_attempts, callback_url, created_at
+    ) VALUES (?, ?, 'audit_daily_trace_report', '{}', 'feishu_bot', 'pending', 0, 8, NULL, ?)
+  `);
+  const notificationDigestScheduler = {
+    getManualSendStatus() {
+      return {
+        allowed: scenario !== 'disabled' && scenario !== 'dry_run',
+        reason: scenario === 'disabled' || scenario === 'dry_run' ? scenario : 'allowed',
+        date: '2026-07-20',
+        window: { from: '2026-07-19T16:00:00.000Z', to: '2026-07-20T06:35:00.000Z' },
+        localTime: '2026-07-20T14:35:00+08:00',
+        timezone: 'UTC+08:00',
+        timezoneOffsetMinutes: 480,
+      };
+    },
+    runManual() {
+      runCalls += 1;
+      if (scenario === 'duplicate') {
+        return { reason: 'duplicate', eventId: 'evt-existing', enqueuedCount: 0, payloadCount: 1 };
+      }
+      if (scenario === 'protected_window') {
+        return { reason: 'protected_window', eventId: null, enqueuedCount: 0, payloadCount: 0 };
+      }
+      if (scenario === 'disabled' || scenario === 'dry_run') {
+        return { reason: scenario, eventId: null, enqueuedCount: 0, payloadCount: 0 };
+      }
+      if (scenario === 'failed') throw new Error('internal manual report failure');
+      const eventId = `evt-manual-${++eventSequence}`;
+      insertOutbox.run(eventId, `manual-${eventSequence}`, new Date().toISOString());
+      return { reason: 'enqueued', eventId, enqueuedCount: 1, payloadCount: 1 };
+    },
+  };
+  const visualization = {
+    overviewPage() {
+      return { page: { title: '日报入口测试' }, summary_metrics: [], filters: [], sections: [] };
+    },
+    manualDailyReportPage({ status }) {
+      manualStatuses.push(status);
+      return {
+        page: { title: '确认发送当前日报', notification_status: status },
+        summary_metrics: [],
+        filters: [],
+        sections: [{
+          id: 'manual_daily_report_confirmation',
+          type: 'confirmation',
+          title: '发送当前日报',
+          description: status.message,
+          allowed: status.allowed,
+          items: [{ label: '统计日期', value: status.date }],
+          form: status.allowed ? {
+            method: 'post',
+            action: '/dashboard/daily-report/send',
+            submit_label: '确认发送',
+            cancel_label: '返回',
+            cancel_href: '/dashboard',
+          } : {
+            cancel_label: '返回',
+            cancel_href: '/dashboard',
+          },
+        }],
+      };
+    },
+  };
+  const dashboardAuth = {
+    authorizeDashboard(req) {
+      return req.headers['x-deny'] === '1'
+        ? { ok: false, status: 403, code: 'forbidden' }
+        : { ok: true };
+    },
+    corsHeaders() { return {}; },
+    clearSessionCookie() { return ''; },
+  };
+  const app = createHttpApp({
+    db,
+    config: {},
+    scheduler: {},
+    reviewStore: {},
+    visualization,
+    dashboardAuth,
+    notificationDigestScheduler,
+    now: () => new Date('2026-07-20T06:35:00.000Z'),
+    async flushNotifications() {
+      flushCalls += 1;
+      const eventId = `evt-manual-${eventSequence}`;
+      if (flushMode === 'delivered') {
+        db.prepare(`
+          UPDATE agent_outbox_events
+          SET delivery_status = 'delivered', delivered_at = ?
+          WHERE event_id = ?
+        `).run(new Date().toISOString(), eventId);
+        return;
+      }
+      if (flushMode === 'failed') throw new Error('flush failed');
+    },
+  });
+  await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
+  const baseUrl = `http://127.0.0.1:${app.address().port}`;
+  const post = () => fetch(`${baseUrl}/dashboard/daily-report/send`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: '',
+  });
+
+  try {
+    const beforeGet = db.prepare('SELECT COUNT(*) AS count FROM agent_outbox_events').get().count;
+    const confirmation = await fetch(`${baseUrl}/dashboard/daily-report/send`);
+    assert.equal(confirmation.status, 200);
+    const confirmationHtml = await confirmation.text();
+    assert.match(confirmationHtml, /确认发送当前日报|发送当前日报/);
+    assert.match(confirmationHtml, /method="post" action="\/dashboard\/daily-report\/send"/);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM agent_outbox_events').get().count, beforeGet);
+    assert.equal(runCalls, 0);
+    assert.equal(manualStatuses[0].label, '飞书通知正常');
+    assert.equal(manualStatuses[0].date, '2026-07-20');
+
+    const dashboard = await fetch(`${baseUrl}/dashboard`);
+    const dashboardHtml = await dashboard.text();
+    assert.match(dashboardHtml, /飞书通知正常/);
+    assert.match(dashboardHtml, /href="\/dashboard\/daily-report\/send"/);
+    assert.doesNotMatch(dashboardHtml, /立即发送日报/);
+
+    scenario = 'enqueued';
+    flushMode = 'delivered';
+    const sent = await post();
+    assert.equal(sent.status, 303);
+    assert.equal(sent.headers.get('location'), '/dashboard?notice=daily_report_sent');
+    assert.equal(flushCalls, 1);
+    assert.equal(db.prepare("SELECT delivery_status FROM agent_outbox_events WHERE event_id = 'evt-manual-1'").get().delivery_status, 'delivered');
+    const sentNotice = await (await fetch(`${baseUrl}${sent.headers.get('location')}`)).text();
+    assert.match(sentNotice, /日报已发送/);
+
+    scenario = 'duplicate';
+    const duplicate = await post();
+    assert.equal(duplicate.headers.get('location'), '/dashboard?notice=daily_report_duplicate');
+    assert.equal(flushCalls, 1);
+
+    scenario = 'protected_window';
+    const protectedResponse = await post();
+    assert.equal(protectedResponse.headers.get('location'), '/dashboard?notice=daily_report_protected');
+    assert.equal(flushCalls, 1);
+
+    scenario = 'dry_run';
+    const unavailableConfirmation = await fetch(`${baseUrl}/dashboard/daily-report/send`);
+    const unavailableConfirmationHtml = await unavailableConfirmation.text();
+    assert.match(unavailableConfirmationHtml, /当前为飞书演练模式，不能发送真实日报/);
+    assert.doesNotMatch(unavailableConfirmationHtml, /<form method="post" action="\/dashboard\/daily-report\/send"/);
+    const unavailable = await post();
+    assert.equal(unavailable.headers.get('location'), '/dashboard?notice=daily_report_unavailable');
+    assert.equal(flushCalls, 1);
+
+    scenario = 'enqueued';
+    flushMode = 'failed';
+    const queued = await post();
+    assert.equal(queued.headers.get('location'), '/dashboard?notice=daily_report_queued');
+    assert.equal(flushCalls, 2);
+    assert.equal(db.prepare("SELECT delivery_status FROM agent_outbox_events WHERE event_id = 'evt-manual-2'").get().delivery_status, 'pending');
+
+    scenario = 'failed';
+    const failed = await post();
+    assert.equal(failed.headers.get('location'), '/dashboard?notice=daily_report_failed');
+
+    const deniedGet = await fetch(`${baseUrl}/dashboard/daily-report/send`, { headers: { 'x-deny': '1' } });
+    assert.equal(deniedGet.status, 403);
+    const callsBeforeDeniedPost = runCalls;
+    const deniedPost = await fetch(`${baseUrl}/dashboard/daily-report/send`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { 'x-deny': '1', 'content-type': 'application/x-www-form-urlencoded' },
+      body: '',
+    });
+    assert.equal(deniedPost.status, 403);
+    assert.equal(runCalls, callsBeforeDeniedPost);
+  } finally {
+    await new Promise((resolve) => app.close(resolve));
+    db.close();
+  }
+});
+
+test('finding lifecycle HTTP routes expose history, map conflicts, and use dashboard POST + 303', async () => {
+  const calls = [];
+  const finding = { finding_id: 'finding/1', status: 'open', state_version: 3 };
+  const reviewStore = {
+    getFinding(findingId) {
+      return findingId === 'finding/1' ? finding : null;
+    },
+    getRun(reviewId) {
+      return reviewId === 'review-1' ? { review_id: reviewId } : null;
+    },
+    listFindingActions({ findingId, limit, offset }) {
+      assert.equal(findingId, 'finding/1');
+      return [{ action_id: 'act-1', limit, offset }];
+    },
+    listFindingOccurrences({ findingId, limit, offset }) {
+      assert.equal(findingId, 'finding/1');
+      return [{ occurrence_id: 'occ-1', limit, offset }];
+    },
+    listReviewOccurrences({ reviewId, limit, offset }) {
+      assert.equal(reviewId, 'review-1');
+      return [{ occurrence_id: 'occ-review-1', limit, offset }];
+    },
+  };
+  const findingLifecycleService = {
+    performAction(input) {
+      calls.push(input);
+      if (input.action === 'conflict') {
+        const error = new Error('version changed');
+        error.code = 'finding_version_conflict';
+        throw error;
+      }
+      if (input.action === 'invalid') {
+        const error = new Error('invalid action');
+        error.code = 'invalid_finding_action';
+        throw error;
+      }
+      return { finding: { ...finding, status: 'resolved', state_version: 4 }, action: { action_type: input.action } };
+    },
+  };
+  const visualization = {
+    overviewPage() { return { page: { title: '总览' }, sections: [] }; },
+    reviewDetailPage() { return { page: { title: '审查' }, sections: [] }; },
+    findingDetailPage(findingId, options) {
+      return {
+        page: { title: findingId },
+        notices: options?.notice ? [{ tone: options.notice === 'action_success' ? 'success' : 'critical', title: options.notice }] : [],
+        sections: [],
+      };
+    },
+  };
+  const dashboardAuth = createDashboardAuth({
+    config: { auditReview: { http: { allowedOrigins: [] } } },
+    env: { AUDIT_AGENT_DASHBOARD_TOKEN: 'lifecycle-test-token' },
+  });
+  const app = createHttpApp({
+    db: {},
+    config: { limits: { maxQueryLimit: 50 } },
+    scheduler: {},
+    reviewStore,
+    visualization,
+    dashboardAuth,
+    findingLifecycleService,
+  });
+  await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
+  const baseUrl = `http://127.0.0.1:${app.address().port}`;
+  const apiHeaders = { Authorization: 'Bearer lifecycle-test-token' };
+
+  try {
+    for (const [route, expectedId] of [
+      ['/v1/audit-findings/finding%2F1/actions?limit=500&offset=2', 'act-1'],
+      ['/v1/audit-findings/finding%2F1/occurrences?limit=20&offset=3', 'occ-1'],
+      ['/v1/audit-reviews/review-1/occurrences?limit=10&offset=4', 'occ-review-1'],
+    ]) {
+      const response = await fetch(`${baseUrl}${route}`, { headers: apiHeaders });
+      assert.equal(response.status, 200);
+      const body = await response.json();
+      assert.equal(body.count, 1);
+      assert.equal(body.results[0].action_id ?? body.results[0].occurrence_id, expectedId);
+    }
+
+    const success = await fetch(`${baseUrl}/v1/audit-findings/finding%2F1/actions`, {
+      method: 'POST',
+      headers: { ...apiHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        action: 'resolve',
+        actor: 'operator-1',
+        note: '已修复',
+        expected_state_version: 3,
+      }),
+    });
+    assert.equal(success.status, 200);
+    assert.deepEqual(calls.at(-1), {
+      findingId: 'finding/1',
+      action: 'resolve',
+      actor: 'operator-1',
+      note: '已修复',
+      snoozedUntil: undefined,
+      expectedStateVersion: 3,
+    });
+
+    const conflict = await fetch(`${baseUrl}/v1/audit-findings/finding%2F1/actions`, {
+      method: 'POST',
+      headers: { ...apiHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'conflict', actor: 'operator-1', expected_state_version: 3 }),
+    });
+    assert.equal(conflict.status, 409);
+    assert.equal((await conflict.json()).error_code, 'finding_version_conflict');
+
+    const invalid = await fetch(`${baseUrl}/v1/audit-findings/finding%2F1/actions`, {
+      method: 'POST',
+      headers: { ...apiHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'invalid' }),
+    });
+    assert.equal(invalid.status, 400);
+    assert.equal((await invalid.json()).error_code, 'invalid_finding_action');
+
+    const malformed = await fetch(`${baseUrl}/v1/audit-findings/finding%2F1/actions`, {
+      method: 'POST',
+      headers: { ...apiHeaders, 'content-type': 'application/json' },
+      body: '{not-json',
+    });
+    assert.equal(malformed.status, 400);
+    assert.equal((await malformed.json()).error_code, 'invalid_finding_action');
+
+    const dashboardAction = await fetch(`${baseUrl}/dashboard/audit-findings/finding%2F1/actions`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ action: 'resolve', actor: 'operator-2', note: '完成', expected_state_version: '3' }),
+    });
+    assert.equal(dashboardAction.status, 303);
+    assert.equal(
+      dashboardAction.headers.get('location'),
+      '/dashboard/audit-findings/finding%2F1?notice=action_success&action=resolve',
+    );
+    assert.equal(calls.at(-1).expectedStateVersion, 3);
+
+    const noticePage = await fetch(`${baseUrl}${dashboardAction.headers.get('location')}`);
+    assert.equal(noticePage.status, 200);
+    assert.ok((await noticePage.text()).includes('action_success'));
+  } finally {
+    await new Promise((resolve) => app.close(resolve));
+  }
+});
 
 function makeUpstreamEvent(overrides = {}) {
   return {
@@ -154,6 +597,7 @@ test('audit review HTTP integration smoke test', async () => {
   };
 
   const reviewStore = createReviewStore(db);
+  const findingLifecycleService = createFindingLifecycleService({ reviewStore });
   const lockStore = createLockStore(db);
   const cursorStore = createIngestCursorStore(db);
   const ingestService = createAuditIngestService({ db, config, cursorStore });
@@ -265,6 +709,7 @@ test('audit review HTTP integration smoke test', async () => {
     reviewStore,
     visualization,
     dashboardAuth,
+    findingLifecycleService,
   });
 
   await new Promise((resolve) => app.listen(0, '127.0.0.1', resolve));
@@ -406,12 +851,15 @@ test('audit review HTTP integration smoke test', async () => {
     // Case: GET /v1/audit-findings -> >= 1 finding
     // ------------------------------------------------------------------
     let findingId;
+    let findingRecord;
     {
       const res = await fetch(`${baseUrl}/v1/audit-findings`, { headers: bearerHeaders });
       assert.equal(res.status, 200);
       const body = await res.json();
       assert.ok(body.count >= 1, 'should have at least 1 finding');
-      findingId = body.results[0].finding_id;
+      findingRecord = body.results.find((finding) => finding.status === 'open');
+      assert.ok(findingRecord, 'should have at least 1 open finding for dashboard filtering');
+      findingId = findingRecord.finding_id;
       assert.ok(findingId, 'finding should have finding_id');
     }
 
@@ -463,8 +911,8 @@ test('audit review HTTP integration smoke test', async () => {
       assert.equal(html.includes('Severity'), false, 'dashboard should not contain English Severity');
       assert.equal(html.includes('Confidence'), false, 'dashboard should not contain English Confidence');
       assert.equal(html.includes('Data source'), false, 'dashboard should not contain Data source');
-      assert.ok(html.includes('Trace ID'), 'dashboard should contain trace link column');
-      assert.ok(html.includes('#trace_sequence'), 'dashboard should link trace ids to the finding trace sequence');
+      assert.ok(html.includes(findingRecord.title), 'dashboard should include the default open finding');
+      assert.ok(html.includes('/dashboard/audit-findings/'), 'dashboard should link to finding detail evidence');
       assert.doesNotMatch(html, MOJIBAKE_PATTERN);
 
       const filtered = await fetch(`${baseUrl}/dashboard?agent_id=agent-test`, { headers: bearerHeaders });
@@ -475,10 +923,57 @@ test('audit review HTTP integration smoke test', async () => {
       assert.equal(filteredApi.status, 200);
       const filteredBody = await filteredApi.json();
       assert.ok(filteredBody.count >= 1, 'filtered API should contain the agent finding');
-      assert.ok(filteredHtml.includes('待处理风险发现'), 'filtered dashboard should render the findings section');
+      assert.ok(filteredHtml.includes('风险发现'), 'filtered dashboard should render the findings section');
+      assert.ok(filteredHtml.includes('Agent 日志（第 1/1 页，共 3 条）'), 'agent dashboard should render all agent logs');
+      assert.ok(filteredHtml.includes('trace-ok-1'), 'agent dashboard should render the latest trace id');
+      assert.ok(filteredHtml.includes('span-ok-1'), 'agent dashboard should render the latest span id');
+      assert.ok(filteredHtml.includes('search ok'), 'agent dashboard should render normal non-finding logs');
+      assert.ok(filteredHtml.includes('当前页原始日志'), 'agent dashboard should expose current-page raw logs');
+      assert.ok(filteredHtml.includes('全部状态'), 'agent dashboard should default the status filter to all states');
+      assert.equal(filteredHtml.includes('打开最新降级审查'), false, 'dashboard should not render the degraded review shortcut');
       assert.ok(filteredHtml.includes('agent-test'), 'filtered dashboard should contain the agent id');
       assert.ok(filteredHtml.includes('db.delete'), 'filtered dashboard should contain the agent finding tool');
       assert.doesNotMatch(filteredHtml, MOJIBAKE_PATTERN);
+
+      const matchingFilters = new URLSearchParams({
+        agent_id: findingRecord.agent_id,
+        severity: findingRecord.severity,
+        category: findingRecord.category,
+        status: 'open',
+        review_id: findingRecord.review_id,
+      });
+      const matching = await fetch(`${baseUrl}/dashboard?${matchingFilters}`, { headers: bearerHeaders });
+      assert.equal(matching.status, 200, 'GET dashboard with matching filters should be 200');
+      assert.equal(matching.headers.get('cache-control'), 'no-store');
+      const matchingHtml = await matching.text();
+      assert.ok(matchingHtml.includes(findingRecord.trace_id), 'matching filters should retain associated Agent logs');
+      assert.equal(matchingHtml.includes('id="pending_findings"'), false, 'Agent dashboard should not render duplicate findings');
+      assert.equal(matchingHtml.includes('test-token-123'), false, 'filtered dashboard must not expose the API token');
+
+      for (const [filterName, filterValue] of [
+        ['agent_id', 'other-agent'],
+        ['severity', 'critical'],
+        ['category', 'failed_call'],
+        ['status', 'resolved'],
+      ]) {
+        const params = new URLSearchParams({
+          agent_id: findingRecord.agent_id,
+          severity: findingRecord.severity,
+          category: findingRecord.category,
+          status: 'open',
+          review_id: findingRecord.review_id,
+        });
+        params.set(filterName, filterValue);
+        const excluded = await fetch(`${baseUrl}/dashboard?${params}`, { headers: bearerHeaders });
+        assert.equal(excluded.status, 200, `GET dashboard with non-matching ${filterName} should be 200`);
+        const excludedHtml = await excluded.text();
+        assert.equal(
+          excludedHtml.includes(findingRecord.trace_id),
+          false,
+          `non-matching ${filterName} should exclude associated Agent logs`,
+        );
+        assert.doesNotMatch(excludedHtml, MOJIBAKE_PATTERN);
+      }
     }
 
     // ------------------------------------------------------------------
@@ -491,9 +986,26 @@ test('audit review HTTP integration smoke test', async () => {
       const html = await res.text();
       assert.ok(html.includes('<html'), 'review detail html should contain <html');
       assert.ok(html.includes('审查批次'), 'review detail should contain Chinese review title');
-      assert.ok(html.includes('Trace ID'), 'review detail should contain trace link column');
-      assert.ok(html.includes('#trace_sequence'), 'review detail should link trace ids to the finding trace sequence');
       assert.doesNotMatch(html, MOJIBAKE_PATTERN);
+
+      const matching = await fetch(
+        `${baseUrl}/dashboard/audit-reviews/${findingRecord.review_id}?agent_id=${encodeURIComponent(findingRecord.agent_id)}&severity=${encodeURIComponent(findingRecord.severity)}&category=${encodeURIComponent(findingRecord.category)}&status=open`,
+        { headers: bearerHeaders },
+      );
+      assert.equal(matching.status, 200, 'GET filtered review detail should be 200');
+      assert.equal(matching.headers.get('cache-control'), 'no-store');
+      const matchingHtml = await matching.text();
+      assert.ok(matchingHtml.includes(findingRecord.title), 'matching review filters should retain the finding');
+      assert.equal(matchingHtml.includes('test-token-123'), false, 'filtered review must not expose the API token');
+
+      const excluded = await fetch(
+        `${baseUrl}/dashboard/audit-reviews/${findingRecord.review_id}?severity=critical`,
+        { headers: bearerHeaders },
+      );
+      assert.equal(excluded.status, 200, 'GET review detail with non-matching severity should be 200');
+      const excludedHtml = await excluded.text();
+      assert.equal(excludedHtml.includes(findingRecord.title), false, 'non-matching review filter should exclude the finding');
+      assert.doesNotMatch(excludedHtml, MOJIBAKE_PATTERN);
     }
 
     // ------------------------------------------------------------------
@@ -519,6 +1031,69 @@ test('audit review HTTP integration smoke test', async () => {
       assert.equal(html.includes('Raw log snippet'), false, 'finding detail should not contain English raw evidence label');
       assert.doesNotMatch(html, MOJIBAKE_PATTERN);
       assert.equal(html.includes('置信度'), false, 'finding detail should not contain 置信度');
+    }
+
+    // ------------------------------------------------------------------
+    // Case: real occurrence/action history and lifecycle Dashboard flow
+    // ------------------------------------------------------------------
+    {
+      const findingOccurrences = await fetch(
+        `${baseUrl}/v1/audit-findings/${findingId}/occurrences`,
+        { headers: bearerHeaders },
+      );
+      assert.equal(findingOccurrences.status, 200);
+      const occurrenceBody = await findingOccurrences.json();
+      assert.ok(occurrenceBody.count >= 1, 'finding should retain at least one occurrence snapshot');
+      assert.ok(Array.isArray(occurrenceBody.results[0].evidence));
+
+      const reviewOccurrences = await fetch(
+        `${baseUrl}/v1/audit-reviews/${findingRecord.review_id}/occurrences`,
+        { headers: bearerHeaders },
+      );
+      assert.equal(reviewOccurrences.status, 200);
+      assert.ok((await reviewOccurrences.json()).count >= 1);
+
+      const acknowledge = await fetch(`${baseUrl}/v1/audit-findings/${findingId}/actions`, {
+        method: 'POST',
+        headers: { ...bearerHeaders, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          action: 'acknowledge',
+          actor: 'integration-operator',
+          expected_state_version: findingRecord.state_version,
+        }),
+      });
+      assert.equal(acknowledge.status, 200);
+      const acknowledgeBody = await acknowledge.json();
+      assert.equal(acknowledgeBody.finding.status, 'acknowledged');
+
+      const resolve = await fetch(`${baseUrl}/dashboard/audit-findings/${findingId}/actions`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          action: 'resolve',
+          actor: 'integration-operator',
+          note: '集成测试已验证',
+          expected_state_version: String(acknowledgeBody.finding.state_version),
+        }),
+      });
+      assert.equal(resolve.status, 303);
+      assert.match(resolve.headers.get('location'), /notice=action_success/);
+
+      const resolvedPage = await fetch(`${baseUrl}${resolve.headers.get('location')}`);
+      assert.equal(resolvedPage.status, 200);
+      const resolvedHtml = await resolvedPage.text();
+      assert.ok(resolvedHtml.includes('操作已完成'));
+      assert.ok(resolvedHtml.includes('出现历史'));
+      assert.ok(resolvedHtml.includes('操作历史'));
+      assert.ok(resolvedHtml.includes('历史证据快照'));
+
+      const actionHistory = await fetch(
+        `${baseUrl}/v1/audit-findings/${findingId}/actions`,
+        { headers: bearerHeaders },
+      );
+      assert.equal(actionHistory.status, 200);
+      assert.equal((await actionHistory.json()).count, 2);
     }
 
     // ------------------------------------------------------------------
@@ -601,7 +1176,7 @@ test('audit review HTTP integration smoke test', async () => {
   }
 });
 
-test('audit review ingests all events and sends mapped tool semantics to detector/LLM', async () => {
+test('audit review ingests all events and reviews canonical or unknown tool lifecycle events', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-review-alias-'));
   const dbPath = path.join(tmpDir, 'test.db');
   const db = openDb(dbPath);

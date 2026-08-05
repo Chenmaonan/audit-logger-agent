@@ -200,6 +200,310 @@ function parseUrl(req) {
   return new URL(req.url, 'http://127.0.0.1');
 }
 
+function firstDefined(...values) {
+  return values.find((value) => value !== undefined);
+}
+
+function safeIso(value) {
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) return null;
+  return value;
+}
+
+function safeScheduleHours(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map(Number)
+    .filter((hour) => Number.isInteger(hour) && hour >= 0 && hour <= 23);
+}
+
+function safeTimezoneOffset(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < -1440 || parsed > 1440) return null;
+  return Math.trunc(parsed);
+}
+
+function safeDigestSlot(value) {
+  if (!value || typeof value !== 'object') return null;
+  const slotHour = Number(value.slot_hour ?? value.slotHour);
+  const attempts = Number(value.attempts);
+  const enqueuedCount = Number(value.enqueued_count ?? value.enqueuedCount);
+  return {
+    slot_key: typeof (value.slot_key ?? value.slotKey) === 'string' ? (value.slot_key ?? value.slotKey) : null,
+    report_date: typeof (value.report_date ?? value.reportDate) === 'string' ? (value.report_date ?? value.reportDate) : null,
+    slot_hour: Number.isInteger(slotHour) ? slotHour : null,
+    scheduled_for: safeIso(value.scheduled_for ?? value.scheduledFor),
+    timezone_offset_minutes: safeTimezoneOffset(value.timezone_offset_minutes ?? value.timezoneOffsetMinutes),
+    trigger_type: ['scheduled', 'catch_up'].includes(value.trigger_type ?? value.triggerType)
+      ? (value.trigger_type ?? value.triggerType)
+      : null,
+    status: typeof value.status === 'string' ? value.status : null,
+    attempts: Number.isInteger(attempts) && attempts >= 0 ? attempts : null,
+    enqueued_count: Number.isInteger(enqueuedCount) && enqueuedCount >= 0 ? enqueuedCount : null,
+    started_at: safeIso(value.started_at ?? value.startedAt),
+    completed_at: safeIso(value.completed_at ?? value.completedAt),
+  };
+}
+
+function latestDailyDigestDelivery(db, timezoneOffsetMinutes, lastSlot) {
+  const empty = {
+    delivery_slot_key: lastSlot?.slot_key ?? null,
+    last_enqueued_at: null,
+    last_delivered_at: null,
+    delivery_lag_ms: null,
+  };
+  try {
+    let runId = null;
+    let scheduledAt = safeIso(lastSlot?.scheduled_for);
+    if (lastSlot?.slot_key) {
+      if (lastSlot.status !== 'enqueued') return empty;
+      if (lastSlot.report_date && Number.isInteger(lastSlot.slot_hour)) {
+        runId = `daily_${lastSlot.report_date}_${lastSlot.slot_hour}`;
+      }
+    } else {
+      runId = db.prepare(`
+        SELECT run_id
+        FROM agent_outbox_events
+        WHERE type = 'audit_daily_trace_report'
+          AND delivery_mode = 'feishu_bot'
+        GROUP BY run_id
+        ORDER BY MAX(created_at) DESC
+        LIMIT 1
+      `).get()?.run_id ?? null;
+    }
+    if (!runId) return empty;
+
+    const row = db.prepare(`
+      SELECT
+        events.run_id,
+        MAX(events.created_at) AS last_enqueued_at,
+        CASE
+          WHEN SUM(CASE
+            WHEN events.delivery_status = 'delivered' AND events.delivered_at IS NOT NULL THEN 0
+            ELSE 1
+          END) = 0
+          THEN MAX(events.delivered_at)
+          ELSE NULL
+        END AS last_delivered_at
+      FROM agent_outbox_events AS events
+      WHERE events.run_id = @run_id
+        AND events.type = 'audit_daily_trace_report'
+        AND events.delivery_mode = 'feishu_bot'
+      GROUP BY events.run_id
+    `).get({ run_id: runId });
+    if (!row) return empty;
+
+    const lastEnqueuedAt = safeIso(row.last_enqueued_at);
+    const lastDeliveredAt = safeIso(row.last_delivered_at);
+    const runMatch = /^daily_(\d{4})-(\d{2})-(\d{2})_(\d{1,2})$/.exec(runId);
+    let deliveryLagMs = null;
+    if (!scheduledAt && runMatch && timezoneOffsetMinutes !== null) {
+      const [, year, month, day, hour] = runMatch;
+      scheduledAt = new Date(Date.UTC(
+        Number(year),
+        Number(month) - 1,
+        Number(day),
+        Number(hour),
+      ) - timezoneOffsetMinutes * 60 * 1000).toISOString();
+    }
+    if (lastDeliveredAt && scheduledAt) {
+      deliveryLagMs = Date.parse(lastDeliveredAt) - Date.parse(scheduledAt);
+    }
+
+    return {
+      delivery_slot_key: lastSlot?.slot_key ?? runId.replace(/^daily_/, 'daily:').replace(/_(\d{1,2})$/, ':$1'),
+      last_enqueued_at: lastEnqueuedAt,
+      last_delivered_at: lastDeliveredAt,
+      delivery_lag_ms: Number.isFinite(deliveryLagMs) ? deliveryLagMs : null,
+    };
+  } catch (error) {
+    if (isMissingTableError(error)) return empty;
+    return empty;
+  }
+}
+
+function notificationDigestHealth(notificationDigestScheduler, db) {
+  if (typeof notificationDigestScheduler?.getHealthStatus !== 'function') return null;
+
+  let source;
+  let statusError = false;
+  try {
+    source = notificationDigestScheduler.getHealthStatus() ?? {};
+  } catch {
+    source = {};
+    statusError = true;
+  }
+
+  const timezoneOffsetMinutes = safeTimezoneOffset(firstDefined(
+    source.timezone_offset_minutes,
+    source.timezoneOffsetMinutes,
+  ));
+  const lastSlot = safeDigestSlot(firstDefined(source.last_slot, source.lastSlot));
+  const schedulerState = {
+    status_error: statusError,
+    feishu_mode: ['disabled', 'dry-run', 'live'].includes(firstDefined(source.feishu_mode, source.feishuMode, source.mode))
+      ? firstDefined(source.feishu_mode, source.feishuMode, source.mode)
+      : 'disabled',
+    configured_enabled: Boolean(firstDefined(source.configured_enabled, source.configuredEnabled, source.enabled, false)),
+    scheduler_started: Boolean(firstDefined(source.scheduler_started, source.schedulerStarted, source.started, false)),
+    active: Boolean(source.active),
+    timezone: typeof source.timezone === 'string' ? source.timezone : null,
+    timezone_offset_minutes: timezoneOffsetMinutes,
+    schedule_hours: safeScheduleHours(firstDefined(source.schedule_hours, source.scheduleHours, source.hours)),
+    catch_up_window_minutes: Number.isInteger(Number(firstDefined(
+      source.catch_up_window_minutes,
+      source.catchUpWindowMinutes,
+    ))) && Number(firstDefined(source.catch_up_window_minutes, source.catchUpWindowMinutes)) >= 0
+      ? Number(firstDefined(source.catch_up_window_minutes, source.catchUpWindowMinutes))
+      : null,
+    next_run_at_utc: safeIso(firstDefined(source.next_run_at_utc, source.nextRunAtUtc)),
+    next_run_at_local: safeIso(firstDefined(source.next_run_at_local, source.nextRunAtLocal)),
+    last_slot: lastSlot,
+  };
+
+  return {
+    ...schedulerState,
+    ...latestDailyDigestDelivery(db, timezoneOffsetMinutes, lastSlot),
+  };
+}
+
+function optionalSearchParam(url, name) {
+  return url.searchParams.get(name) || undefined;
+}
+
+function dashboardSortParam(url) {
+  const value = optionalSearchParam(url, 'sort');
+  return value === 'time_desc' || value === 'severity_desc' ? value : undefined;
+}
+
+function dashboardLogPageParam(url) {
+  const value = optionalSearchParam(url, 'log_page');
+  if (!value || !/^\d+$/.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+const MANUAL_DAILY_REPORT_PATH = '/dashboard/daily-report/send';
+
+const DAILY_REPORT_NOTICES = {
+  daily_report_sent: { tone: 'success', title: '日报已发送' },
+  daily_report_queued: { tone: 'neutral', title: '日报已进入发送队列' },
+  daily_report_duplicate: { tone: 'neutral', title: '本分钟日报已提交，请勿重复操作' },
+  daily_report_protected: { tone: 'neutral', title: '临近定时报送时段，请等待自动日报' },
+  daily_report_unavailable: { tone: 'critical', title: '飞书通知当前不可用' },
+  daily_report_failed: { tone: 'critical', title: '日报发送失败，请稍后重试' },
+};
+
+function dailyReportNotice(value) {
+  const notice = DAILY_REPORT_NOTICES[value];
+  return notice ? [{ ...notice }] : [];
+}
+
+function manualSendStatus(notificationDigestScheduler, at) {
+  if (typeof notificationDigestScheduler?.getManualSendStatus !== 'function') {
+    return { allowed: false, reason: 'unavailable' };
+  }
+  try {
+    return notificationDigestScheduler.getManualSendStatus({ at }) ?? { allowed: false, reason: 'unavailable' };
+  } catch {
+    return { allowed: false, reason: 'unavailable' };
+  }
+}
+
+function notificationStatusModel(status = {}) {
+  const reason = status.reason;
+  if (status.allowed === true || reason === 'allowed' || reason === 'protected_window') {
+    return {
+      ...status,
+      label: '飞书通知正常',
+      tone: 'success',
+      href: MANUAL_DAILY_REPORT_PATH,
+      active: true,
+      ...(reason === 'protected_window'
+        ? { message: '临近定时报送时段，请等待自动日报。' }
+        : {}),
+    };
+  }
+  if (reason === 'dry_run') {
+    return {
+      ...status,
+      label: '飞书通知演练模式',
+      tone: 'neutral',
+      href: MANUAL_DAILY_REPORT_PATH,
+      active: false,
+      message: '当前为飞书演练模式，不能发送真实日报。',
+    };
+  }
+  if (reason === 'disabled') {
+    return {
+      ...status,
+      label: '飞书通知未启用',
+      tone: 'neutral',
+      href: MANUAL_DAILY_REPORT_PATH,
+      active: false,
+      message: '飞书通知未启用，当前不能发送日报。',
+    };
+  }
+  return {
+    ...status,
+    label: '飞书通知状态异常',
+    tone: 'critical',
+    href: MANUAL_DAILY_REPORT_PATH,
+    active: false,
+    message: '飞书通知状态异常，当前不能发送日报。',
+  };
+}
+
+function manualDeliveryStatus(db, eventId) {
+  if (!eventId) return null;
+  try {
+    return db.prepare('SELECT delivery_status FROM agent_outbox_events WHERE event_id = ?').get(eventId)?.delivery_status ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function noticeForManualResult(result, deliveryStatus) {
+  if (result?.reason === 'duplicate') return 'daily_report_duplicate';
+  if (result?.reason === 'protected_window') return 'daily_report_protected';
+  if (result?.reason === 'disabled' || result?.reason === 'dry_run') return 'daily_report_unavailable';
+  if (result?.reason !== 'enqueued' || !result.eventId) return 'daily_report_failed';
+  if (deliveryStatus === 'delivered') return 'daily_report_sent';
+  if (deliveryStatus === 'pending' || deliveryStatus == null) return 'daily_report_queued';
+  return 'daily_report_failed';
+}
+
+function decorateOverviewPage(page, { status, notice } = {}) {
+  if (!page || typeof page !== 'object') return page;
+  const notices = dailyReportNotice(notice);
+  return {
+    ...page,
+    page: {
+      ...(page.page && typeof page.page === 'object' ? page.page : {}),
+      notification_status: notificationStatusModel(status),
+    },
+    ...(notices.length > 0 ? { notices } : {}),
+  };
+}
+
+function dashboardFindingFilters(url, { includeReviewId = false, includeOverviewControls = false } = {}) {
+  const filters = {
+    agentId: optionalSearchParam(url, 'agent_id'),
+    severity: optionalSearchParam(url, 'severity'),
+    category: optionalSearchParam(url, 'category'),
+    status: optionalSearchParam(url, 'status'),
+  };
+  if (includeReviewId) filters.reviewId = optionalSearchParam(url, 'review_id');
+  if (includeOverviewControls) {
+    filters.sort = dashboardSortParam(url);
+    filters.logPage = dashboardLogPageParam(url);
+    filters.logEvent = optionalSearchParam(url, 'log_event');
+    filters.logToolName = optionalSearchParam(url, 'log_tool_name');
+    filters.logTraceId = optionalSearchParam(url, 'log_trace_id');
+    filters.logStatus = optionalSearchParam(url, 'log_status');
+  }
+  return filters;
+}
+
 function isNonEmptyString(value) {
   return typeof value === 'string' && value.trim() !== '';
 }
@@ -213,6 +517,9 @@ function validateCreateRunInput(input) {
   if (!isNonEmptyString(input.deliveryMode)) errors.push({ field: 'delivery.mode', message: 'delivery.mode is required' });
   if (input.deliveryMode === 'callback' && !isNonEmptyString(input.deliveryTargetUrl)) {
     errors.push({ field: 'delivery.target_url', message: 'delivery.target_url is required when delivery.mode is callback' });
+  }
+  if (input.deliveryMode !== 'callback' && input.deliveryTargetUrl != null) {
+    errors.push({ field: 'delivery.target_url', message: 'delivery.target_url is only allowed when delivery.mode is callback' });
   }
   return errors;
 }
@@ -260,7 +567,75 @@ function mapRuntimeError(error) {
   return { status: 500, body: { error_code: 'internal_error', error: 'Internal server error' } };
 }
 
-export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth, toolSemanticMapper, retentionService, now = () => new Date() } = {}) {
+function mapFindingActionError(error) {
+  const code = error?.code;
+  if (error instanceof SyntaxError) return { status: 400, body: { error_code: 'invalid_finding_action', error: 'Request body must be valid JSON' } };
+  if (code === 'invalid_finding_action') return { status: 400, body: { error_code: code, error: error.message } };
+  if (code === 'finding_not_found') return { status: 404, body: { error_code: code, error: error.message } };
+  if (code === 'finding_state_conflict' || code === 'finding_version_conflict') {
+    return { status: 409, body: { error_code: code, error: error.message } };
+  }
+  if (code === 'finding_lifecycle_unavailable') return { status: 503, body: { error_code: code, error: error.message } };
+  return { status: 500, body: { error_code: 'internal_error', error: 'Internal server error' } };
+}
+
+async function readForm(req, limitBytes = DEFAULT_MAX_BODY_BYTES) {
+  const declared = Number(req.headers['content-length']);
+  if (Number.isFinite(declared) && declared > limitBytes) {
+    const error = new Error('Request body exceeds maxBodyBytes');
+    error.code = 'body_too_large';
+    throw error;
+  }
+
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > limitBytes) {
+      const error = new Error('Request body exceeds maxBodyBytes');
+      error.code = 'body_too_large';
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  return Object.fromEntries(new URLSearchParams(Buffer.concat(chunks).toString('utf-8')));
+}
+
+function findingActionInput(body = {}) {
+  const rawVersion = body.expected_state_version ?? body.expectedStateVersion;
+  const expectedStateVersion = typeof rawVersion === 'string' && /^\d+$/.test(rawVersion)
+    ? Number(rawVersion)
+    : rawVersion;
+  return {
+    action: body.action,
+    actor: body.actor,
+    note: body.note,
+    snoozedUntil: body.snoozed_until ?? body.snoozedUntil,
+    expectedStateVersion,
+  };
+}
+
+async function performFindingAction(findingLifecycleService, findingId, input) {
+  const handler = findingLifecycleService?.performAction
+    ?? findingLifecycleService?.applyAction
+    ?? findingLifecycleService?.executeAction
+    ?? findingLifecycleService?.transitionFinding;
+  if (typeof handler !== 'function') {
+    const error = new Error('Finding lifecycle service is unavailable');
+    error.code = 'finding_lifecycle_unavailable';
+    throw error;
+  }
+  return handler.call(findingLifecycleService, { findingId, ...input });
+}
+
+function listHistory(store, methodName, idName, id, pagination) {
+  const method = store?.[methodName];
+  if (typeof method !== 'function') return null;
+  const rows = method.call(store, { [idName]: id, ...pagination });
+  return Array.isArray(rows) ? rows : [];
+}
+
+export function createHttpApp({ db, config, runStore, runtime, scheduler, reviewStore, visualization, dashboardAuth, findingLifecycleService, toolSemanticMapper, retentionService, notificationDigestScheduler, flushNotifications, now = () => new Date() } = {}) {
   // Helpers for audit-review routes. These are optional — if not provided
   // (e.g. in the existing runs-api test), the new routes return 503.
   const hasReviewDeps = !!(scheduler && reviewStore && visualization && dashboardAuth);
@@ -306,6 +681,25 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         return;
       }
 
+      const reviewOccurrencesMatch = url.pathname.match(/^\/v1\/audit-reviews\/([^/]+)\/occurrences$/);
+      if (hasReviewDeps && req.method === 'GET' && reviewOccurrencesMatch) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeApi(req);
+        const fail = mapAuthFailure(auth);
+        if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
+        const reviewId = decodeURIComponent(reviewOccurrencesMatch[1]);
+        const run = reviewStore.getRun(reviewId);
+        if (!run) { auditJson(res, 404, { error_code: 'review_not_found', error: 'Review not found' }, cors); return; }
+        const pagination = paginationFromUrl(url, { defaultLimit: 100, config });
+        const occurrences = listHistory(reviewStore, 'listReviewOccurrences', 'reviewId', reviewId, pagination);
+        if (occurrences === null) {
+          auditJson(res, 503, { error_code: 'occurrence_store_unavailable', error: 'Review occurrence history is unavailable' }, cors);
+          return;
+        }
+        auditJson(res, 200, { count: occurrences.length, results: occurrences }, cors);
+        return;
+      }
+
       if (hasReviewDeps && req.method === 'GET' && url.pathname.startsWith('/v1/audit-reviews/') && url.pathname !== '/v1/audit-reviews/run') {
         const cors = reviewCors(req);
         const auth = dashboardAuth.authorizeApi(req);
@@ -332,6 +726,53 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         const reviewId = url.searchParams.get('review_id') ?? undefined;
         const findings = reviewStore.listFindings({ limit, offset, severity, category, agentId, toolName, status: statusFilter, reviewId });
         auditJson(res, 200, { count: findings.length, results: findings }, cors);
+        return;
+      }
+
+      const findingHistoryMatch = url.pathname.match(/^\/v1\/audit-findings\/([^/]+)\/(actions|occurrences)$/);
+      if (hasReviewDeps && req.method === 'GET' && findingHistoryMatch) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeApi(req);
+        const fail = mapAuthFailure(auth);
+        if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
+        const findingId = decodeURIComponent(findingHistoryMatch[1]);
+        const finding = reviewStore.getFinding(findingId);
+        if (!finding) { auditJson(res, 404, { error_code: 'finding_not_found', error: 'Finding not found' }, cors); return; }
+        const pagination = paginationFromUrl(url, { defaultLimit: 100, config });
+        const isActions = findingHistoryMatch[2] === 'actions';
+        const rows = listHistory(
+          reviewStore,
+          isActions ? 'listFindingActions' : 'listFindingOccurrences',
+          'findingId',
+          findingId,
+          pagination,
+        );
+        if (rows === null) {
+          auditJson(res, 503, {
+            error_code: isActions ? 'action_store_unavailable' : 'occurrence_store_unavailable',
+            error: isActions ? 'Finding action history is unavailable' : 'Finding occurrence history is unavailable',
+          }, cors);
+          return;
+        }
+        auditJson(res, 200, { count: rows.length, results: rows }, cors);
+        return;
+      }
+
+      const findingActionMatch = url.pathname.match(/^\/v1\/audit-findings\/([^/]+)\/actions$/);
+      if (hasReviewDeps && req.method === 'POST' && findingActionMatch) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeApi(req);
+        const fail = mapAuthFailure(auth);
+        if (fail) { auditJson(res, fail.status, fail.body, cors); return; }
+        const findingId = decodeURIComponent(findingActionMatch[1]);
+        try {
+          const body = await readJson(req, maxBodyBytes(config));
+          const result = await performFindingAction(findingLifecycleService, findingId, findingActionInput(body));
+          auditJson(res, 200, result, cors);
+        } catch (error) {
+          const mapped = error?.code === 'body_too_large' ? mapRuntimeError(error) : mapFindingActionError(error);
+          auditJson(res, mapped.status, mapped.body, cors);
+        }
         return;
       }
 
@@ -380,14 +821,87 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         return;
       }
 
+      if (hasReviewDeps && req.method === 'GET' && url.pathname === MANUAL_DAILY_REPORT_PATH) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeDashboard(req);
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
+        if (typeof visualization.manualDailyReportPage !== 'function') {
+          html(res, 503, '<h1>Daily report page unavailable</h1>', cors);
+          return;
+        }
+        const at = now();
+        const status = notificationStatusModel(manualSendStatus(notificationDigestScheduler, at));
+        const page = visualization.manualDailyReportPage({ status });
+        html(res, 200, renderDashboard(page), cors);
+        return;
+      }
+
+      if (hasReviewDeps && req.method === 'POST' && url.pathname === MANUAL_DAILY_REPORT_PATH) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeDashboard(req);
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
+
+        let notice = 'daily_report_failed';
+        try {
+          await readForm(req, maxBodyBytes(config));
+          if (typeof notificationDigestScheduler?.runManual !== 'function') {
+            notice = 'daily_report_unavailable';
+          } else {
+            const result = await notificationDigestScheduler.runManual({ generatedAt: now() });
+            if (result?.reason === 'enqueued' && result.eventId) {
+              try {
+                if (typeof flushNotifications === 'function') await flushNotifications();
+              } catch {
+                // The Outbox keeps the event pending for the normal retry loop.
+              }
+            }
+            notice = noticeForManualResult(result, manualDeliveryStatus(db, result?.eventId));
+          }
+        } catch {
+          notice = 'daily_report_failed';
+        }
+        redirect(res, `/dashboard?notice=${encodeURIComponent(notice)}`);
+        return;
+      }
+
       if (hasReviewDeps && req.method === 'GET' && (url.pathname === '/dashboard' || url.pathname === '/dashboard/')) {
         const cors = reviewCors(req);
         const auth = dashboardAuth.authorizeDashboard(req);
         const fail = mapAuthFailure(auth);
         if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
-        const agentId = url.searchParams.get('agent_id') || undefined;
-        const page = visualization.overviewPage({ agentId });
+        const filters = dashboardFindingFilters(url, {
+          includeReviewId: true,
+          includeOverviewControls: true,
+        });
+        const page = decorateOverviewPage(visualization.overviewPage(filters), {
+          status: manualSendStatus(notificationDigestScheduler, now()),
+          notice: optionalSearchParam(url, 'notice'),
+        });
         html(res, 200, renderDashboard(page), cors);
+        return;
+      }
+
+      const dashboardFindingActionMatch = url.pathname.match(/^\/dashboard\/audit-findings\/([^/]+)\/actions$/);
+      if (hasReviewDeps && req.method === 'POST' && dashboardFindingActionMatch) {
+        const cors = reviewCors(req);
+        const auth = dashboardAuth.authorizeDashboard(req);
+        const fail = mapAuthFailure(auth);
+        if (fail) { html(res, fail.status, `<h1>${fail.body.error}</h1>`, cors); return; }
+        const findingId = decodeURIComponent(dashboardFindingActionMatch[1]);
+        let notice = 'action_success';
+        let action = '';
+        try {
+          const body = await readForm(req, maxBodyBytes(config));
+          action = body.action ?? '';
+          await performFindingAction(findingLifecycleService, findingId, findingActionInput(body));
+        } catch (error) {
+          notice = error?.code ?? 'internal_error';
+        }
+        const params = new URLSearchParams({ notice });
+        if (action) params.set('action', action);
+        redirect(res, `/dashboard/audit-findings/${encodeURIComponent(findingId)}?${params}`);
         return;
       }
 
@@ -399,7 +913,8 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         const reviewId = decodeURIComponent(url.pathname.split('/').pop());
         const run = reviewStore.getRun(reviewId);
         if (!run) { html(res, 404, '<h1>Review not found</h1>', cors); return; }
-        const page = visualization.reviewDetailPage(reviewId);
+        const filters = dashboardFindingFilters(url);
+        const page = visualization.reviewDetailPage(reviewId, filters);
         html(res, 200, renderDashboard(page), cors);
         return;
       }
@@ -412,9 +927,13 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
         const findingId = decodeURIComponent(url.pathname.split('/').pop());
         const finding = reviewStore.getFinding(findingId);
         if (!finding) { html(res, 404, '<h1>Finding not found</h1>', cors); return; }
+        const pageOptions = {
+          notice: optionalSearchParam(url, 'notice'),
+          action: optionalSearchParam(url, 'action'),
+        };
         const page = typeof visualization.findingDetailPageWithAnalysis === 'function'
-          ? await visualization.findingDetailPageWithAnalysis(findingId)
-          : visualization.findingDetailPage(findingId);
+          ? await visualization.findingDetailPageWithAnalysis(findingId, pageOptions)
+          : visualization.findingDetailPage(findingId, pageOptions);
         html(res, 200, renderDashboard(page), cors);
         return;
       }
@@ -430,6 +949,7 @@ export function createHttpApp({ db, config, runStore, runtime, scheduler, review
           db: dbProbe,
           latest_review: latestReview(db),
           outbox: outboxCounts(db),
+          notification_digest: notificationDigestHealth(notificationDigestScheduler, db),
           disk: diskUsageEstimate(config.dbPath),
         });
         return;

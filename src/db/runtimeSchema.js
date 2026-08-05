@@ -55,7 +55,12 @@ CREATE TABLE IF NOT EXISTS agent_outbox_events (
   delivery_attempts INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL DEFAULT 8,
   next_attempt_at TEXT,
+  priority INTEGER NOT NULL DEFAULT 0,
+  claim_owner TEXT,
+  claim_token TEXT,
+  claim_expires_at TEXT,
   callback_url TEXT,
+  dedupe_key TEXT,
   last_error TEXT,
   created_at TEXT NOT NULL,
   delivered_at TEXT
@@ -70,6 +75,9 @@ CREATE INDEX IF NOT EXISTS idx_agent_run_steps_run_id ON agent_run_steps(run_id,
 CREATE INDEX IF NOT EXISTS idx_agent_waiting_states_run_id ON agent_waiting_states(run_id, status);
 CREATE INDEX IF NOT EXISTS idx_agent_outbox_events_status ON agent_outbox_events(delivery_status, created_at);
 CREATE INDEX IF NOT EXISTS idx_agent_outbox_events_next_attempt ON agent_outbox_events(delivery_status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_agent_outbox_events_pending_priority ON agent_outbox_events(delivery_status, priority DESC, created_at);
+CREATE INDEX IF NOT EXISTS idx_agent_outbox_events_claim_expiry ON agent_outbox_events(delivery_status, claim_expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_outbox_events_dedupe_key ON agent_outbox_events(dedupe_key) WHERE dedupe_key IS NOT NULL;
 `;
 
 // Backwards-compat alias for any caller that imports the old combined name.
@@ -81,6 +89,11 @@ export const RUNTIME_SCHEMA = RUNTIME_TABLES;
 const MIGRATION_COLUMNS = [
   { table: 'agent_outbox_events', column: 'max_attempts', def: 'INTEGER NOT NULL DEFAULT 8' },
   { table: 'agent_outbox_events', column: 'next_attempt_at', def: 'TEXT' },
+  { table: 'agent_outbox_events', column: 'priority', def: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'agent_outbox_events', column: 'claim_owner', def: 'TEXT' },
+  { table: 'agent_outbox_events', column: 'claim_token', def: 'TEXT' },
+  { table: 'agent_outbox_events', column: 'claim_expires_at', def: 'TEXT' },
+  { table: 'agent_outbox_events', column: 'dedupe_key', def: 'TEXT' },
   { table: 'agent_runs', column: 'idempotency_key', def: 'TEXT' },
 ];
 

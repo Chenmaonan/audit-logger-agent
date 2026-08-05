@@ -48,14 +48,42 @@ test('ensureReviewSchema migrates legacy finding and LLM usage tables', () => {
       prompt_version TEXT,
       reviewer_version TEXT NOT NULL
     );
+
+    INSERT INTO audit_review_findings (
+      finding_id, review_id, finding_hash, category, severity,
+      title, summary, evidence_event_ids_json, evidence_json,
+      created_at, last_seen_at, risk_policy_version, reviewer_version
+    ) VALUES (
+      'fnd_legacy', 'review_legacy', 'hash_legacy', 'failed_call', 'high',
+      'legacy title', 'legacy summary', '[7]', '[{"event_id":7,"raw_json":"legacy"}]',
+      '2026-07-01T00:00:00.000Z', '2026-07-01T00:05:00.000Z',
+      'risk-policy-v1', 'audit-reviewer-v1'
+    );
   `);
 
+  ensureReviewSchema(db);
   ensureReviewSchema(db);
   const findingColumns = db.prepare(`PRAGMA table_info(audit_review_findings)`).all().map((row) => row.name);
   assert.ok(findingColumns.includes('llm_analysis_json'));
   assert.ok(findingColumns.includes('analysis_generated_at'));
+  assert.ok(findingColumns.includes('first_review_id'));
+  assert.ok(findingColumns.includes('last_review_id'));
+  assert.ok(findingColumns.includes('max_severity'));
+  assert.ok(findingColumns.includes('state_version'));
   const usageColumns = db.prepare(`PRAGMA table_info(audit_llm_usage)`).all().map((row) => row.name);
   assert.deepEqual(usageColumns, ['day', 'calls', 'est_tokens', 'updated_at']);
+  const digestSlotColumns = db.prepare(`PRAGMA table_info(audit_notification_digest_slots)`).all().map((row) => row.name);
+  assert.deepEqual(digestSlotColumns, [
+    'slot_key', 'report_date', 'slot_hour', 'scheduled_for', 'timezone_offset_minutes', 'trigger_type',
+    'status', 'attempts', 'enqueued_count', 'owner_id', 'lease_expires_at',
+    'started_at', 'completed_at', 'last_error',
+  ]);
+  const occurrence = db.prepare(`SELECT * FROM audit_review_finding_occurrences`).get();
+  assert.equal(occurrence.finding_id, 'fnd_legacy');
+  assert.equal(occurrence.review_id, 'review_legacy');
+  assert.equal(occurrence.evidence_json, '[{"event_id":7,"raw_json":"legacy"}]');
+  assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM audit_review_finding_occurrences`).get().count, 1);
+  assert.equal(db.pragma('foreign_keys', { simple: true }), 1);
   db.close();
 });
 
@@ -74,6 +102,19 @@ const baseFinding = {
 
 function makeFinding(overrides = {}) {
   return { ...baseFinding, ...overrides };
+}
+
+function createRun(store, reviewId) {
+  return store.createRun({
+    reviewId,
+    windowFrom: '2026-07-03T10:00:00.000Z',
+    windowTo: '2026-07-03T10:30:00.000Z',
+    triggerType: 'scheduled',
+    intervalMinutes: 30,
+    riskPolicyVersion: 'risk-policy-v1',
+    promptVersion: 'audit-review-prompt-v1',
+    reviewerVersion: 'audit-reviewer-v1',
+  });
 }
 
 test('reviewStore: createRun inserts a running row and finishRun sets terminal state', () => {
@@ -171,24 +212,31 @@ test('reviewStore: upsertFinding dedupes by finding_hash and escalates severity 
   assert.equal(r1.finding.occurrence_count, 1);
   assert.equal(r1.finding.severity, 'medium');
 
-  // Second insert: same hash, severity escalated to high -> updates in place
+  // Same review: updates the one occurrence instead of double-counting it.
   const r2 = store.upsertFinding(makeFinding({ review_id: reviewId, severity: 'high' }));
   assert.equal(r2.isNew, false);
   assert.equal(r2.severityEscalated, true);
-  assert.equal(r2.finding.occurrence_count, 2);
+  assert.equal(r2.finding.occurrence_count, 1);
   assert.equal(r2.finding.severity, 'high');
+  assert.equal(r2.finding.max_severity, 'high');
   assert.equal(r2.finding.last_notified_at, null); // cleared for re-notify
+  assert.equal(store.listReviewOccurrences({ reviewId }).length, 1);
 
   // Verify only one row exists in the table
   const allFindings = store.listFindings({ limit: 100 });
   assert.equal(allFindings.length, 1);
 
-  // Third insert: severity downgrade -> not escalated, occurrence_count increments
-  const r3 = store.upsertFinding(makeFinding({ review_id: reviewId, severity: 'medium' }));
+  // A later review creates the second occurrence. The recent severity may
+  // downgrade, while max_severity retains the historical maximum.
+  const laterReviewId = `rev_fnd_later_${crypto.randomUUID()}`;
+  const r3 = store.upsertFinding(makeFinding({ review_id: laterReviewId, severity: 'medium' }));
   assert.equal(r3.isNew, false);
   assert.equal(r3.severityEscalated, false);
-  assert.equal(r3.finding.occurrence_count, 3);
+  assert.equal(r3.finding.occurrence_count, 2);
   assert.equal(r3.finding.severity, 'medium');
+  assert.equal(r3.finding.max_severity, 'high');
+  assert.equal(r3.finding.first_review_id, reviewId);
+  assert.equal(r3.finding.last_review_id, laterReviewId);
 
   db.close();
 });
@@ -341,6 +389,259 @@ test('reviewStore: listFindings filters by severity/category/agent', () => {
   db.close();
 });
 
+test('reviewStore: persistReviewResult merges same-review hashes and finishes count atomically', () => {
+  const db = openDb();
+  const store = createReviewStore(db);
+  const reviewId = `rev_atomic_${crypto.randomUUID()}`;
+  createRun(store, reviewId);
+
+  const result = store.persistReviewResult(reviewId, {
+    status: 'completed',
+    observedAt: '2026-07-03T10:30:00.000Z',
+    findings: [
+      makeFinding({
+        review_id: reviewId,
+        severity: 'medium',
+        evidence_event_ids: [1],
+        evidence_json: JSON.stringify([{ event_id: 1, raw_json: '{"id":1}' }]),
+      }),
+      makeFinding({
+        review_id: reviewId,
+        severity: 'high',
+        evidence_event_ids: [2],
+        evidence_json: JSON.stringify([{ event_id: 2, raw_json: '{"id":2}' }]),
+      }),
+    ],
+  });
+
+  assert.equal(result.findingCount, 1);
+  assert.equal(result.run.status, 'completed');
+  assert.equal(result.run.finding_count, 1);
+  const occurrences = store.listReviewOccurrences({ reviewId });
+  assert.equal(occurrences.length, 1);
+  assert.equal(occurrences[0].severity, 'high');
+  assert.deepEqual(occurrences[0].evidence_event_ids, [1, 2]);
+  assert.deepEqual(occurrences[0].evidence.map((item) => item.raw_json), ['{"id":1}', '{"id":2}']);
+  assert.equal(store.listFindings({ reviewId }).length, 1);
+  db.close();
+});
+
+test('reviewStore: persistReviewResult rolls back finding, occurrence, action and run completion together', () => {
+  const db = openDb();
+  const store = createReviewStore(db);
+  const reviewId = `rev_rollback_${crypto.randomUUID()}`;
+  createRun(store, reviewId);
+
+  assert.throws(() => store.persistReviewResult(reviewId, {
+    status: 'completed',
+    findings: [
+      makeFinding({ review_id: reviewId, severity: 'medium' }),
+      makeFinding({
+        review_id: reviewId,
+        severity: 'high',
+        trace_id: 'trace_invalid',
+        title: null,
+      }),
+    ],
+  }), /NOT NULL constraint failed/);
+
+  assert.equal(store.listFindings({ limit: 100 }).length, 0);
+  assert.equal(store.listReviewOccurrences({ reviewId }).length, 0);
+  assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM audit_finding_actions`).get().count, 0);
+  const run = store.getRun(reviewId);
+  assert.equal(run.status, 'running');
+  assert.equal(run.finding_count, 0);
+  assert.equal(run.finished_at, null);
+  db.close();
+});
+
+test('reviewStore: automatic snooze expiry and resolved recurrence append system actions', () => {
+  const db = openDb();
+  const store = createReviewStore(db);
+  const firstReview = `rev_state_1_${crypto.randomUUID()}`;
+  const { finding } = store.upsertFinding(makeFinding({
+    review_id: firstReview,
+    severity: 'medium',
+    observed_at: '2026-07-03T10:00:00.000Z',
+  }));
+
+  const snoozed = store.applyFindingAction({
+    findingId: finding.finding_id,
+    expectedStateVersion: 1,
+    allowedFromStatuses: ['open'],
+    toStatus: 'snoozed',
+    findingPatch: { snoozedUntil: '2026-07-03T11:00:00.000Z' },
+    action: {
+      actionType: 'snooze',
+      actor: 'ops',
+      snoozedUntil: '2026-07-03T11:00:00.000Z',
+      createdAt: '2026-07-03T10:05:00.000Z',
+    },
+  });
+  assert.equal(snoozed.outcome, 'updated');
+  assert.equal(snoozed.finding.status, 'snoozed');
+  assert.equal(snoozed.finding.snoozed_until, '2026-07-03T11:00:00.000Z');
+  assert.equal(snoozed.finding.state_version, 2);
+
+  const beforeExpiry = store.upsertFinding(makeFinding({
+    review_id: `rev_state_2_${crypto.randomUUID()}`,
+    severity: 'medium',
+    observed_at: '2026-07-03T10:30:00.000Z',
+  }));
+  assert.equal(beforeExpiry.finding.status, 'snoozed');
+
+  const expired = store.upsertFinding(makeFinding({
+    review_id: `rev_state_3_${crypto.randomUUID()}`,
+    severity: 'high',
+    observed_at: '2026-07-03T11:01:00.000Z',
+  }));
+  assert.equal(expired.finding.status, 'open');
+  assert.equal(expired.finding.state_version, 3);
+  assert.equal(expired.finding.max_severity, 'high');
+  assert.equal(expired.action.action_type, 'snooze_expired');
+
+  const resolved = store.applyFindingAction({
+    findingId: finding.finding_id,
+    expectedStateVersion: 3,
+    allowedFromStatuses: ['open'],
+    toStatus: 'resolved',
+    findingPatch: { resolvedAt: '2026-07-03T11:10:00.000Z' },
+    action: {
+      actionType: 'resolve',
+      actor: 'ops',
+      note: 'fixed',
+      createdAt: '2026-07-03T11:10:00.000Z',
+    },
+  });
+  assert.equal(resolved.finding.status, 'resolved');
+  assert.equal(resolved.finding.resolved_at, '2026-07-03T11:10:00.000Z');
+
+  const sameTime = store.upsertFinding(makeFinding({
+    review_id: `rev_state_4_${crypto.randomUUID()}`,
+    severity: 'medium',
+    observed_at: '2026-07-03T11:10:00.000Z',
+  }));
+  assert.equal(sameTime.finding.status, 'resolved');
+
+  const recurrence = store.upsertFinding(makeFinding({
+    review_id: `rev_state_5_${crypto.randomUUID()}`,
+    severity: 'medium',
+    observed_at: '2026-07-03T11:11:00.000Z',
+  }));
+  assert.equal(recurrence.finding.status, 'open');
+  assert.equal(recurrence.finding.state_version, 5);
+  assert.equal(recurrence.reopened, true);
+  assert.equal(recurrence.action.action_type, 'recurrence');
+  assert.equal(recurrence.occurrence.reopened, 1);
+
+  const actions = store.listFindingActions({ findingId: finding.finding_id, limit: 10, offset: 0 });
+  assert.deepEqual(actions.map((action) => action.action_type), [
+    'recurrence', 'resolve', 'snooze_expired', 'snooze',
+  ]);
+  assert.equal(store.listFindingOccurrences({ findingId: finding.finding_id }).length, 5);
+  db.close();
+});
+
+test('reviewStore: persistReviewResult expires snoozed findings even without a new occurrence', () => {
+  const db = openDb();
+  const store = createReviewStore(db);
+  const firstReviewId = `rev_expire_source_${crypto.randomUUID()}`;
+  const { finding } = store.upsertFinding(makeFinding({
+    review_id: firstReviewId,
+    severity: 'medium',
+    observed_at: '2026-07-03T10:00:00.000Z',
+  }));
+  store.applyFindingAction({
+    findingId: finding.finding_id,
+    expectedStateVersion: 1,
+    allowedFromStatuses: ['open'],
+    toStatus: 'snoozed',
+    findingPatch: { snoozedUntil: '2026-07-03T11:00:00.000Z' },
+    action: {
+      actionType: 'snooze',
+      actor: 'ops',
+      snoozedUntil: '2026-07-03T11:00:00.000Z',
+      createdAt: '2026-07-03T10:05:00.000Z',
+    },
+  });
+
+  const emptyReviewId = `rev_expire_empty_${crypto.randomUUID()}`;
+  createRun(store, emptyReviewId);
+  const result = store.persistReviewResult(emptyReviewId, {
+    status: 'completed',
+    observedAt: '2026-07-03T11:01:00.000Z',
+    findings: [],
+  });
+
+  const expired = store.getFinding(finding.finding_id);
+  assert.equal(expired.status, 'open');
+  assert.equal(expired.snoozed_until, null);
+  assert.equal(expired.state_version, 3);
+  assert.equal(expired.last_review_id, firstReviewId);
+  assert.equal(result.findingCount, 0);
+  assert.equal(result.expiredActions.length, 1);
+  assert.equal(result.expiredActions[0].action_type, 'snooze_expired');
+  assert.equal(store.listReviewOccurrences({ reviewId: emptyReviewId }).length, 0);
+  assert.equal(store.getRun(emptyReviewId).finding_count, 0);
+  db.close();
+});
+
+test('reviewStore: applyFindingAction enforces version and state before writing an action', () => {
+  const db = openDb();
+  const store = createReviewStore(db);
+  const { finding } = store.upsertFinding(makeFinding({
+    review_id: `rev_action_${crypto.randomUUID()}`,
+    severity: 'high',
+  }));
+
+  const versionConflict = store.applyFindingAction({
+    findingId: finding.finding_id,
+    expectedStateVersion: 99,
+    allowedFromStatuses: ['open'],
+    toStatus: 'acknowledged',
+    findingPatch: {},
+    action: { actionType: 'acknowledge', actor: 'ops' },
+  });
+  assert.equal(versionConflict.outcome, 'version_conflict');
+
+  const stateConflict = store.applyFindingAction({
+    findingId: finding.finding_id,
+    expectedStateVersion: 1,
+    allowedFromStatuses: ['resolved'],
+    toStatus: 'open',
+    findingPatch: {},
+    action: { actionType: 'reopen', actor: 'ops' },
+  });
+  assert.equal(stateConflict.outcome, 'state_conflict');
+
+  const updated = store.applyFindingAction({
+    findingId: finding.finding_id,
+    expectedStateVersion: 1,
+    allowedFromStatuses: ['open'],
+    toStatus: 'acknowledged',
+    findingPatch: {
+      acknowledgedAt: '2026-07-03T12:00:00.000Z',
+      acknowledgedBy: 'ops',
+    },
+    action: {
+      actionType: 'acknowledge',
+      actor: 'ops',
+      note: 'triaged',
+      createdAt: '2026-07-03T12:00:00.000Z',
+    },
+  });
+  assert.equal(updated.outcome, 'updated');
+  assert.equal(updated.finding.status, 'acknowledged');
+  assert.equal(updated.finding.state_version, 2);
+  assert.equal(updated.finding.acknowledged_at, '2026-07-03T12:00:00.000Z');
+  assert.equal(updated.finding.acknowledged_by, 'ops');
+  assert.equal(updated.action.action_type, 'acknowledge');
+  assert.equal(updated.action.actor, 'ops');
+  assert.equal(updated.action.note, 'triaged');
+  assert.equal(store.listFindingActions({ findingId: finding.finding_id }).length, 1);
+  db.close();
+});
+
 test('reviewStore: listAgents summarizes received audit events by agent', () => {
   const db = openDb();
   db.exec(`
@@ -390,6 +691,227 @@ test('reviewStore: listAgents returns empty when audit_events table is unavailab
   const db = openDb();
   const store = createReviewStore(db);
   assert.deepEqual(store.listAgents({ limit: 10 }), []);
+  db.close();
+});
+
+test('reviewStore: listAgentEvents isolates, sorts and paginates events for one agent', () => {
+  const db = openDb();
+  db.exec(`
+    CREATE TABLE audit_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      event TEXT NOT NULL
+    );
+  `);
+  const insert = db.prepare(`INSERT INTO audit_events (ts, agent_id, event) VALUES (?, ?, ?)`);
+  insert.run('2026-07-03T10:00:00.000Z', 'agent-a', 'a-oldest');
+  insert.run('2026-07-03T10:02:00.000Z', 'agent-b', 'b-hidden');
+  insert.run('2026-07-03T10:01:00.000Z', 'agent-a', 'a-middle');
+  insert.run('2026-07-03T10:01:00.000Z', 'agent-a', 'a-newer-same-ts');
+  insert.run('2026-07-03T10:03:00.000Z', 'agent-a', 'a-newest');
+
+  const store = createReviewStore(db);
+
+  assert.deepEqual(
+    store.listAgentEvents({ agentId: 'agent-a', limit: 10 }).map((row) => row.event),
+    ['a-newest', 'a-newer-same-ts', 'a-middle', 'a-oldest'],
+  );
+  assert.deepEqual(
+    store.listAgentEvents({ agentId: 'agent-a', limit: 2, offset: 1 }).map((row) => row.event),
+    ['a-newer-same-ts', 'a-middle'],
+  );
+  assert.deepEqual(
+    store.listAgentEvents({ agentId: 'agent-a', limit: 'invalid', offset: -3 }).map((row) => row.event),
+    ['a-newest', 'a-newer-same-ts', 'a-middle', 'a-oldest'],
+  );
+  assert.equal(store.countAgentEvents({ agentId: 'agent-a' }), 4);
+  assert.equal(store.countAgentEvents({ agentId: 'agent-b' }), 1);
+  db.close();
+});
+
+test('reviewStore: Agent log filters are applied before time sorting and pagination', () => {
+  const db = openDb();
+  db.exec(`
+    CREATE TABLE audit_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      trace_id TEXT,
+      event TEXT,
+      tool_name TEXT,
+      status TEXT
+    );
+  `);
+  const insert = db.prepare(`
+    INSERT INTO audit_events (ts, agent_id, trace_id, event, tool_name, status)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  insert.run('2026-07-03T10:04:00.000Z', 'agent-a', 'trace-a', 'tool.end', 'db.delete', 'INTERNAL');
+  insert.run('2026-07-03T10:03:00.000Z', 'agent-a', 'trace-a', 'tool.start', 'db.delete', 'OK');
+  insert.run('2026-07-03T10:02:00.000Z', 'agent-a', 'trace-b', 'tool.end', 'db.read', 'OK');
+  insert.run('2026-07-03T10:01:00.000Z', 'agent-b', 'trace-a', 'tool.end', 'db.delete', 'INTERNAL');
+
+  const store = createReviewStore(db);
+  const filters = {
+    agentId: 'agent-a',
+    logEvent: 'tool.end',
+    logToolName: 'db.delete',
+    logTraceId: 'trace-a',
+    logStatus: 'INTERNAL',
+  };
+
+  assert.deepEqual(
+    store.listAgentEvents({ ...filters, sort: 'time_desc', limit: 1 }).map((row) => row.id),
+    [1],
+  );
+  assert.equal(store.countAgentEvents(filters), 1);
+  assert.equal(store.countAgentEvents({ agentId: 'agent-a', logEvent: 'tool.end' }), 2);
+  assert.deepEqual(
+    store.listAgentEvents({ agentId: 'agent-a', logEvent: 'tool.end', sort: 'time_desc' }).map((row) => row.id),
+    [1, 3],
+  );
+  db.close();
+});
+
+test('reviewStore: listAgentEvents projects the highest risk level to every event in the same trace before paginating', () => {
+  const db = openDb();
+  db.exec(`
+    CREATE TABLE audit_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      trace_id TEXT,
+      event TEXT NOT NULL,
+      tool_name TEXT,
+      status TEXT
+    );
+  `);
+  const insertEvent = db.prepare(`INSERT INTO audit_events (ts, agent_id, trace_id, event) VALUES (?, ?, ?, ?)`);
+  insertEvent.run('2026-07-03T10:06:00.000Z', 'agent-a', 'trace-none', 'no-risk-newest');
+  insertEvent.run('2026-07-03T10:05:00.000Z', 'agent-a', 'trace-high', 'high');
+  insertEvent.run('2026-07-03T10:04:00.000Z', 'agent-a', 'trace-critical', 'critical-evidence');
+  insertEvent.run('2026-07-03T10:03:00.000Z', 'agent-a', 'trace-critical', 'critical-related');
+  insertEvent.run('2026-07-03T10:02:00.000Z', 'agent-b', 'trace-critical', 'other-agent');
+  insertEvent.run('2026-07-03T10:01:00.000Z', 'agent-a', 'trace_null', 'placeholder-trace');
+  const insertFinding = db.prepare(`
+    INSERT INTO audit_review_findings (
+      finding_id, review_id, finding_hash, category, severity, title, summary,
+      evidence_event_ids_json, status, created_at, last_seen_at,
+      risk_policy_version, reviewer_version
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const [findingId, severity, eventId, category, status] of [
+    ['finding-critical', 'critical', 3, 'failed_call', 'open'],
+    ['finding-critical-lower', 'medium', 4, 'repeated_call', 'resolved'],
+    ['finding-high', 'high', 2, 'high_risk_permission', 'resolved'],
+    ['finding-other-agent', 'critical', 5, 'failed_call', 'open'],
+    ['finding-placeholder', 'critical', 6, 'failed_call', 'open'],
+  ]) {
+    insertFinding.run(
+      findingId,
+      'review-1',
+      `hash-${findingId}`,
+      category,
+      severity,
+      `${severity} finding`,
+      `${severity} event`,
+      `[${eventId}]`,
+      status,
+      '2026-07-03T10:04:00.000Z',
+      '2026-07-03T10:04:00.000Z',
+      'risk-v1',
+      'reviewer-v1',
+    );
+  }
+  db.prepare('UPDATE audit_review_findings SET agent_id = ?, trace_id = ? WHERE finding_id = ?').run('agent-a', 'trace-critical', 'finding-critical');
+  db.prepare('UPDATE audit_review_findings SET agent_id = ?, trace_id = ? WHERE finding_id = ?').run('agent-a', 'trace-critical', 'finding-critical-lower');
+  db.prepare('UPDATE audit_review_findings SET agent_id = ?, trace_id = ? WHERE finding_id = ?').run('agent-a', 'trace-high', 'finding-high');
+  db.prepare('UPDATE audit_review_findings SET agent_id = ?, trace_id = ? WHERE finding_id = ?').run('agent-b', 'trace-critical', 'finding-other-agent');
+  db.prepare('UPDATE audit_review_findings SET agent_id = ?, trace_id = ? WHERE finding_id = ?').run('agent-a', 'trace_null', 'finding-placeholder');
+  const insertOccurrence = db.prepare(`
+    INSERT INTO audit_review_finding_occurrences (
+      occurrence_id, finding_id, review_id, severity, title, summary,
+      evidence_event_ids_json, observed_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insertOccurrence.run('occ-critical', 'finding-critical', 'review-1', 'critical', 'Critical', 'Critical event', '[3]', '2026-07-03T10:06:00.000Z', '2026-07-03T10:06:00.000Z');
+  insertOccurrence.run('occ-critical-lower', 'finding-critical-lower', 'review-1', 'medium', 'Medium', 'Related event', '[4]', '2026-07-03T10:06:00.000Z', '2026-07-03T10:06:00.000Z');
+  insertOccurrence.run('occ-high', 'finding-high', 'review-1', 'high', 'High', 'High event', '[2]', '2026-07-03T10:06:00.000Z', '2026-07-03T10:06:00.000Z');
+  insertOccurrence.run('occ-other-agent', 'finding-other-agent', 'review-1', 'critical', 'Critical', 'Other agent event', '[5]', '2026-07-03T10:06:00.000Z', '2026-07-03T10:06:00.000Z');
+  insertOccurrence.run('occ-placeholder', 'finding-placeholder', 'review-1', 'critical', 'Critical', 'Placeholder trace event', '[6]', '2026-07-03T10:06:00.000Z', '2026-07-03T10:06:00.000Z');
+
+  const store = createReviewStore(db);
+  const firstPage = store.listAgentEvents({ agentId: 'agent-a', sort: 'severity_desc', limit: 2 });
+  const secondPage = store.listAgentEvents({ agentId: 'agent-a', sort: 'severity_desc', limit: 2, offset: 2 });
+  const thirdPage = store.listAgentEvents({ agentId: 'agent-a', sort: 'severity_desc', limit: 2, offset: 4 });
+
+  assert.deepEqual(firstPage.map((row) => row.event), ['critical-evidence', 'critical-related']);
+  assert.deepEqual(firstPage.map((row) => row.severity), ['critical', 'critical']);
+  assert.deepEqual(secondPage.map((row) => row.event), ['high', 'no-risk-newest']);
+  assert.deepEqual(secondPage.map((row) => row.severity), ['high', null]);
+  assert.deepEqual(thirdPage.map((row) => row.event), ['placeholder-trace']);
+  assert.deepEqual(thirdPage.map((row) => row.severity), [null]);
+  assert.deepEqual(
+    store.listAgentEvents({
+      agentId: 'agent-a',
+      severity: 'high',
+      category: 'high_risk_permission',
+      status: 'resolved',
+      sort: 'severity_desc',
+    }).map((row) => row.event),
+    ['high'],
+  );
+  assert.equal(store.countAgentEvents({
+    agentId: 'agent-a',
+    severity: 'critical',
+    category: 'repeated_call',
+    status: 'resolved',
+  }), 2);
+  assert.deepEqual(
+    store.listAgentEvents({ agentId: 'agent-a', status: 'resolved', sort: 'severity_desc' }).map((row) => row.event),
+    ['critical-evidence', 'critical-related', 'high'],
+  );
+  db.close();
+});
+
+test('reviewStore: agent event queries reject empty agent IDs and tolerate a missing table', () => {
+  const db = openDb();
+  const store = createReviewStore(db);
+
+  assert.deepEqual(store.listAgentEvents({ agentId: '' }), []);
+  assert.deepEqual(store.listAgentEvents({}), []);
+  assert.equal(store.countAgentEvents({ agentId: '' }), 0);
+  assert.equal(store.countAgentEvents({}), 0);
+  assert.deepEqual(store.listAgentEvents({ agentId: 'agent-a' }), []);
+  assert.equal(store.countAgentEvents({ agentId: 'agent-a' }), 0);
+  db.close();
+});
+
+test('reviewStore: Agent risk filters return an empty result when review tables are unavailable', () => {
+  const db = openDb();
+  db.exec(`
+    CREATE TABLE audit_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      trace_id TEXT,
+      event TEXT,
+      tool_name TEXT,
+      status TEXT
+    );
+    INSERT INTO audit_events (ts, agent_id, trace_id, event)
+    VALUES ('2026-07-03T10:00:00.000Z', 'agent-a', 'trace-a', 'tool.end');
+  `);
+  const store = createReviewStore(db);
+  db.pragma('foreign_keys = OFF');
+  db.exec(`
+    DROP TABLE audit_review_finding_occurrences;
+    DROP TABLE audit_review_findings;
+  `);
+
+  assert.deepEqual(store.listAgentEvents({ agentId: 'agent-a', severity: 'high' }), []);
+  assert.equal(store.countAgentEvents({ agentId: 'agent-a', severity: 'high' }), 0);
   db.close();
 });
 

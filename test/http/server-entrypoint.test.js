@@ -61,6 +61,7 @@ test('graceful shutdown releases resources once and exits despite cleanup errors
   const shutdown = serverEntrypoint.createGracefulShutdown({
     scheduler: { stop: () => calls.push('scheduler.stop') },
     retentionScheduler: { stop: () => { calls.push('retention.stop'); throw new Error('retention failed'); } },
+    notificationDigestScheduler: { stop: () => calls.push('notification.stop') },
     flushInterval: 'timer',
     clearIntervalFn: (timer) => calls.push(`clear:${timer}`),
     eventPublisher: { flushPending: async (limit) => calls.push(`flush:${limit}`) },
@@ -75,6 +76,7 @@ test('graceful shutdown releases resources once and exits despite cleanup errors
   assert.deepEqual(calls, [
     'scheduler.stop',
     'retention.stop',
+    'notification.stop',
     'clear:timer',
     'flush:20',
     'server.close',
@@ -160,6 +162,9 @@ test('server script retains the HTTP server and registers both shutdown signals'
   const source = fs.readFileSync(path.join(process.cwd(), 'scripts', 'server.js'), 'utf-8');
 
   assert.match(source, /const server = listenHttpServer\(app,/);
+  assert.match(source, /createFindingLifecycleService\(\{ reviewStore,/);
+  assert.match(source, /findingLifecycleService,/);
+  assert.match(source, /flushNotifications:\s*\(\)\s*=>\s*eventPublisher\.flushPending\(20\)/);
   assert.match(source, /createGracefulShutdown\(\{/);
   assert.match(source, /process\.on\('SIGINT', handleShutdown\)/);
   assert.match(source, /process\.on\('SIGTERM', handleShutdown\)/);

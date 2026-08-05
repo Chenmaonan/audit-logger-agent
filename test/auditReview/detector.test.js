@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
   llm_intent_json TEXT,
   error_message TEXT,
   tags TEXT,
+  mapped_tool_type TEXT,
+  mapping_status TEXT,
+  mapping_reason TEXT,
   raw_json TEXT
 );
 `;
@@ -49,13 +52,18 @@ function mk(db, n, opts) {
     llm_intent_json: opts.llm_intent_json ?? null,
     error_message: opts.error_message ?? null,
     tags: null,
+    mapped_tool_type: opts.mapped_tool_type ?? null,
+    mapping_status: opts.mapping_status ?? null,
+    mapping_reason: opts.mapping_reason ?? null,
     raw_json: opts.raw_json ?? `{}`,
   };
   db.prepare(`INSERT INTO audit_events
     (row_hash, ts, agent_id, trace_id, span_id, parent_span_id, event, tool_name, status,
-     result_summary, duration_ms, channel, user_id, entity_type, entity_id, llm_intent_json, error_message, tags, raw_json)
+     result_summary, duration_ms, channel, user_id, entity_type, entity_id, llm_intent_json, error_message, tags,
+     mapped_tool_type, mapping_status, mapping_reason, raw_json)
     VALUES (@row_hash, @ts, @agent_id, @trace_id, @span_id, @parent_span_id, @event, @tool_name, @status,
-     @result_summary, @duration_ms, @channel, @user_id, @entity_type, @entity_id, @llm_intent_json, @error_message, @tags, @raw_json)`)
+     @result_summary, @duration_ms, @channel, @user_id, @entity_type, @entity_id, @llm_intent_json, @error_message, @tags,
+     @mapped_tool_type, @mapping_status, @mapping_reason, @raw_json)`)
     .run(o);
 }
 
@@ -158,11 +166,144 @@ test('detect emits failed_call, repeated_call, high_risk_permission, anomalous_c
   // repeated_call should be emitted exactly once with count >= 5
   const repeated = candidates.filter((c) => c.category === 'repeated_call');
   assert.equal(repeated.length, 1);
-  // Emitted when the sliding window first reaches the threshold (5).
-  assert.match(repeated[0].reason, /5 calls/);
+  // Anchored to the latest event that still satisfies the sliding-window threshold.
+  assert.match(repeated[0].reason, /6 calls/);
   assert.equal(repeated[0].entity_type, 'product');
   assert.equal(repeated[0].entity_id, 'prod-1');
   assert.equal(Object.hasOwn(repeated[0], 'product_id'), false);
+});
+
+test('detect admits mapped update tools as high-risk when raw tool name does not match', () => {
+  const db = makeDb();
+  mk(db, 1, {
+    tool_name: 'rental.priceApply',
+    mapped_tool_type: 'update',
+    mapping_status: 'mapped',
+  });
+
+  const detector = createCandidateDetector({
+    db,
+    riskPolicy: {
+      highRiskToolPatterns: ['*delete*'],
+      highRiskMappedToolTypes: ['update'],
+    },
+  });
+
+  const { candidates } = detector.detect({
+    windowFrom: '2026-07-03T10:00:00.000Z',
+    windowTo: '2026-07-03T10:30:00.000Z',
+  });
+
+  const highRisk = candidates.filter((candidate) => candidate.category === 'high_risk_permission');
+  assert.equal(highRisk.length, 1);
+  assert.equal(highRisk[0].tool_name, 'rental.priceApply');
+  assert.equal(highRisk[0].mapped_tool_type, 'update');
+  assert.equal(highRisk[0].mapping_status, 'mapped');
+});
+
+test('detect does not admit mapped read tools as high-risk without a raw tool-name match', () => {
+  const db = makeDb();
+  mk(db, 1, {
+    tool_name: 'rental.priceApply',
+    mapped_tool_type: 'read',
+    mapping_status: 'mapped',
+  });
+
+  const detector = createCandidateDetector({
+    db,
+    riskPolicy: {
+      highRiskToolPatterns: ['*delete*'],
+      highRiskMappedToolTypes: ['update'],
+    },
+  });
+
+  const { candidates } = detector.detect({
+    windowFrom: '2026-07-03T10:00:00.000Z',
+    windowTo: '2026-07-03T10:30:00.000Z',
+  });
+
+  assert.equal(candidates.some((candidate) => candidate.category === 'high_risk_permission'), false);
+});
+
+test('detect does not trust mapped tool type when mapping status is unknown', () => {
+  const db = makeDb();
+  mk(db, 1, {
+    tool_name: 'rental.priceApply',
+    mapped_tool_type: 'update',
+    mapping_status: 'unknown',
+  });
+
+  const detector = createCandidateDetector({
+    db,
+    riskPolicy: {
+      highRiskToolPatterns: ['*delete*'],
+      highRiskMappedToolTypes: ['update'],
+    },
+  });
+
+  const { candidates } = detector.detect({
+    windowFrom: '2026-07-03T10:00:00.000Z',
+    windowTo: '2026-07-03T10:30:00.000Z',
+  });
+
+  assert.equal(candidates.some((candidate) => candidate.category === 'high_risk_permission'), false);
+});
+
+test('detect preserves raw tool-name high-risk matches when mapped tool type is read', () => {
+  const db = makeDb();
+  mk(db, 1, {
+    tool_name: 'db.deleteTable',
+    mapped_tool_type: 'read',
+    mapping_status: 'mapped',
+  });
+
+  const detector = createCandidateDetector({
+    db,
+    riskPolicy: {
+      highRiskToolPatterns: ['*delete*'],
+      highRiskMappedToolTypes: ['update'],
+    },
+  });
+
+  const { candidates } = detector.detect({
+    windowFrom: '2026-07-03T10:00:00.000Z',
+    windowTo: '2026-07-03T10:30:00.000Z',
+  });
+
+  const highRisk = candidates.filter((candidate) => candidate.category === 'high_risk_permission');
+  assert.equal(highRisk.length, 1);
+  assert.equal(highRisk[0].tool_name, 'db.deleteTable');
+  assert.equal(highRisk[0].mapped_tool_type, 'read');
+});
+
+test('detect prioritizes high-risk candidates before applying the candidate cap', () => {
+  const db = makeDb();
+  mk(db, 1, { tool_name: 'first.failure', status: 'INTERNAL' });
+  mk(db, 2, {
+    ts: '2026-07-03T10:00:02.000Z',
+    tool_name: 'rental.priceApply',
+    mapped_tool_type: 'update',
+    mapping_status: 'mapped',
+  });
+
+  const detector = createCandidateDetector({
+    db,
+    riskPolicy: {
+      highRiskToolPatterns: [],
+      highRiskMappedToolTypes: ['update'],
+    },
+  });
+
+  const { candidates, trimmed } = detector.detect({
+    windowFrom: '2026-07-03T10:00:00.000Z',
+    windowTo: '2026-07-03T10:30:00.000Z',
+    maxEventsPerReview: 1,
+  });
+
+  assert.equal(trimmed, true);
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].category, 'high_risk_permission');
+  assert.equal(candidates[0].tool_name, 'rental.priceApply');
 });
 
 test('detect uses entity_type and entity_id in repeated-call keys', () => {

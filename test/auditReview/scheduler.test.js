@@ -8,6 +8,7 @@ import { createReviewStore } from '../../src/auditReview/reviewStore.js';
 import { createLockStore } from '../../src/auditReview/lockStore.js';
 import { createIngestCursorStore } from '../../src/auditReview/ingestCursorStore.js';
 import { createCandidateDetector } from '../../src/auditReview/candidateDetector.js';
+import { createToolSemanticMapper } from '../../src/auditReview/toolSemanticMapper.js';
 import { createLlmReviewer } from '../../src/auditReview/llmReviewer.js';
 import { createReviewNotifier } from '../../src/auditReview/notification.js';
 import { createVisualization } from '../../src/auditReview/visualization.js';
@@ -289,7 +290,7 @@ function makeFakeRealEvidenceAlteredFieldsLlmClient() {
 // Inline real outbox store to keep tests self-contained.
 import { createOutboxStore } from '../../src/agent/outboxStore.js';
 
-function buildRealDeps(db, { llmClient, configOverrides } = {}) {
+function buildRealDeps(db, { llmClient, configOverrides, feishuMode = 'disabled' } = {}) {
   const config = makeConfig(configOverrides);
   const reviewStore = createReviewStore(db);
   const lockStore = createLockStore(db);
@@ -305,10 +306,10 @@ function buildRealDeps(db, { llmClient, configOverrides } = {}) {
     llmClient: llmClient ?? makeFakeLlmClient(),
     model: 'test-model',
   });
-  const notifier = createReviewNotifier({ outboxStore, config });
+  const notifier = createReviewNotifier({ outboxStore, config, feishuMode });
   const visualization = createVisualization({ reviewStore, config });
   const auditLogger = createRuntimeAuditLogger(db, { agentId: 'audit-logger-agent' });
-  return { config, reviewStore, lockStore, cursorStore, ingestService, detector, llmReviewer, notifier, visualization, auditLogger };
+  return { config, reviewStore, lockStore, cursorStore, outboxStore, ingestService, detector, llmReviewer, notifier, visualization, auditLogger };
 }
 
 // ===================== Tests =====================
@@ -320,7 +321,8 @@ test('scheduler.runOnce happy path: creates completed run, persists findings, re
     ts: '2026-07-03T10:00:01.000Z',
     tool_name: 'some.query',
     status: 'INTERNAL',
-        event: 'tool.end',
+    event: 'tool.end',
+    raw_json: '{"source":"raw-snapshot"}',
   });
 
   const deps = buildRealDeps(db);
@@ -347,6 +349,10 @@ test('scheduler.runOnce happy path: creates completed run, persists findings, re
   assert.equal(firstFinding.evidence[0].agent_id, 'mt-agent');
   assert.ok(firstFinding.evidence[0].agent_name, 'evidence should carry agent_name');
   assert.ok(firstFinding.evidence[0].log_detail, 'evidence should carry log_detail');
+  const occurrences = deps.reviewStore.listReviewOccurrences({ reviewId: result.reviewId });
+  assert.equal(run.finding_count, occurrences.length);
+  assert.equal(occurrences.length, 1);
+  assert.equal(occurrences[0].evidence[0].raw_json, '{"source":"raw-snapshot"}');
 
   // Lock should be released.
   const lock = deps.lockStore.getLock('audit_review_scheduler');
@@ -359,6 +365,274 @@ test('scheduler.runOnce happy path: creates completed run, persists findings, re
   assert.ok(events.includes('review.completed'), 'should log review.completed');
   assert.ok(events.includes('review.ingest.completed'), 'should log review.ingest.completed');
 
+  db.close();
+});
+
+test('scheduler maps semantic tool type before detection and sends mapped high-risk candidate to reviewer', async () => {
+  const db = makeDb();
+  db.exec(`
+    ALTER TABLE audit_events ADD COLUMN mapped_tool_type TEXT;
+    ALTER TABLE audit_events ADD COLUMN mapping_status TEXT;
+    ALTER TABLE audit_events ADD COLUMN mapping_reason TEXT;
+    ALTER TABLE audit_events ADD COLUMN mapping_model TEXT;
+    ALTER TABLE audit_events ADD COLUMN mapping_version TEXT;
+    ALTER TABLE audit_events ADD COLUMN mapped_at TEXT;
+  `);
+  insertEvent(db, 1, {
+    ts: '2026-07-03T10:00:01.000Z',
+    tool_name: 'rental.priceApply',
+    status: 'OK',
+    event: 'tool.end',
+  });
+
+  let mappingCalls = 0;
+  const toolSemanticMapper = createToolSemanticMapper({
+    db,
+    llmClient: {
+      async createStructuredResponse() {
+        mappingCalls += 1;
+        return { tool_type: 'update', reason: 'Applies a new rental price' };
+      },
+    },
+    model: 'test-mapping-model',
+  });
+
+  let reviewerCandidates = null;
+  const reviewerLlmClient = {
+    async createStructuredResponse({ input }) {
+      const payload = JSON.parse(input.find((message) => message.role === 'user').content);
+      reviewerCandidates = payload.candidates;
+      const candidate = payload.candidates[0];
+      return {
+        type: 'audit_review',
+        review_id: payload.review_id,
+        window: payload.window,
+        summary: {
+          title: '审查发现 1 个高风险操作',
+          overview: 'rental.priceApply 被语义映射为 update。',
+          severity_counts: { critical: 0, high: 1, medium: 0, low: 0 },
+        },
+        findings: [{
+          category: candidate.category,
+          severity: 'high',
+          agent_id: candidate.agent_id,
+          tool_name: candidate.tool_name,
+          trace_id: candidate.trace_id,
+          entity: candidate.entity,
+          title: '租金修改操作需要审查',
+          summary: 'rental.priceApply 映射为 update 并命中高风险策略。',
+          recommendation: '核实修改权限和审批记录。',
+          evidence_event_ids: [candidate.event_id],
+          requires_action: true,
+        }],
+      };
+    },
+  };
+
+  const deps = buildRealDeps(db, { llmClient: reviewerLlmClient });
+  deps.detector = createCandidateDetector({
+    db,
+    riskPolicy: {
+      ...RISK_POLICY,
+      highRiskMappedToolTypes: ['update'],
+    },
+  });
+  const scheduler = createAuditReviewScheduler({
+    db,
+    ...deps,
+    toolSemanticMapper,
+    now: () => new Date('2026-07-03T10:30:00.000Z'),
+  });
+
+  const result = await scheduler.runOnce({ triggerType: 'scheduled' });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(mappingCalls, 1);
+  assert.equal(reviewerCandidates.length, 1);
+  assert.equal(reviewerCandidates[0].tool_name, 'rental.priceApply');
+  assert.equal(reviewerCandidates[0].mapped_tool_type, 'update');
+  assert.equal(reviewerCandidates[0].mapping_status, 'mapped');
+  assert.equal(reviewerCandidates[0].category, 'high_risk_permission');
+  assert.match(reviewerCandidates[0].reason, /mapped_tool_type=update/);
+
+  db.close();
+});
+
+test('scheduler sends every high-risk finding from a batch larger than 1000 without query truncation', async () => {
+  const db = makeDb();
+  const findingTotal = 1001;
+  db.transaction(() => {
+    for (let index = 0; index < findingTotal; index += 1) {
+      insertEvent(db, index + 1, {
+        ts: `2026-07-03T10:${String(Math.floor(index / 60) % 30).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}.000Z`,
+        tool_name: `tool-${index}`,
+        trace_id: 'trace-large-batch',
+        status: 'INTERNAL',
+      });
+    }
+  })();
+
+  const llmClient = {
+    async createStructuredResponse({ input }) {
+      const { candidates } = JSON.parse(input.find((message) => message.role === 'user').content);
+      const findings = candidates.slice(0, findingTotal).map((candidate, index) => ({
+        category: 'failed_call',
+        severity: 'high',
+        agent_id: 'mt-agent',
+        tool_name: candidate.tool_name,
+        trace_id: 'trace-large-batch',
+        entity: { type: 'test_finding', id: String(index) },
+        title: `批次风险-${index}`,
+        summary: `第 ${index} 条高风险摘要`,
+        recommendation: '检查失败原因',
+        evidence_event_ids: [candidate.event_id],
+        requires_action: true,
+      }));
+      return {
+        type: 'audit_review',
+        review_id: 'fake-large',
+        window: { from: '2026-07-03T10:00:00.000Z', to: '2026-07-03T10:30:00.000Z' },
+        summary: {
+          title: '大批次高风险审查',
+          overview: `发现 ${findings.length} 条高风险。`,
+          severity_counts: { critical: 0, high: findings.length, medium: 0, low: 0 },
+        },
+        findings,
+      };
+    },
+  };
+  const deps = buildRealDeps(db, {
+    llmClient,
+    feishuMode: 'live',
+    configOverrides: {
+      maxEventsPerReview: 1100,
+      llmReview: {
+        promptVersion: 'audit-review-prompt-v1',
+        reviewerVersion: 'audit-reviewer-v1',
+        maxCandidatesPerCall: 1100,
+      },
+      notification: {
+        enabled: true,
+        mode: 'feishu_bot',
+        minSeverity: 'high',
+        maxAttempts: 8,
+        card: { maxPayloadBytes: 19 * 1024, foldThresholdChars: 1 },
+      },
+    },
+  });
+  let highRiskNotification;
+  const enqueueHighRiskGroups = deps.notifier.enqueueHighRiskGroups;
+  deps.notifier = {
+    ...deps.notifier,
+    enqueueHighRiskGroups(args) {
+      highRiskNotification = args;
+      return enqueueHighRiskGroups(args);
+    },
+  };
+  const scheduler = createAuditReviewScheduler({
+    db,
+    ...deps,
+    now: () => new Date('2026-07-03T10:30:00.000Z'),
+  });
+
+  const result = await scheduler.runOnce({ triggerType: 'scheduled' });
+
+  const llmAudit = db.prepare(`
+    SELECT result_summary FROM audit_events
+    WHERE agent_id = 'audit-logger-agent' AND event = 'review.llm.completed'
+    ORDER BY id DESC LIMIT 1
+  `).get();
+  assert.equal(result.status, 'completed', llmAudit?.result_summary);
+  assert.equal(highRiskNotification.findings.length, findingTotal);
+  assert.ok(highRiskNotification.findings.every((finding) => (
+    typeof finding.observed_at === 'string' && Number.isFinite(Date.parse(finding.observed_at))
+  )));
+  const payloads = deps.outboxStore.listAll(5000)
+    .filter((event) => event.type === 'audit_review_high_risk_group')
+    .map((event) => event.payload_json);
+  assert.ok(payloads.length > 1, 'large same-group batch should be split into multiple cards');
+  const serialized = JSON.stringify(payloads);
+  for (let index = 0; index < findingTotal; index += 1) {
+    assert.match(serialized, new RegExp(`批次风险-${index}(?!\\d)`));
+    assert.match(serialized, new RegExp(`第 ${index} 条高风险摘要(?!\\d)`));
+  }
+
+  db.close();
+});
+
+test('scheduler.runOnce merges duplicate finding hashes into one occurrence and snapshots all raw evidence', async () => {
+  const db = makeDb();
+  insertEvent(db, 1, {
+    ts: '2026-07-03T10:00:01.000Z',
+    status: 'INTERNAL',
+    event: 'tool.end',
+    raw_json: '{"event":1}',
+  });
+  insertEvent(db, 2, {
+    ts: '2026-07-03T10:00:02.000Z',
+    status: 'INTERNAL',
+    event: 'tool.end',
+    raw_json: '{"event":2}',
+  });
+  const llmClient = makeFakeLlmClient({
+    type: 'audit_review',
+    review_id: 'fake',
+    window: { from: '2026-07-03T10:00:00.000Z', to: '2026-07-03T10:30:00.000Z' },
+    summary: {
+      title: '重复结果',
+      overview: '同一问题引用两条证据。',
+      severity_counts: { critical: 0, high: 1, medium: 1, low: 0 },
+    },
+    findings: [
+      {
+        category: 'failed_call',
+        severity: 'medium',
+        agent_id: 'mt-agent',
+        tool_name: 'some.tool',
+        trace_id: 'trace-1',
+        entity: null,
+        title: '工具失败',
+        summary: '第一条证据',
+        recommendation: '检查工具',
+        evidence_event_ids: [1],
+        requires_action: false,
+      },
+      {
+        category: 'failed_call',
+        severity: 'high',
+        agent_id: 'mt-agent',
+        tool_name: 'some.tool',
+        trace_id: 'trace-1',
+        entity: null,
+        title: '工具持续失败',
+        summary: '第二条证据',
+        recommendation: '立即检查工具',
+        evidence_event_ids: [2],
+        requires_action: true,
+      },
+    ],
+  });
+  const deps = buildRealDeps(db, { llmClient });
+  const scheduler = createAuditReviewScheduler({
+    db,
+    ...deps,
+    now: () => new Date('2026-07-03T10:30:00.000Z'),
+  });
+
+  const result = await scheduler.runOnce({ triggerType: 'scheduled' });
+
+  assert.equal(result.status, 'completed');
+  const run = deps.reviewStore.getRun(result.reviewId);
+  const occurrences = deps.reviewStore.listReviewOccurrences({ reviewId: result.reviewId });
+  assert.equal(run.finding_count, 1);
+  assert.equal(occurrences.length, 1);
+  assert.equal(occurrences[0].severity, 'high');
+  assert.deepEqual(occurrences[0].evidence_event_ids, [1, 2]);
+  assert.deepEqual(occurrences[0].evidence.map((item) => item.raw_json), [
+    '{"event":1}',
+    '{"event":2}',
+  ]);
+  assert.equal(deps.reviewStore.listFindings({ reviewId: result.reviewId }).length, 1);
   db.close();
 });
 
@@ -453,6 +727,52 @@ test('scheduler.runAfterIngest runs an immediate review and resets the scheduled
   assert.equal(clearedTimeouts[0], timeoutCalls[0]);
 
   scheduler.stop();
+  db.close();
+});
+
+test('scheduler.runAfterIngest coalesces a burst and keeps one follow-up for events received during review', async () => {
+  const db = makeDb();
+  insertEvent(db, 1, {
+    ts: '2026-07-03T10:29:00.000Z',
+    tool_name: 'some.query',
+    status: 'INTERNAL',
+    event: 'tool.end',
+  });
+
+  let llmCalls = 0;
+  let releaseFirstReview;
+  let firstReviewStarted;
+  const firstReviewStartedPromise = new Promise((resolve) => { firstReviewStarted = resolve; });
+  const fallbackLlm = makeFakeLlmClient();
+  const deps = buildRealDeps(db, {
+    llmClient: {
+      async createStructuredResponse(args) {
+        llmCalls += 1;
+        if (llmCalls === 1) {
+          firstReviewStarted();
+          await new Promise((resolve) => { releaseFirstReview = resolve; });
+        }
+        return fallbackLlm.createStructuredResponse(args);
+      },
+    },
+  });
+  const scheduler = createAuditReviewScheduler({ db, ...deps, now: () => new Date('2026-07-03T10:30:00.000Z') });
+
+  const first = scheduler.runAfterIngest();
+  const queuedBeforeStart = scheduler.runAfterIngest();
+  await firstReviewStartedPromise;
+  const duringReview = Array.from({ length: 8 }, () => scheduler.runAfterIngest());
+  releaseFirstReview();
+
+  const results = await Promise.all([first, queuedBeforeStart, ...duringReview]);
+  assert.ok(results.every((result) => result.status === 'completed'));
+  assert.equal(llmCalls, 2, 'a running ingest review gets at most one trailing review');
+  const runs = deps.reviewStore.listRuns({ limit: 10 }).filter((run) => run.trigger_type === 'ingest');
+  assert.equal(runs.length, 2);
+
+  await scheduler.runAfterIngest();
+  assert.equal(llmCalls, 3, 'a later ingest starts a fresh drain after the prior one finishes');
+
   db.close();
 });
 

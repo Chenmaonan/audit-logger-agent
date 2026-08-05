@@ -250,6 +250,30 @@ function parseErrorFindings(parseErrors, reviewId, riskPolicyVersion, reviewerVe
   return findings;
 }
 
+function withRawJsonSnapshots(reviewStore, findings) {
+  const eventIds = [...new Set(findings.flatMap((finding) =>
+    Array.isArray(finding.evidence_event_ids) ? finding.evidence_event_ids : []))];
+  const rawById = new Map(
+    reviewStore.listRawEventsByIds({ eventIds, limit: eventIds.length })
+      .map((row) => [row.id, row.raw_json]),
+  );
+  return findings.map((finding) => {
+    let evidence;
+    try {
+      evidence = JSON.parse(finding.evidence_json ?? '[]');
+    } catch {
+      evidence = [];
+    }
+    return {
+      ...finding,
+      evidence_json: JSON.stringify(evidence.map((item) => ({
+        ...item,
+        raw_json: item?.event_id == null ? null : (rawById.get(item.event_id) ?? null),
+      }))),
+    };
+  });
+}
+
 export function createAuditReviewScheduler({
   db,
   config,
@@ -305,6 +329,9 @@ export function createAuditReviewScheduler({
   let refreshTimer = null;
   let started = false;
   let reviewChain = Promise.resolve();
+  let ingestDrainPromise = null;
+  let ingestReviewStarted = false;
+  let ingestFollowupRequested = false;
 
   function clearRefreshTimer() {
     if (refreshTimer) {
@@ -329,12 +356,13 @@ export function createAuditReviewScheduler({
     }, delayMs);
   }
 
-  function enqueueReview(triggerType, { rescheduleAfterReview = false } = {}) {
+  function enqueueReview(triggerType, { rescheduleAfterReview = false, onStart } = {}) {
     reviewChain = reviewChain
       .catch(() => {})
       .then(async () => {
         if (rescheduleAfterReview) clearScheduledTimer();
         try {
+          onStart?.();
           return await runOnce({ triggerType });
         } finally {
           if (rescheduleAfterReview && started) {
@@ -553,14 +581,6 @@ export function createAuditReviewScheduler({
         reviewerVersion,
         agentsConfig,
       );
-      for (const f of parseFindings) {
-        try {
-          reviewStore.upsertFinding(f);
-          findingCount++;
-        } catch {
-          // ignore individual finding failures
-        }
-      }
 
       // 7. LLM review.
       const llmCandidates = candidates.candidates.slice(0, maxCandidatesPerLlmReview);
@@ -668,33 +688,39 @@ export function createAuditReviewScheduler({
         );
       }
 
-      for (const f of findingsToPersist) {
-        try {
-          reviewStore.upsertFinding(f);
-          findingCount++;
-        } catch {
-          // ignore individual finding failures
-        }
-      }
+      findingsToPersist.push(...parseFindings);
+      findingsToPersist = withRawJsonSnapshots(reviewStore, findingsToPersist);
+      const persistedResult = reviewStore.persistReviewResult(reviewId, {
+        findings: findingsToPersist,
+        observedAt: windowTo,
+        status,
+        scannedFiles: ingestResult.scannedFiles,
+        insertedEvents: ingestResult.inserted,
+        parseErrorCount: ingestResult.parseErrors.length,
+        candidateEventCount: candidates.candidates.length,
+        llmModel,
+        errorCode,
+      });
+      findingCount = persistedResult.findingCount;
 
       // 9. Notify.
       try {
         const dashboardUrl = visualization.dashboardUrlFor(reviewId);
         const run = reviewStore.getRun(reviewId);
-        // Attach persisted finding_ids back onto the review findings so the
-        // callback summary's top_findings carry a usable finding_id link.
-        // Query ALL findings (not filtered by reviewId): finding_hash dedup keeps
-        // the earliest review_id on a re-observed finding, so filtering by this
-        // run's review_id would miss rows that were merged into an earlier run.
-        const persistedRows = reviewStore.listFindings({ limit: 1000 });
-        // Match by category+agent+tool+trace+entity (the hash inputs) to find the DB row.
-        const matchRow = (f) => persistedRows.find((row) =>
-          row.category === f.category &&
-          (row.agent_id ?? null) === (f.agent_id ?? null) &&
-          (row.tool_name ?? null) === (f.tool_name ?? null) &&
-          (row.trace_id ?? null) === (f.trace_id ?? null) &&
-          (row.entity_type ?? null) === entityTypeOf(f) &&
-          (row.entity_id ?? null) === entityIdOf(f));
+        // persistReviewResult returns every finding/occurrence pair committed
+        // for this batch. Using that authoritative result avoids arbitrary
+        // list limits and preserves re-observed findings whose first review_id
+        // belongs to an earlier batch.
+        const persistedEntries = Array.isArray(persistedResult.findings)
+          ? persistedResult.findings
+          : [];
+        const matchPersisted = (f) => persistedEntries.find(({ finding }) =>
+          finding?.category === f.category &&
+          (finding?.agent_id ?? null) === (f.agent_id ?? null) &&
+          (finding?.tool_name ?? null) === (f.tool_name ?? null) &&
+          (finding?.trace_id ?? null) === (f.trace_id ?? null) &&
+          (finding?.entity_type ?? null) === entityTypeOf(f) &&
+          (finding?.entity_id ?? null) === entityIdOf(f));
         const baseReview = llmResult.ok
           ? llmResult.review
           : degradedReview({ reviewId, window: { from: windowFrom, to: windowTo }, candidates: candidates.candidates });
@@ -702,18 +728,33 @@ export function createAuditReviewScheduler({
           ...baseReview,
           findings: (baseReview.findings || []).map((f) => {
             if (f.finding_id) return f;
-            const row = matchRow(f);
-            return row ? { ...f, finding_id: row.finding_id } : f;
+            const persisted = matchPersisted(f)?.finding;
+            return persisted ? { ...f, finding_id: persisted.finding_id } : f;
           }),
         };
         notifier.enqueue({ reviewId, run, review: reviewForNotify, dashboardUrl });
 
-        // Enqueue individual high/critical findings.
-        const highFindings = reviewStore.listFindings({ limit: 1000, severity: 'high' });
-        const criticalFindings = reviewStore.listFindings({ limit: 1000, severity: 'critical' });
-        const persistedFindings = [...highFindings, ...criticalFindings];
-        for (const pf of persistedFindings) {
-          if (pf.review_id === reviewId) {
+        // Enqueue high/critical findings. Feishu delivery groups them by the
+        // non-crossable (agent_id, trace_id) boundary; callback delivery keeps
+        // the legacy individual payload behavior.
+        const persistedFindings = persistedEntries
+          .map(({ finding, occurrence }) => {
+            if (!finding || !occurrence) return null;
+            return {
+              ...finding,
+              severity: occurrence.severity,
+              title: occurrence.title,
+              summary: occurrence.summary,
+              recommendation: occurrence.recommendation,
+              evidence: occurrence.evidence,
+              observed_at: occurrence.observed_at,
+            };
+          })
+          .filter((finding) => finding?.severity === 'high' || finding?.severity === 'critical');
+        if (typeof notifier.enqueueHighRiskGroups === 'function') {
+          notifier.enqueueHighRiskGroups({ findings: persistedFindings, reviewId, run, dashboardUrl });
+        } else {
+          for (const pf of persistedFindings) {
             notifier.enqueueFinding({ finding: pf, reviewId, run, dashboardUrl });
           }
         }
@@ -732,17 +773,7 @@ export function createAuditReviewScheduler({
         );
       }
 
-      // 10. Finish run.
-      reviewStore.finishRun(reviewId, {
-        status,
-        scannedFiles: ingestResult.scannedFiles,
-        insertedEvents: ingestResult.inserted,
-        parseErrorCount: ingestResult.parseErrors.length,
-        candidateEventCount: candidates.candidates.length,
-        findingCount,
-        llmModel,
-        errorCode,
-      });
+      // 10. The run was completed atomically with findings and occurrences.
       logAudit(
         'review.completed',
         status === 'completed' ? 'OK' : 'INTERNAL',
@@ -792,7 +823,31 @@ export function createAuditReviewScheduler({
   }
 
   function runAfterIngest() {
-    return enqueueReview('ingest', { rescheduleAfterReview: true });
+    if (ingestDrainPromise) {
+      // Batches arriving before their coalesced review starts are already covered.
+      // While it runs, retain only one trailing review for newly accepted events.
+      if (ingestReviewStarted) ingestFollowupRequested = true;
+      return ingestDrainPromise;
+    }
+
+    ingestDrainPromise = (async () => {
+      let result;
+      do {
+        ingestFollowupRequested = false;
+        ingestReviewStarted = false;
+        result = await enqueueReview('ingest', {
+          rescheduleAfterReview: true,
+          onStart: () => { ingestReviewStarted = true; },
+        });
+      } while (ingestFollowupRequested);
+      return result;
+    })().finally(() => {
+      ingestDrainPromise = null;
+      ingestReviewStarted = false;
+      ingestFollowupRequested = false;
+    });
+
+    return ingestDrainPromise;
   }
 
   function runManual() {

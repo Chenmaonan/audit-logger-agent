@@ -28,8 +28,6 @@
     "maxEventsPerAgent": 200,
     "runtimeRunsDays": 30,
     "waitingStatesDays": 30,
-    "resolvedFindingsDays": 30,
-    "reviewRunsDays": 60,
     "llmUsageDays": 90,
     "outboxDays": 14,
     "logFilesDays": 14,
@@ -47,7 +45,17 @@
       "mode": "callback",
       "callbackUrl": "http://127.0.0.1:9999/audit-review-events",
       "minSeverity": "medium",
-      "sendEmptyReview": false
+      "sendEmptyReview": false,
+      "card": {
+        "maxPayloadBytes": 19456,
+        "foldThresholdChars": 800
+      },
+      "dailyReport": {
+        "enabled": true,
+        "hours": [10, 17],
+        "timezoneOffsetMinutes": 480,
+        "catchUpWindowMinutes": 30
+      }
     },
     "http": {
       "bindHost": "127.0.0.1",
@@ -55,7 +63,7 @@
       "allowedOrigins": ["http://127.0.0.1:9320"]
     },
     "riskPolicy": {
-      "version": "risk-policy-v1",
+      "version": "risk-policy-v2",
       "repeatWindowMinutes": 10,
       "repeatThreshold": 5,
       "slowCallDurationMs": 30000,
@@ -69,6 +77,15 @@
         "*credential*",
         "shell.*",
         "browser.runScript"
+      ],
+      "highRiskMappedToolTypes": [
+        "write",
+        "update",
+        "delete",
+        "deploy",
+        "permission",
+        "credential",
+        "shell"
       ],
       "agentToolAllowlists": {
         "rental-price-agent": [],

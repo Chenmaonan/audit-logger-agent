@@ -81,8 +81,6 @@ function makeConfig(rootDir, overrides = {}) {
       maxEventsPerAgent: 200,
       runtimeRunsDays: 30,
       waitingStatesDays: 30,
-      resolvedFindingsDays: 30,
-      reviewRunsDays: 60,
       llmUsageDays: 90,
       outboxDays: 14,
       logFilesDays: 14,
@@ -104,7 +102,7 @@ function writeFileWithMtime(filePath, contents, isoTime) {
 
 function insertEvent(db, id, ts, agentId = 'agent') {
   const suffix = `${agentId}-${id}`;
-  db.prepare(`
+  const result = db.prepare(`
     INSERT INTO audit_events (
       row_hash, ts, agent_id, trace_id, span_id, parent_span_id, event,
       tool_name, status, result_summary, duration_ms, channel, user_id,
@@ -120,39 +118,94 @@ function insertEvent(db, id, ts, agentId = 'agent') {
     agent_id: agentId,
     span_id: `span-${suffix}`,
   });
+  return Number(result.lastInsertRowid);
 }
 
-function insertReviewRun(db, id, startedAt) {
+function insertReviewRun(db, id, startedAt, { findingCount = 0 } = {}) {
   db.prepare(`
     INSERT INTO audit_review_runs (
       review_id, window_from, window_to, status, trigger_type,
-      risk_policy_version, reviewer_version, started_at
+      finding_count, risk_policy_version, reviewer_version, started_at
     ) VALUES (
       @review_id, @started_at, @started_at, 'completed', 'scheduled',
-      'risk-policy-v1', 'reviewer-v1', @started_at
+      @finding_count, 'risk-policy-v1', 'reviewer-v1', @started_at
     )
-  `).run({ review_id: id, started_at: startedAt });
+  `).run({ review_id: id, finding_count: findingCount, started_at: startedAt });
 }
 
-function insertFinding(db, id, { status, createdAt, resolvedAt = null, acknowledgedAt = null }) {
+function insertFinding(db, id, {
+  status,
+  createdAt,
+  lastSeenAt = createdAt,
+  resolvedAt = null,
+  acknowledgedAt = null,
+  reviewId = 'review-1',
+  evidenceEventIds = [],
+  evidenceJson = null,
+}) {
   db.prepare(`
     INSERT INTO audit_review_findings (
       finding_id, review_id, finding_hash, category, severity, title, summary,
-      evidence_event_ids_json, status, created_at, last_seen_at, resolved_at,
+      evidence_event_ids_json, evidence_json, status, created_at, last_seen_at, resolved_at,
       acknowledged_at, risk_policy_version, reviewer_version
     ) VALUES (
-      @finding_id, 'review-1', @finding_hash, 'failed_call', 'medium', 'title', 'summary',
-      '[]', @status, @created_at, @created_at, @resolved_at,
+      @finding_id, @review_id, @finding_hash, 'failed_call', 'medium', 'title', 'summary',
+      @evidence_event_ids_json, @evidence_json, @status, @created_at, @last_seen_at, @resolved_at,
       @acknowledged_at, 'risk-policy-v1', 'reviewer-v1'
     )
   `).run({
     finding_id: id,
+    review_id: reviewId,
     finding_hash: `hash-${id}`,
+    evidence_event_ids_json: JSON.stringify(evidenceEventIds),
+    evidence_json: evidenceJson,
     status,
     created_at: createdAt,
+    last_seen_at: lastSeenAt,
     resolved_at: resolvedAt,
     acknowledged_at: acknowledgedAt,
   });
+}
+
+function insertOccurrence(db, id, {
+  findingId,
+  reviewId,
+  observedAt,
+  evidenceEventIds = [],
+  evidenceJson = '[]',
+  severity = 'medium',
+}) {
+  db.prepare(`
+    INSERT INTO audit_review_finding_occurrences (
+      occurrence_id, finding_id, review_id, severity, title, summary,
+      recommendation, evidence_event_ids_json, evidence_json, observed_at,
+      is_new, severity_escalated, reopened, created_at
+    ) VALUES (
+      @occurrence_id, @finding_id, @review_id, @severity, 'title', 'summary',
+      NULL, @evidence_event_ids_json, @evidence_json, @observed_at,
+      1, 0, 0, @observed_at
+    )
+  `).run({
+    occurrence_id: id,
+    finding_id: findingId,
+    review_id: reviewId,
+    severity,
+    evidence_event_ids_json: JSON.stringify(evidenceEventIds),
+    observed_at: observedAt,
+    evidence_json: evidenceJson,
+  });
+}
+
+function insertFindingAction(db, id, { findingId, createdAt }) {
+  db.prepare(`
+    INSERT INTO audit_finding_actions (
+      action_id, finding_id, action_type, from_status, to_status,
+      actor, note, snoozed_until, created_at
+    ) VALUES (
+      @action_id, @finding_id, 'resolve', 'open', 'resolved',
+      'operator', 'fixed', NULL, @created_at
+    )
+  `).run({ action_id: id, finding_id: findingId, created_at: createdAt });
 }
 
 function insertOutbox(db, id, { status, createdAt }) {
@@ -240,7 +293,7 @@ function count(db, table) {
   return db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count;
 }
 
-test('retention dry-run reports expired rows without deleting protected data', () => {
+test('retention dry-run reports expired dashboard rows without deleting data', () => {
   const rootDir = tmpDir();
   const db = makeDb();
   const service = createRetentionService({
@@ -251,9 +304,9 @@ test('retention dry-run reports expired rows without deleting protected data', (
   });
 
   insertEvent(db, 1, '2026-03-01T00:00:00.000Z');
-  insertEvent(db, 2, '2026-07-05T00:00:00.000Z');
+  const freshEventId = insertEvent(db, 2, '2026-07-05T00:00:00.000Z');
   insertReviewRun(db, 'old-run', '2026-04-01T00:00:00.000Z');
-  insertReviewRun(db, 'new-run', '2026-06-20T00:00:00.000Z');
+  insertReviewRun(db, 'new-run', '2026-07-05T00:00:00.000Z');
   insertFinding(db, 'resolved-old', {
     status: 'resolved',
     createdAt: '2026-04-01T00:00:00.000Z',
@@ -268,6 +321,11 @@ test('retention dry-run reports expired rows without deleting protected data', (
     createdAt: '2026-04-01T00:00:00.000Z',
     acknowledgedAt: '2026-05-01T00:00:00.000Z',
   });
+  insertFinding(db, 'open-fresh', {
+    status: 'open',
+    createdAt: '2026-07-05T00:00:00.000Z',
+    evidenceEventIds: [freshEventId],
+  });
   insertOutbox(db, 'delivered-old', { status: 'delivered', createdAt: '2026-06-01T00:00:00.000Z' });
   insertOutbox(db, 'dead-old', { status: 'dead_letter', createdAt: '2026-06-01T00:00:00.000Z' });
   insertOutbox(db, 'pending-old', { status: 'pending', createdAt: '2026-06-01T00:00:00.000Z' });
@@ -281,7 +339,8 @@ test('retention dry-run reports expired rows without deleting protected data', (
     agentRunSteps: 0,
     agentWaitingStates: 0,
     reviewRuns: 1,
-    resolvedFindings: 1,
+    findingOccurrences: 0,
+    findings: 3,
     auditLlmUsage: 0,
     outboxEvents: 2,
     ingestCursors: 0,
@@ -292,7 +351,7 @@ test('retention dry-run reports expired rows without deleting protected data', (
   });
   assert.equal(count(db, 'audit_events'), 2);
   assert.equal(count(db, 'audit_review_runs'), 2);
-  assert.equal(count(db, 'audit_review_findings'), 3);
+  assert.equal(count(db, 'audit_review_findings'), 4);
   assert.equal(count(db, 'agent_outbox_events'), 3);
 
   db.close();
@@ -402,7 +461,7 @@ test('retention deletes expired runtime rows and llm usage while keeping active 
   fs.rmSync(rootDir, { recursive: true, force: true });
 });
 
-test('retention deletes expired data in batches and keeps open or acknowledged findings', () => {
+test('retention deletes expired findings regardless of workflow status in batches', () => {
   const rootDir = tmpDir();
   const db = makeDb();
   const service = createRetentionService({
@@ -415,7 +474,7 @@ test('retention deletes expired data in batches and keeps open or acknowledged f
   for (let i = 1; i <= 5; i++) {
     insertEvent(db, i, `2026-03-0${i}T00:00:00.000Z`);
   }
-  insertEvent(db, 99, '2026-07-05T00:00:00.000Z');
+  const freshEventId = insertEvent(db, 99, '2026-07-05T00:00:00.000Z');
   insertFinding(db, 'resolved-old', {
     status: 'resolved',
     createdAt: '2026-04-01T00:00:00.000Z',
@@ -430,18 +489,221 @@ test('retention deletes expired data in batches and keeps open or acknowledged f
     createdAt: '2026-04-01T00:00:00.000Z',
     acknowledgedAt: '2026-05-01T00:00:00.000Z',
   });
+  insertFinding(db, 'open-fresh', {
+    status: 'open',
+    createdAt: '2026-07-05T00:00:00.000Z',
+    evidenceEventIds: [freshEventId],
+  });
 
   const result = service.run({ batchSize: 2 });
 
   assert.equal(result.deleted.auditEvents, 5);
+  assert.equal(result.deleted.findings, 3);
   assert.ok(result.batches.auditEvents.every((n) => n <= 2), 'each audit_events delete batch should respect batchSize');
+  assert.ok(result.batches.findings.every((n) => n <= 2), 'each finding delete batch should respect batchSize');
   assert.deepEqual(
     db.prepare(`SELECT row_hash FROM audit_events ORDER BY row_hash`).all().map((row) => row.row_hash),
     ['hash-99'],
   );
   assert.deepEqual(
     db.prepare(`SELECT finding_id FROM audit_review_findings ORDER BY finding_id`).all().map((row) => row.finding_id),
-    ['acked-old', 'open-old'],
+    ['open-fresh'],
+  );
+
+  db.close();
+  fs.rmSync(rootDir, { recursive: true, force: true });
+});
+
+test('retention removes expired findings, evidence snapshots, actions, and review runs together', () => {
+  const rootDir = tmpDir();
+  const db = makeDb();
+  const service = createRetentionService({
+    db,
+    config: makeConfig(rootDir),
+    cursorStore: createIngestCursorStore(db),
+    now: () => new Date('2026-07-06T12:00:00.000Z'),
+  });
+
+  insertReviewRun(db, 'active-old-review', '2026-04-01T00:00:00.000Z', { findingCount: 1 });
+  insertReviewRun(db, 'resolved-old-review', '2026-04-02T00:00:00.000Z', { findingCount: 1 });
+  const sourceEventId = insertEvent(db, 'snapshot-source', '2026-04-01T00:00:00.000Z');
+  insertFinding(db, 'active-finding', {
+    status: 'open',
+    createdAt: '2026-04-01T00:00:00.000Z',
+    reviewId: 'active-old-review',
+    evidenceEventIds: [sourceEventId],
+  });
+  insertFinding(db, 'expired-resolved-finding', {
+    status: 'resolved',
+    createdAt: '2026-04-02T00:00:00.000Z',
+    resolvedAt: '2026-05-01T00:00:00.000Z',
+    reviewId: 'resolved-old-review',
+  });
+  insertOccurrence(db, 'occ-active', {
+    findingId: 'active-finding',
+    reviewId: 'active-old-review',
+    observedAt: '2026-04-01T00:00:00.000Z',
+    evidenceEventIds: [sourceEventId],
+    evidenceJson: '[{"event_id":1,"raw_json":"{\\"source\\":\\"retained-snapshot\\"}"}]',
+  });
+  insertOccurrence(db, 'occ-resolved', {
+    findingId: 'expired-resolved-finding',
+    reviewId: 'resolved-old-review',
+    observedAt: '2026-04-02T00:00:00.000Z',
+  });
+  insertFindingAction(db, 'act-resolved', {
+    findingId: 'expired-resolved-finding',
+    createdAt: '2026-05-01T00:00:00.000Z',
+  });
+
+  const result = service.run({ batchSize: 1 });
+
+  assert.equal(result.deleted.auditEvents, 1);
+  assert.equal(result.deleted.findingOccurrences, 2);
+  assert.equal(result.deleted.findings, 2);
+  assert.equal(result.deleted.reviewRuns, 2);
+  assert.equal(count(db, 'audit_events'), 0);
+  assert.equal(count(db, 'audit_review_runs'), 0);
+  assert.equal(count(db, 'audit_review_findings'), 0);
+  assert.equal(count(db, 'audit_review_finding_occurrences'), 0);
+  assert.equal(count(db, 'audit_finding_actions'), 0);
+
+  db.close();
+  fs.rmSync(rootDir, { recursive: true, force: true });
+});
+
+test('retention removes old occurrences while rebasing a finding onto retained evidence', () => {
+  const rootDir = tmpDir();
+  const db = makeDb();
+  const service = createRetentionService({
+    db,
+    config: makeConfig(rootDir),
+    cursorStore: createIngestCursorStore(db),
+    now: () => new Date('2026-07-06T12:00:00.000Z'),
+  });
+
+  const oldEventId = insertEvent(db, 'old-source', '2026-07-03T00:00:00.000Z');
+  const freshEventId = insertEvent(db, 'fresh-source', '2026-07-05T00:00:00.000Z');
+  insertReviewRun(db, 'old-review', '2026-07-03T00:00:00.000Z', { findingCount: 1 });
+  insertReviewRun(db, 'fresh-review', '2026-07-05T00:00:00.000Z', { findingCount: 1 });
+  insertFinding(db, 'recurring-finding', {
+    status: 'open',
+    createdAt: '2026-07-03T00:00:00.000Z',
+    lastSeenAt: '2026-07-05T00:00:00.000Z',
+    reviewId: 'old-review',
+    evidenceEventIds: [freshEventId],
+    evidenceJson: JSON.stringify([{ event_id: freshEventId, raw_json: '{"source":"fresh"}' }]),
+  });
+  insertOccurrence(db, 'old-occurrence', {
+    findingId: 'recurring-finding',
+    reviewId: 'old-review',
+    observedAt: '2026-07-03T00:00:00.000Z',
+    evidenceEventIds: [oldEventId],
+    evidenceJson: JSON.stringify([{ event_id: oldEventId, raw_json: '{"source":"old"}' }]),
+    severity: 'medium',
+  });
+  insertOccurrence(db, 'fresh-occurrence', {
+    findingId: 'recurring-finding',
+    reviewId: 'fresh-review',
+    observedAt: '2026-07-05T00:00:00.000Z',
+    evidenceEventIds: [freshEventId],
+    evidenceJson: JSON.stringify([{ event_id: freshEventId, raw_json: '{"source":"fresh"}' }]),
+    severity: 'high',
+  });
+
+  const result = service.run({ batchSize: 1 });
+
+  assert.equal(result.deleted.auditEvents, 1);
+  assert.equal(result.deleted.findingOccurrences, 1);
+  assert.equal(result.deleted.findings, 0);
+  assert.equal(result.deleted.reviewRuns, 1);
+  assert.deepEqual(
+    db.prepare(`SELECT occurrence_id FROM audit_review_finding_occurrences`).all().map((row) => row.occurrence_id),
+    ['fresh-occurrence'],
+  );
+  assert.deepEqual(
+    db.prepare(`SELECT review_id FROM audit_review_runs`).all().map((row) => row.review_id),
+    ['fresh-review'],
+  );
+  const finding = db.prepare(`
+    SELECT review_id, first_review_id, last_review_id, severity, max_severity,
+           occurrence_count, created_at, last_seen_at, evidence_json
+    FROM audit_review_findings
+    WHERE finding_id = 'recurring-finding'
+  `).get();
+  assert.deepEqual({
+    review_id: finding.review_id,
+    first_review_id: finding.first_review_id,
+    last_review_id: finding.last_review_id,
+    severity: finding.severity,
+    max_severity: finding.max_severity,
+    occurrence_count: finding.occurrence_count,
+    created_at: finding.created_at,
+    last_seen_at: finding.last_seen_at,
+  }, {
+    review_id: 'fresh-review',
+    first_review_id: 'fresh-review',
+    last_review_id: 'fresh-review',
+    severity: 'high',
+    max_severity: 'high',
+    occurrence_count: 1,
+    created_at: '2026-07-05T00:00:00.000Z',
+    last_seen_at: '2026-07-05T00:00:00.000Z',
+  });
+  assert.equal(JSON.parse(finding.evidence_json)[0].raw_json, '{"source":"fresh"}');
+
+  db.close();
+  fs.rmSync(rootDir, { recursive: true, force: true });
+});
+
+test('retention removes dashboard data whose source event is pruned by the per-agent limit', () => {
+  const rootDir = tmpDir();
+  const db = makeDb();
+  const service = createRetentionService({
+    db,
+    config: makeConfig(rootDir, { retention: { maxEventsPerAgent: 2 } }),
+    cursorStore: createIngestCursorStore(db),
+    now: () => new Date('2026-07-06T12:00:00.000Z'),
+  });
+
+  const eventIds = [
+    insertEvent(db, 'one', '2026-07-05T00:00:00.000Z', 'limited-agent'),
+    insertEvent(db, 'two', '2026-07-05T00:01:00.000Z', 'limited-agent'),
+    insertEvent(db, 'three', '2026-07-05T00:02:00.000Z', 'limited-agent'),
+  ];
+  for (let index = 0; index < eventIds.length; index++) {
+    const number = index + 1;
+    const reviewId = `limited-review-${number}`;
+    const findingId = `limited-finding-${number}`;
+    const observedAt = `2026-07-05T00:0${index}:00.000Z`;
+    insertReviewRun(db, reviewId, observedAt, { findingCount: 1 });
+    insertFinding(db, findingId, {
+      status: 'open',
+      createdAt: observedAt,
+      reviewId,
+      evidenceEventIds: [eventIds[index]],
+    });
+    insertOccurrence(db, `limited-occurrence-${number}`, {
+      findingId,
+      reviewId,
+      observedAt,
+      evidenceEventIds: [eventIds[index]],
+    });
+  }
+
+  const result = service.run();
+
+  assert.equal(result.deleted.auditEvents, 1);
+  assert.equal(result.deleted.findingOccurrences, 1);
+  assert.equal(result.deleted.findings, 1);
+  assert.equal(result.deleted.reviewRuns, 1);
+  assert.deepEqual(
+    db.prepare(`SELECT finding_id FROM audit_review_findings ORDER BY finding_id`).all().map((row) => row.finding_id),
+    ['limited-finding-2', 'limited-finding-3'],
+  );
+  assert.deepEqual(
+    db.prepare(`SELECT review_id FROM audit_review_runs ORDER BY review_id`).all().map((row) => row.review_id),
+    ['limited-review-2', 'limited-review-3'],
   );
 
   db.close();
@@ -513,6 +775,33 @@ test('retention keeps only the latest 200 audit events for each agent', () => {
   assert.deepEqual(
     db.prepare(`SELECT row_hash FROM audit_events WHERE agent_id = 'agent-a' ORDER BY ts ASC LIMIT 1`).get().row_hash,
     'hash-agent-a-6',
+  );
+
+  db.close();
+  fs.rmSync(rootDir, { recursive: true, force: true });
+});
+
+test('retention preserves all events from the current Beijing report day before the 10:00/17:00 digests', () => {
+  const rootDir = tmpDir();
+  const db = makeDb();
+  const service = createRetentionService({
+    db,
+    config: makeConfig(rootDir, { report: { timezoneOffsetMinutes: 480 } }),
+    cursorStore: createIngestCursorStore(db),
+    now: () => new Date('2026-07-06T08:00:00.000Z'),
+  });
+
+  const currentDayStart = Date.parse('2026-07-05T16:00:00.000Z');
+  for (let i = 1; i <= 205; i++) {
+    insertEvent(db, i, new Date(currentDayStart + i * 60 * 1000).toISOString(), 'agent-current');
+  }
+
+  const result = service.run({ batchSize: 10 });
+
+  assert.equal(result.deleted.auditEvents, 0);
+  assert.equal(
+    db.prepare(`SELECT COUNT(*) AS count FROM audit_events WHERE agent_id = 'agent-current'`).get().count,
+    205,
   );
 
   db.close();

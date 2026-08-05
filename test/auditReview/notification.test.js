@@ -280,6 +280,134 @@ test('enqueueFinding skips medium findings', () => {
   assert.equal(result.reason, 'below_high');
 });
 
+test('feishu notifier groups high/critical findings by agent and trace without storing a webhook URL', () => {
+  const outbox = makeFakeOutboxStore();
+  const notifier = createReviewNotifier({
+    outboxStore: outbox,
+    feishuMode: 'live',
+    config: {
+      auditReview: {
+        notification: {
+          enabled: true,
+          mode: 'feishu_bot',
+          minSeverity: 'high',
+          card: { foldThresholdChars: 1 },
+        },
+      },
+    },
+  });
+  const findings = [
+    { finding_id: 'f1', severity: 'high', agent_id: 'a1', trace_id: 't1', title: '风险 1', summary: '摘要 1' },
+    { finding_id: 'f2', severity: 'critical', agent_id: 'a1', trace_id: 't1', title: '风险 2', summary: '摘要 2' },
+    { finding_id: 'f3', severity: 'high', agent_id: 'a1', trace_id: 't2', title: '风险 3', summary: '摘要 3' },
+    { finding_id: 'f4', severity: 'medium', agent_id: 'a1', trace_id: 't1', title: '不发送', summary: '不发送' },
+  ];
+
+  const result = notifier.enqueueHighRiskGroups({
+    findings,
+    reviewId: 'review-feishu',
+    run: makeRun(),
+    dashboardUrl: 'https://example.com/dashboard',
+  });
+
+  assert.equal(result.enqueued, true);
+  assert.equal(result.groups.length, 2);
+  assert.equal(outbox.calls.length, 2);
+  assert.ok(outbox.calls.every((call) => call.deliveryMode === 'feishu_bot'));
+  assert.ok(outbox.calls.every((call) => call.callbackUrl === null));
+  const first = JSON.stringify(outbox.calls[0].payload);
+  assert.match(first, /风险 1/);
+  assert.match(first, /风险 2/);
+  assert.doesNotMatch(first, /风险 3|不发送/);
+});
+
+test('feishu dry-run renders grouped cards but never writes to outbox', () => {
+  const outbox = makeFakeOutboxStore();
+  const notifier = createReviewNotifier({
+    outboxStore: outbox,
+    feishuMode: 'dry-run',
+    config: {
+      agents: { a: { displayName: '审计 Agent A' } },
+      auditReview: { notification: { enabled: true, mode: 'feishu_bot' } },
+    },
+  });
+  const result = notifier.enqueueHighRiskGroups({
+    findings: [{
+      severity: 'high',
+      agent_id: 'a',
+      trace_id: 't',
+      title: '风险',
+      summary: '摘要',
+      observed_at: '2026-07-17T01:15:00.000Z',
+    }],
+    reviewId: 'r',
+    run: makeRun(),
+  });
+
+  assert.equal(result.reason, 'dry_run');
+  assert.equal(result.groups.length, 1);
+  assert.equal(result.groups[0].agentName, '审计 Agent A');
+  assert.equal(result.groups[0].agentId, 'a');
+  assert.equal(result.groups[0].findings[0].observed_at, '2026-07-17T01:15:00.000Z');
+  assert.match(JSON.stringify(result.groups[0].payloads), /审计 Agent A/);
+  assert.equal(outbox.calls.length, 0);
+});
+
+test('Feishu display names do not change raw identity dedupe keys', () => {
+  function renderWithDisplayName(displayName) {
+    const outbox = makeFakeOutboxStore();
+    const notifier = createReviewNotifier({
+      outboxStore: outbox,
+      feishuMode: 'live',
+      config: {
+        agents: { a: { displayName } },
+        auditReview: { notification: { enabled: true, mode: 'feishu_bot' } },
+      },
+    });
+    notifier.enqueueHighRiskGroups({
+      findings: [{ severity: 'high', agent_id: 'a', trace_id: 't', title: '风险', summary: '摘要' }],
+      reviewId: 'review-display-name',
+      run: makeRun(),
+    });
+    return outbox.calls[0].dedupeKey;
+  }
+
+  assert.equal(renderWithDisplayName('显示名称一'), renderWithDisplayName('显示名称二'));
+});
+
+test('feishu notifier keeps the same persisted risk deduplicated across review batches', () => {
+  const outbox = makeFakeOutboxStore();
+  const notifier = createReviewNotifier({
+    outboxStore: outbox,
+    feishuMode: 'live',
+    config: { auditReview: { notification: { enabled: true, mode: 'feishu_bot' } } },
+  });
+
+  notifier.enqueueHighRiskGroups({
+    findings: [{ finding_hash: 'risk-one', severity: 'high', agent_id: 'a', trace_id: 't', title: '批次一风险', summary: '批次一摘要' }],
+    reviewId: 'review-one',
+    run: makeRun(),
+  });
+  notifier.enqueueHighRiskGroups({
+    findings: [{ finding_hash: 'risk-one', severity: 'high', agent_id: 'a', trace_id: 't', title: '批次二风险', summary: '批次二摘要' }],
+    reviewId: 'review-two',
+    run: makeRun(),
+  });
+  notifier.enqueueHighRiskGroups({
+    findings: [{ finding_hash: 'risk-two', severity: 'high', agent_id: 'a', trace_id: 't', title: '另一条风险', summary: '另一条摘要' }],
+    reviewId: 'review-three',
+    run: makeRun(),
+  });
+
+  assert.equal(outbox.calls.length, 3);
+  assert.equal(outbox.calls[0].dedupeKey, outbox.calls[1].dedupeKey);
+  assert.notEqual(outbox.calls[0].dedupeKey, outbox.calls[2].dedupeKey);
+  assert.match(JSON.stringify(outbox.calls[0].payload), /批次一风险/);
+  assert.doesNotMatch(JSON.stringify(outbox.calls[0].payload), /批次二风险/);
+  assert.match(JSON.stringify(outbox.calls[1].payload), /批次二风险/);
+  assert.doesNotMatch(JSON.stringify(outbox.calls[1].payload), /批次一风险/);
+});
+
 test('meetsMinSeverity compares by index', () => {
   assert.equal(meetsMinSeverity('critical', 'low'), true);
   assert.equal(meetsMinSeverity('high', 'high'), true);
